@@ -32,8 +32,8 @@ bm::Matrix make_regression_targets(const bm::Matrix& inputs, std::size_t outputs
     return targets;
 }
 
-bm::Model make_model(std::size_t inputs, std::size_t hidden, std::size_t outputs) {
-    return bm::Model::builder()
+bm::TrainingModel make_training_model(std::size_t inputs, std::size_t hidden, std::size_t outputs) {
+    return bm::TrainingModel::builder()
         .input_size(inputs)
         .add_layer(hidden, bm::Activation::relu)
         .add_layer(hidden, bm::Activation::relu)
@@ -44,17 +44,29 @@ bm::Model make_model(std::size_t inputs, std::size_t hidden, std::size_t outputs
         .build();
 }
 
+bm::InferenceModel make_inference_model(std::size_t inputs, std::size_t hidden, std::size_t outputs) {
+    return make_training_model(inputs, hidden, outputs).to_inference_model();
+}
+
 } // namespace
 
 static void BM_PredictSingle(benchmark::State& state) {
     const auto input_size = static_cast<std::size_t>(state.range(0));
     const auto hidden_size = static_cast<std::size_t>(state.range(1));
-    auto model = make_model(input_size, hidden_size, 8);
+    auto model = make_inference_model(input_size, hidden_size, 8);
     auto input = make_inputs(1, input_size).front();
+    bm::Vector output(model.output_size(), 0.0);
+    bm::Vector scratch(model.scratch_size(), 0.0);
 
     for (auto _ : state) {
-        auto prediction = model.predict(input);
-        benchmark::DoNotOptimize(prediction);
+        const auto status = model.predict_to(input.data(),
+                                             input.size(),
+                                             output.data(),
+                                             output.size(),
+                                             scratch.data(),
+                                             scratch.size());
+        benchmark::DoNotOptimize(status);
+        benchmark::DoNotOptimize(output.data());
     }
 
     state.SetItemsProcessed(state.iterations());
@@ -62,12 +74,22 @@ static void BM_PredictSingle(benchmark::State& state) {
 
 static void BM_PredictBatch(benchmark::State& state) {
     const auto batch_size = static_cast<std::size_t>(state.range(0));
-    auto model = make_model(32, 64, 8);
+    auto model = make_inference_model(32, 64, 8);
     auto inputs = make_inputs(batch_size, 32);
+    bm::Vector output(model.output_size(), 0.0);
+    bm::Vector scratch(model.scratch_size(), 0.0);
 
     for (auto _ : state) {
-        auto predictions = model.predict_batch(inputs);
-        benchmark::DoNotOptimize(predictions);
+        for (const auto& input : inputs) {
+            const auto status = model.predict_to(input.data(),
+                                                 input.size(),
+                                                 output.data(),
+                                                 output.size(),
+                                                 scratch.data(),
+                                                 scratch.size());
+            benchmark::DoNotOptimize(status);
+            benchmark::DoNotOptimize(output.data());
+        }
     }
 
     state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(batch_size));
@@ -80,7 +102,7 @@ static void BM_FitEpoch(benchmark::State& state) {
 
     for (auto _ : state) {
         state.PauseTiming();
-        auto model = make_model(16, 32, 4);
+        auto model = make_training_model(16, 32, 4);
         bm::TrainingOptions options;
         options.epochs = 1;
         options.batch_size = batch_size;

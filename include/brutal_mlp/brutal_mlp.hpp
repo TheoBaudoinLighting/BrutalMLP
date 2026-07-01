@@ -33,9 +33,20 @@ enum class OptimizerType {
     adam
 };
 
+enum class InferenceStatus {
+    ok,
+    null_input,
+    null_output,
+    invalid_input_size,
+    invalid_output_size,
+    null_scratch,
+    insufficient_scratch
+};
+
 [[nodiscard]] std::string to_string(Activation activation);
 [[nodiscard]] std::string to_string(Loss loss);
 [[nodiscard]] std::string to_string(OptimizerType optimizer);
+[[nodiscard]] std::string to_string(InferenceStatus status);
 
 [[nodiscard]] Activation activation_from_string(std::string_view value);
 [[nodiscard]] Loss loss_from_string(std::string_view value);
@@ -84,7 +95,49 @@ struct LayerParameters {
     Vector biases;
 };
 
-class Model {
+class InferenceModel {
+public:
+    [[nodiscard]] static InferenceModel from_parameters(const std::vector<LayerParameters>& parameters);
+    [[nodiscard]] static InferenceModel load(const std::filesystem::path& path);
+
+    InferenceModel(const InferenceModel& other);
+    InferenceModel& operator=(const InferenceModel& other);
+    InferenceModel(InferenceModel&& other) noexcept;
+    InferenceModel& operator=(InferenceModel&& other) noexcept;
+    ~InferenceModel();
+
+    [[nodiscard]] bool empty() const noexcept;
+    [[nodiscard]] std::size_t input_size() const noexcept;
+    [[nodiscard]] std::size_t output_size() const noexcept;
+    [[nodiscard]] std::size_t layer_count() const noexcept;
+    [[nodiscard]] std::size_t scratch_size() const noexcept;
+    [[nodiscard]] std::size_t weight_count() const noexcept;
+    [[nodiscard]] std::size_t bias_count() const noexcept;
+    [[nodiscard]] const Scalar* weights_data() const noexcept;
+    [[nodiscard]] const Scalar* biases_data() const noexcept;
+
+    [[nodiscard]] InferenceStatus predict_to(const Scalar* input,
+                                             std::size_t input_size,
+                                             Scalar* output,
+                                             std::size_t output_size,
+                                             Scalar* scratch,
+                                             std::size_t scratch_size) const noexcept;
+
+    [[nodiscard]] Vector predict(const Vector& input) const;
+    [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
+
+    [[nodiscard]] std::vector<LayerParameters> parameters() const;
+    void save(const std::filesystem::path& path) const;
+
+private:
+    struct Impl;
+
+    explicit InferenceModel(std::unique_ptr<Impl> impl);
+
+    std::unique_ptr<Impl> impl_;
+};
+
+class TrainingModel {
 public:
     class Builder {
     public:
@@ -94,10 +147,10 @@ public:
         Builder& optimizer(OptimizerConfig optimizer);
         Builder& seed(std::uint64_t seed);
 
-        [[nodiscard]] Model build() const;
+        [[nodiscard]] TrainingModel build() const;
 
     private:
-        friend class Model;
+        friend class TrainingModel;
 
         std::size_t input_size_{0};
         std::vector<LayerSpec> layers_{};
@@ -107,13 +160,13 @@ public:
     };
 
     [[nodiscard]] static Builder builder();
-    [[nodiscard]] static Model load(const std::filesystem::path& path);
+    [[nodiscard]] static TrainingModel load(const std::filesystem::path& path);
 
-    Model(const Model& other);
-    Model& operator=(const Model& other);
-    Model(Model&& other) noexcept;
-    Model& operator=(Model&& other) noexcept;
-    ~Model();
+    TrainingModel(const TrainingModel& other);
+    TrainingModel& operator=(const TrainingModel& other);
+    TrainingModel(TrainingModel&& other) noexcept;
+    TrainingModel& operator=(TrainingModel&& other) noexcept;
+    ~TrainingModel();
 
     [[nodiscard]] std::size_t input_size() const;
     [[nodiscard]] std::size_t output_size() const;
@@ -129,15 +182,18 @@ public:
 
     [[nodiscard]] std::vector<LayerParameters> parameters() const;
     void set_parameters(const std::vector<LayerParameters>& parameters);
+    [[nodiscard]] InferenceModel to_inference_model() const;
 
     void save(const std::filesystem::path& path) const;
 
 private:
     struct Impl;
 
-    explicit Model(std::unique_ptr<Impl> impl);
+    explicit TrainingModel(std::unique_ptr<Impl> impl);
 
     std::unique_ptr<Impl> impl_;
 };
+
+using Model = TrainingModel;
 
 } // namespace brutal_mlp

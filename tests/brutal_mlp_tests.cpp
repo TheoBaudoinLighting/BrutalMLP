@@ -2,16 +2,24 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
 #include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <new>
 #include <numeric>
 #include <stdexcept>
+#include <type_traits>
+#include <utility>
 
 namespace bm = brutal_mlp;
 
 namespace {
+
+std::atomic<bool> g_count_allocations{false};
+std::atomic<std::size_t> g_allocation_count{0};
 
 void expect_vector_near(const bm::Vector& actual, const bm::Vector& expected, double tolerance) {
     ASSERT_EQ(actual.size(), expected.size());
@@ -34,6 +42,29 @@ bm::Model make_known_linear_model() {
     return model;
 }
 
+bm::TrainingModel make_known_two_layer_model() {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(3, bm::Activation::relu)
+                     .add_layer(2, bm::Activation::linear)
+                     .loss(bm::Loss::mean_squared_error)
+                     .seed(9)
+                     .build();
+
+    model.set_parameters({
+        bm::LayerParameters{2, 3, bm::Activation::relu,
+                            {1.0, -1.0,
+                             -0.5, 2.0,
+                             0.25, 0.5},
+                            {0.0, 0.25, -0.75}},
+        bm::LayerParameters{3, 2, bm::Activation::linear,
+                            {1.0, 0.5, -1.0,
+                             -2.0, 0.25, 0.5},
+                            {0.1, -0.2}},
+    });
+    return model;
+}
+
 bm::TrainingOptions quick_options(std::size_t epochs, std::size_t batch_size) {
     bm::TrainingOptions options;
     options.epochs = epochs;
@@ -45,6 +76,49 @@ bm::TrainingOptions quick_options(std::size_t epochs, std::size_t batch_size) {
 }
 
 } // namespace
+
+void* operator new(std::size_t size) {
+    if (g_count_allocations.load(std::memory_order_relaxed)) {
+        g_allocation_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (void* pointer = std::malloc(size)) {
+        return pointer;
+    }
+    throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size) {
+    if (g_count_allocations.load(std::memory_order_relaxed)) {
+        g_allocation_count.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (void* pointer = std::malloc(size)) {
+        return pointer;
+    }
+    throw std::bad_alloc();
+}
+
+void operator delete(void* pointer) noexcept {
+    std::free(pointer);
+}
+
+void operator delete[](void* pointer) noexcept {
+    std::free(pointer);
+}
+
+void operator delete(void* pointer, std::size_t) noexcept {
+    std::free(pointer);
+}
+
+void operator delete[](void* pointer, std::size_t) noexcept {
+    std::free(pointer);
+}
+
+TEST(ApiShape, ModelIsLegacyAliasForTrainingModel) {
+    static_assert(std::is_same<bm::Model, bm::TrainingModel>::value,
+                  "Model should remain a source-compatible alias for TrainingModel");
+    static_assert(noexcept(std::declval<const bm::InferenceModel&>().predict_to(nullptr, 0, nullptr, 0, nullptr, 0)),
+                  "InferenceModel::predict_to must remain noexcept");
+}
 
 TEST(StringConversions, RoundTripSupportedEnums) {
     EXPECT_EQ(bm::activation_from_string(bm::to_string(bm::Activation::linear)), bm::Activation::linear);
@@ -62,6 +136,9 @@ TEST(StringConversions, RoundTripSupportedEnums) {
 
     EXPECT_EQ(bm::optimizer_type_from_string(bm::to_string(bm::OptimizerType::sgd)), bm::OptimizerType::sgd);
     EXPECT_EQ(bm::optimizer_type_from_string(bm::to_string(bm::OptimizerType::adam)), bm::OptimizerType::adam);
+
+    EXPECT_EQ(bm::to_string(bm::InferenceStatus::ok), "ok");
+    EXPECT_EQ(bm::to_string(bm::InferenceStatus::insufficient_scratch), "insufficient_scratch");
 }
 
 TEST(StringConversions, RejectUnknownValues) {
@@ -414,6 +491,109 @@ TEST(Parameters, ReturnedParametersAreIndependentCopies) {
     parameters[0].weights[0] = 100.0;
 
     expect_vector_near(model.predict({3.0, 1.0}), {5.5}, 1e-12);
+}
+
+TEST(InferenceModel, FrozenModelMatchesTrainingPrediction) {
+    const auto training = make_known_two_layer_model();
+    const auto inference = training.to_inference_model();
+    const bm::Vector input{2.0, -1.0};
+
+    EXPECT_FALSE(inference.empty());
+    EXPECT_EQ(inference.input_size(), training.input_size());
+    EXPECT_EQ(inference.output_size(), training.output_size());
+    EXPECT_EQ(inference.layer_count(), training.layer_count());
+    EXPECT_EQ(inference.weight_count(), 12U);
+    EXPECT_EQ(inference.bias_count(), 5U);
+    EXPECT_NE(inference.weights_data(), nullptr);
+    EXPECT_NE(inference.biases_data(), nullptr);
+    EXPECT_EQ(inference.scratch_size(), 6U);
+
+    expect_vector_near(inference.predict(input), training.predict(input), 1e-12);
+
+    bm::Vector output(inference.output_size(), 0.0);
+    bm::Vector scratch(inference.scratch_size(), 0.0);
+    const auto status =
+        inference.predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), scratch.size());
+
+    EXPECT_EQ(status, bm::InferenceStatus::ok);
+    expect_vector_near(output, training.predict(input), 1e-12);
+}
+
+TEST(InferenceModel, PredictToDoesNotAllocateOnHotPath) {
+    const auto inference = make_known_two_layer_model().to_inference_model();
+    const bm::Vector input{2.0, -1.0};
+    bm::Vector output(inference.output_size(), 0.0);
+    bm::Vector scratch(inference.scratch_size(), 0.0);
+
+    g_allocation_count.store(0, std::memory_order_relaxed);
+    g_count_allocations.store(true, std::memory_order_relaxed);
+    const auto status =
+        inference.predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), scratch.size());
+    g_count_allocations.store(false, std::memory_order_relaxed);
+
+    EXPECT_EQ(status, bm::InferenceStatus::ok);
+    EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0U);
+}
+
+TEST(InferenceModel, PredictToReportsStatusInsteadOfThrowing) {
+    const auto inference = make_known_two_layer_model().to_inference_model();
+    const bm::Vector input{2.0, -1.0};
+    bm::Vector output(inference.output_size(), 0.0);
+    bm::Vector scratch(inference.scratch_size(), 0.0);
+
+    EXPECT_EQ(inference.predict_to(nullptr, input.size(), output.data(), output.size(), scratch.data(), scratch.size()),
+              bm::InferenceStatus::null_input);
+    EXPECT_EQ(inference.predict_to(input.data(), input.size(), nullptr, output.size(), scratch.data(), scratch.size()),
+              bm::InferenceStatus::null_output);
+    EXPECT_EQ(inference.predict_to(input.data(), 1, output.data(), output.size(), scratch.data(), scratch.size()),
+              bm::InferenceStatus::invalid_input_size);
+    EXPECT_EQ(inference.predict_to(input.data(), input.size(), output.data(), 1, scratch.data(), scratch.size()),
+              bm::InferenceStatus::invalid_output_size);
+    EXPECT_EQ(inference.predict_to(input.data(), input.size(), output.data(), output.size(), nullptr, scratch.size()),
+              bm::InferenceStatus::null_scratch);
+    EXPECT_EQ(inference.predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), 1),
+              bm::InferenceStatus::insufficient_scratch);
+}
+
+TEST(InferenceModel, OneLayerModelDoesNotRequireScratch) {
+    const auto inference = make_known_linear_model().to_inference_model();
+    const bm::Vector input{3.0, 1.0};
+    bm::Vector output(inference.output_size(), 0.0);
+
+    EXPECT_EQ(inference.scratch_size(), 0U);
+    EXPECT_EQ(inference.predict_to(input.data(), input.size(), output.data(), output.size(), nullptr, 0),
+              bm::InferenceStatus::ok);
+    expect_vector_near(output, {5.5}, 1e-12);
+}
+
+TEST(InferenceModel, SaveLoadRoundTripsFrozenModel) {
+    const auto path = std::filesystem::temp_directory_path() / "brutal_mlp_inference_roundtrip.model";
+
+    const auto inference = make_known_two_layer_model().to_inference_model();
+    inference.save(path);
+    const auto loaded = bm::InferenceModel::load(path);
+    std::filesystem::remove(path);
+
+    EXPECT_EQ(loaded.input_size(), inference.input_size());
+    EXPECT_EQ(loaded.output_size(), inference.output_size());
+    EXPECT_EQ(loaded.layer_count(), inference.layer_count());
+    EXPECT_EQ(loaded.scratch_size(), inference.scratch_size());
+    expect_vector_near(loaded.predict({2.0, -1.0}), inference.predict({2.0, -1.0}), 1e-12);
+}
+
+TEST(InferenceModel, RejectsInvalidFrozenParameters) {
+    EXPECT_THROW((void)bm::InferenceModel::from_parameters({}), std::invalid_argument);
+    EXPECT_THROW((void)bm::InferenceModel::from_parameters({
+                     bm::LayerParameters{2, 1, bm::Activation::linear, {1.0}, {0.0}},
+                 }),
+                 std::invalid_argument);
+    EXPECT_THROW((void)bm::InferenceModel::from_parameters({
+                     bm::LayerParameters{2, 2, bm::Activation::softmax,
+                                         {1.0, 0.0, 0.0, 1.0},
+                                         {0.0, 0.0}},
+                     bm::LayerParameters{2, 1, bm::Activation::linear, {1.0, 1.0}, {0.0}},
+                 }),
+                 std::invalid_argument);
 }
 
 TEST(CopyAndMove, CopyIsDeepAndIndependent) {

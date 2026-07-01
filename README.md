@@ -1,8 +1,14 @@
 # brutal_mlp
 
-Small C++17 multilayer perceptron library with a stable facade API, CMake package exports, GoogleTest coverage, and Google Benchmark targets.
+Small C++17 multilayer perceptron library with a stable CMake integration surface, a flexible training API, and a frozen allocation-free inference hot path.
 
 The runtime library only uses the C++ standard library. GoogleTest and Google Benchmark are fetched only for `BRUTAL_MLP_BUILD_TESTS` and `BRUTAL_MLP_BUILD_BENCHMARKS`.
+
+## API split
+
+- `brutal_mlp::TrainingModel`: owns training state, gradients, optimizer moments, validation, history, serialization, and debug-friendly APIs.
+- `brutal_mlp::InferenceModel`: frozen model for production inference. It stores weights and biases contiguously, has no optimizer or gradient state, and exposes `predict_to(...) noexcept` so callers provide input, output, and scratch buffers.
+- `brutal_mlp::Model`: legacy alias for `TrainingModel`.
 
 ## Integration
 
@@ -33,7 +39,7 @@ target_link_libraries(your_target PRIVATE brutal_mlp::brutal_mlp)
 
 auto optimizer = brutal_mlp::OptimizerConfig::adam(0.01);
 
-auto model = brutal_mlp::Model::builder()
+auto training = brutal_mlp::TrainingModel::builder()
     .input_size(2)
     .add_layer(16, brutal_mlp::Activation::relu)
     .add_layer(1, brutal_mlp::Activation::sigmoid)
@@ -49,9 +55,27 @@ brutal_mlp::TrainingOptions options;
 options.epochs = 1000;
 options.batch_size = 4;
 
-model.fit(x, y, options);
-auto prediction = model.predict({1.0, 0.0});
+training.fit(x, y, options);
+
+auto inference = training.to_inference_model();
+
+brutal_mlp::Vector input{1.0, 0.0};
+brutal_mlp::Vector output(inference.output_size());
+brutal_mlp::Vector scratch(inference.scratch_size());
+
+auto status = inference.predict_to(input.data(),
+                                   input.size(),
+                                   output.data(),
+                                   output.size(),
+                                   scratch.data(),
+                                   scratch.size());
+
+if (status != brutal_mlp::InferenceStatus::ok) {
+    // Handle invalid buffers or shape mismatch outside the hot path.
+}
 ```
+
+`InferenceModel::predict_to(...)` does not allocate, does not throw, and does not mutate the model.
 
 ## Build
 

@@ -39,7 +39,7 @@ void require_finite(Scalar value, const std::string& name) {
     return value;
 }
 
-[[nodiscard]] Scalar sigmoid(Scalar value) {
+[[nodiscard]] Scalar sigmoid(Scalar value) noexcept {
     if (value >= 0.0) {
         const Scalar z = std::exp(-value);
         return 1.0 / (1.0 + z);
@@ -208,6 +208,73 @@ T read_value(std::istream& stream, const std::string& name) {
     return value;
 }
 
+void apply_activation_in_place(Scalar* values, std::size_t size, Activation activation) noexcept {
+    switch (activation) {
+    case Activation::linear:
+        return;
+    case Activation::relu:
+        for (std::size_t i = 0; i < size; ++i) {
+            values[i] = values[i] > 0.0 ? values[i] : 0.0;
+        }
+        return;
+    case Activation::sigmoid:
+        for (std::size_t i = 0; i < size; ++i) {
+            values[i] = sigmoid(values[i]);
+        }
+        return;
+    case Activation::tanh:
+        for (std::size_t i = 0; i < size; ++i) {
+            values[i] = std::tanh(values[i]);
+        }
+        return;
+    case Activation::softmax: {
+        Scalar max_value = values[0];
+        for (std::size_t i = 1; i < size; ++i) {
+            if (values[i] > max_value) {
+                max_value = values[i];
+            }
+        }
+
+        Scalar sum = 0.0;
+        for (std::size_t i = 0; i < size; ++i) {
+            values[i] = std::exp(values[i] - max_value);
+            sum += values[i];
+        }
+        for (std::size_t i = 0; i < size; ++i) {
+            values[i] /= sum;
+        }
+        return;
+    }
+    }
+}
+
+void validate_layer_parameters(const std::vector<LayerParameters>& parameters) {
+    require(!parameters.empty(), "parameters must contain at least one layer");
+
+    std::size_t expected_input_size = parameters.front().input_size;
+    require(expected_input_size > 0, "input_size must be positive");
+
+    for (std::size_t i = 0; i < parameters.size(); ++i) {
+        const LayerParameters& layer = parameters[i];
+        require(layer.input_size == expected_input_size, "parameter input_size mismatch");
+        require(layer.output_size > 0, "parameter output_size must be positive");
+        require(layer.weights.size() == layer.input_size * layer.output_size,
+                "parameter weights size mismatch");
+        require(layer.biases.size() == layer.output_size, "parameter biases size mismatch");
+        if (layer.activation == Activation::softmax) {
+            require(i + 1 == parameters.size(), "softmax is only supported on the output layer");
+            require(layer.output_size >= 2, "softmax output layer must contain at least two neurons");
+        }
+        for (Scalar weight : layer.weights) {
+            require_finite(weight, "weight");
+        }
+        for (Scalar bias : layer.biases) {
+            require_finite(bias, "bias");
+        }
+        expected_input_size = layer.output_size;
+    }
+}
+
 } // namespace
 
 std::string to_string(Activation activation) {
@@ -249,6 +316,27 @@ std::string to_string(OptimizerType optimizer) {
     }
 
     throw std::invalid_argument("unknown optimizer");
+}
+
+std::string to_string(InferenceStatus status) {
+    switch (status) {
+    case InferenceStatus::ok:
+        return "ok";
+    case InferenceStatus::null_input:
+        return "null_input";
+    case InferenceStatus::null_output:
+        return "null_output";
+    case InferenceStatus::invalid_input_size:
+        return "invalid_input_size";
+    case InferenceStatus::invalid_output_size:
+        return "invalid_output_size";
+    case InferenceStatus::null_scratch:
+        return "null_scratch";
+    case InferenceStatus::insufficient_scratch:
+        return "insufficient_scratch";
+    }
+
+    throw std::invalid_argument("unknown inference status");
 }
 
 Activation activation_from_string(std::string_view value) {
@@ -308,7 +396,307 @@ OptimizerConfig OptimizerConfig::sgd(Scalar learning_rate, Scalar momentum) {
     return config;
 }
 
-struct Model::Impl {
+struct InferenceModel::Impl {
+    struct Layer {
+        std::size_t input_size{0};
+        std::size_t output_size{0};
+        std::size_t weight_offset{0};
+        std::size_t bias_offset{0};
+        Activation activation{Activation::linear};
+    };
+
+    std::size_t input_size{0};
+    std::size_t output_size{0};
+    std::size_t scratch_stride{0};
+    std::vector<Layer> layers;
+    Vector weights;
+    Vector biases;
+
+    [[nodiscard]] std::size_t scratch_size() const noexcept {
+        return scratch_stride == 0 ? 0 : scratch_stride * 2;
+    }
+};
+
+InferenceModel::InferenceModel(std::unique_ptr<Impl> impl)
+    : impl_(std::move(impl)) {}
+
+InferenceModel::InferenceModel(const InferenceModel& other)
+    : impl_(other.impl_ ? std::make_unique<Impl>(*other.impl_) : nullptr) {}
+
+InferenceModel& InferenceModel::operator=(const InferenceModel& other) {
+    if (this != &other) {
+        impl_ = other.impl_ ? std::make_unique<Impl>(*other.impl_) : nullptr;
+    }
+    return *this;
+}
+
+InferenceModel::InferenceModel(InferenceModel&& other) noexcept = default;
+
+InferenceModel& InferenceModel::operator=(InferenceModel&& other) noexcept = default;
+
+InferenceModel::~InferenceModel() = default;
+
+InferenceModel InferenceModel::from_parameters(const std::vector<LayerParameters>& parameters) {
+    validate_layer_parameters(parameters);
+
+    auto impl = std::make_unique<Impl>();
+    impl->input_size = parameters.front().input_size;
+    impl->output_size = parameters.back().output_size;
+    impl->layers.reserve(parameters.size());
+
+    std::size_t weight_count = 0;
+    std::size_t bias_count = 0;
+    std::size_t max_hidden_width = 0;
+    for (std::size_t i = 0; i < parameters.size(); ++i) {
+        const LayerParameters& layer = parameters[i];
+        weight_count += layer.weights.size();
+        bias_count += layer.biases.size();
+        if (i + 1 < parameters.size()) {
+            max_hidden_width = std::max(max_hidden_width, layer.output_size);
+        }
+    }
+
+    impl->weights.reserve(weight_count);
+    impl->biases.reserve(bias_count);
+    impl->scratch_stride = max_hidden_width;
+
+    for (const LayerParameters& source : parameters) {
+        const std::size_t weight_offset = impl->weights.size();
+        const std::size_t bias_offset = impl->biases.size();
+        impl->weights.insert(impl->weights.end(), source.weights.begin(), source.weights.end());
+        impl->biases.insert(impl->biases.end(), source.biases.begin(), source.biases.end());
+        impl->layers.push_back(Impl::Layer{
+            source.input_size,
+            source.output_size,
+            weight_offset,
+            bias_offset,
+            source.activation,
+        });
+    }
+
+    return InferenceModel(std::move(impl));
+}
+
+bool InferenceModel::empty() const noexcept {
+    return !impl_ || impl_->layers.empty();
+}
+
+std::size_t InferenceModel::input_size() const noexcept {
+    return empty() ? 0 : impl_->input_size;
+}
+
+std::size_t InferenceModel::output_size() const noexcept {
+    return empty() ? 0 : impl_->output_size;
+}
+
+std::size_t InferenceModel::layer_count() const noexcept {
+    return empty() ? 0 : impl_->layers.size();
+}
+
+std::size_t InferenceModel::scratch_size() const noexcept {
+    return empty() ? 0 : impl_->scratch_size();
+}
+
+std::size_t InferenceModel::weight_count() const noexcept {
+    return empty() ? 0 : impl_->weights.size();
+}
+
+std::size_t InferenceModel::bias_count() const noexcept {
+    return empty() ? 0 : impl_->biases.size();
+}
+
+const Scalar* InferenceModel::weights_data() const noexcept {
+    return empty() ? nullptr : impl_->weights.data();
+}
+
+const Scalar* InferenceModel::biases_data() const noexcept {
+    return empty() ? nullptr : impl_->biases.data();
+}
+
+InferenceStatus InferenceModel::predict_to(const Scalar* input,
+                                           std::size_t provided_input_size,
+                                           Scalar* output,
+                                           std::size_t provided_output_size,
+                                           Scalar* scratch,
+                                           std::size_t provided_scratch_size) const noexcept {
+    if (!input) {
+        return InferenceStatus::null_input;
+    }
+    if (!output) {
+        return InferenceStatus::null_output;
+    }
+    if (empty() || provided_input_size != impl_->input_size) {
+        return InferenceStatus::invalid_input_size;
+    }
+    if (provided_output_size != impl_->output_size) {
+        return InferenceStatus::invalid_output_size;
+    }
+    if (impl_->scratch_size() > 0 && !scratch) {
+        return InferenceStatus::null_scratch;
+    }
+    if (provided_scratch_size < impl_->scratch_size()) {
+        return InferenceStatus::insufficient_scratch;
+    }
+
+    const Scalar* previous = input;
+    Scalar* scratch_a = scratch;
+    Scalar* scratch_b = scratch ? scratch + impl_->scratch_stride : nullptr;
+    bool write_a = true;
+
+    for (std::size_t layer_index = 0; layer_index < impl_->layers.size(); ++layer_index) {
+        const Impl::Layer& layer = impl_->layers[layer_index];
+        const bool output_layer = layer_index + 1 == impl_->layers.size();
+        Scalar* target = output_layer ? output : (write_a ? scratch_a : scratch_b);
+
+        for (std::size_t out = 0; out < layer.output_size; ++out) {
+            Scalar value = impl_->biases[layer.bias_offset + out];
+            const std::size_t weight_offset = layer.weight_offset + out * layer.input_size;
+            for (std::size_t in = 0; in < layer.input_size; ++in) {
+                value += impl_->weights[weight_offset + in] * previous[in];
+            }
+            target[out] = value;
+        }
+
+        apply_activation_in_place(target, layer.output_size, layer.activation);
+        previous = target;
+        write_a = !write_a;
+    }
+
+    return InferenceStatus::ok;
+}
+
+Vector InferenceModel::predict(const Vector& input) const {
+    Vector output(output_size(), 0.0);
+    Vector scratch(scratch_size(), 0.0);
+    const InferenceStatus status =
+        predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), scratch.size());
+    if (status != InferenceStatus::ok) {
+        throw std::invalid_argument("inference failed: " + to_string(status));
+    }
+    return output;
+}
+
+Matrix InferenceModel::predict_batch(const Matrix& inputs) const {
+    validate_matrix(inputs, input_size(), "inputs", true);
+    Matrix result;
+    result.reserve(inputs.size());
+    Vector scratch(scratch_size(), 0.0);
+
+    for (const Vector& input : inputs) {
+        Vector output(output_size(), 0.0);
+        const InferenceStatus status =
+            predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), scratch.size());
+        if (status != InferenceStatus::ok) {
+            throw std::invalid_argument("inference failed: " + to_string(status));
+        }
+        result.push_back(std::move(output));
+    }
+
+    return result;
+}
+
+std::vector<LayerParameters> InferenceModel::parameters() const {
+    require(!empty(), "inference model is empty");
+    std::vector<LayerParameters> result;
+    result.reserve(impl_->layers.size());
+
+    for (const Impl::Layer& layer : impl_->layers) {
+        LayerParameters parameters;
+        parameters.input_size = layer.input_size;
+        parameters.output_size = layer.output_size;
+        parameters.activation = layer.activation;
+        parameters.weights.assign(impl_->weights.begin() + static_cast<std::ptrdiff_t>(layer.weight_offset),
+                                  impl_->weights.begin() + static_cast<std::ptrdiff_t>(layer.weight_offset +
+                                                                                      layer.input_size *
+                                                                                          layer.output_size));
+        parameters.biases.assign(impl_->biases.begin() + static_cast<std::ptrdiff_t>(layer.bias_offset),
+                                 impl_->biases.begin() + static_cast<std::ptrdiff_t>(layer.bias_offset +
+                                                                                    layer.output_size));
+        result.push_back(std::move(parameters));
+    }
+
+    return result;
+}
+
+void InferenceModel::save(const std::filesystem::path& path) const {
+    require(!empty(), "inference model is empty");
+
+    std::ofstream output(path);
+    if (!output) {
+        throw std::runtime_error("failed to open inference model file for writing: " + path.string());
+    }
+
+    output << std::setprecision(17);
+    output << "BRUTAL_MLP_INFERENCE_V1\n";
+    output << impl_->input_size << '\n';
+    output << impl_->layers.size() << '\n';
+
+    for (const Impl::Layer& layer : impl_->layers) {
+        output << layer.input_size << ' ' << layer.output_size << ' ' << to_string(layer.activation) << '\n';
+
+        const std::size_t weight_count = layer.input_size * layer.output_size;
+        output << weight_count;
+        for (std::size_t i = 0; i < weight_count; ++i) {
+            output << ' ' << impl_->weights[layer.weight_offset + i];
+        }
+        output << '\n';
+
+        output << layer.output_size;
+        for (std::size_t i = 0; i < layer.output_size; ++i) {
+            output << ' ' << impl_->biases[layer.bias_offset + i];
+        }
+        output << '\n';
+    }
+
+    if (!output) {
+        throw std::runtime_error("failed while writing inference model file: " + path.string());
+    }
+}
+
+InferenceModel InferenceModel::load(const std::filesystem::path& path) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to open inference model file for reading: " + path.string());
+    }
+
+    const std::string magic = read_token(input, "magic");
+    if (magic != "BRUTAL_MLP_INFERENCE_V1") {
+        throw std::runtime_error("unsupported inference model file format");
+    }
+
+    const std::size_t input_size = read_value<std::size_t>(input, "input_size");
+    const std::size_t layer_count = read_value<std::size_t>(input, "layer_count");
+    std::vector<LayerParameters> parameters;
+    parameters.reserve(layer_count);
+
+    std::size_t expected_input_size = input_size;
+    for (std::size_t i = 0; i < layer_count; ++i) {
+        LayerParameters layer;
+        layer.input_size = read_value<std::size_t>(input, "layer_input_size");
+        layer.output_size = read_value<std::size_t>(input, "layer_output_size");
+        layer.activation = activation_from_string(read_token(input, "layer_activation"));
+        require(layer.input_size == expected_input_size, "inference file topology is inconsistent");
+
+        const std::size_t weight_count = read_value<std::size_t>(input, "weight_count");
+        layer.weights.resize(weight_count);
+        for (Scalar& weight : layer.weights) {
+            weight = read_value<Scalar>(input, "weight");
+        }
+
+        const std::size_t bias_count = read_value<std::size_t>(input, "bias_count");
+        layer.biases.resize(bias_count);
+        for (Scalar& bias : layer.biases) {
+            bias = read_value<Scalar>(input, "bias");
+        }
+
+        expected_input_size = layer.output_size;
+        parameters.push_back(std::move(layer));
+    }
+
+    return InferenceModel::from_parameters(parameters);
+}
+
+struct TrainingModel::Impl {
     struct Layer {
         std::size_t input_size{0};
         std::size_t output_size{0};
@@ -658,32 +1046,32 @@ struct Model::Impl {
     }
 };
 
-Model::Builder& Model::Builder::input_size(std::size_t input_size) {
+TrainingModel::Builder& TrainingModel::Builder::input_size(std::size_t input_size) {
     input_size_ = input_size;
     return *this;
 }
 
-Model::Builder& Model::Builder::add_layer(std::size_t neurons, Activation activation) {
+TrainingModel::Builder& TrainingModel::Builder::add_layer(std::size_t neurons, Activation activation) {
     layers_.push_back(LayerSpec{neurons, activation});
     return *this;
 }
 
-Model::Builder& Model::Builder::loss(Loss loss_value) {
+TrainingModel::Builder& TrainingModel::Builder::loss(Loss loss_value) {
     loss_ = loss_value;
     return *this;
 }
 
-Model::Builder& Model::Builder::optimizer(OptimizerConfig optimizer_value) {
+TrainingModel::Builder& TrainingModel::Builder::optimizer(OptimizerConfig optimizer_value) {
     optimizer_ = optimizer_value;
     return *this;
 }
 
-Model::Builder& Model::Builder::seed(std::uint64_t seed_value) {
+TrainingModel::Builder& TrainingModel::Builder::seed(std::uint64_t seed_value) {
     seed_ = seed_value;
     return *this;
 }
 
-Model Model::Builder::build() const {
+TrainingModel TrainingModel::Builder::build() const {
     require(input_size_ > 0, "input_size must be positive");
     require(!layers_.empty(), "model must contain at least one layer");
     validate_optimizer(optimizer_);
@@ -746,53 +1134,53 @@ Model Model::Builder::build() const {
         impl->layers.push_back(std::move(layer));
     }
 
-    return Model(std::move(impl));
+    return TrainingModel(std::move(impl));
 }
 
-Model::Builder Model::builder() {
+TrainingModel::Builder TrainingModel::builder() {
     return Builder{};
 }
 
-Model::Model(std::unique_ptr<Impl> impl)
+TrainingModel::TrainingModel(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
 
-Model::Model(const Model& other)
+TrainingModel::TrainingModel(const TrainingModel& other)
     : impl_(std::make_unique<Impl>(*other.impl_)) {}
 
-Model& Model::operator=(const Model& other) {
+TrainingModel& TrainingModel::operator=(const TrainingModel& other) {
     if (this != &other) {
         impl_ = std::make_unique<Impl>(*other.impl_);
     }
     return *this;
 }
 
-Model::Model(Model&& other) noexcept = default;
+TrainingModel::TrainingModel(TrainingModel&& other) noexcept = default;
 
-Model& Model::operator=(Model&& other) noexcept = default;
+TrainingModel& TrainingModel::operator=(TrainingModel&& other) noexcept = default;
 
-Model::~Model() = default;
+TrainingModel::~TrainingModel() = default;
 
-std::size_t Model::input_size() const {
+std::size_t TrainingModel::input_size() const {
     return impl_->input_size;
 }
 
-std::size_t Model::output_size() const {
+std::size_t TrainingModel::output_size() const {
     return impl_->output_size();
 }
 
-std::size_t Model::layer_count() const {
+std::size_t TrainingModel::layer_count() const {
     return impl_->layers.size();
 }
 
-Loss Model::loss() const {
+Loss TrainingModel::loss() const {
     return impl_->loss;
 }
 
-OptimizerConfig Model::optimizer() const {
+OptimizerConfig TrainingModel::optimizer() const {
     return impl_->optimizer;
 }
 
-Vector Model::predict(const Vector& input) const {
+Vector TrainingModel::predict(const Vector& input) const {
     require(input.size() == input_size(), "input has an invalid size");
     for (Scalar value : input) {
         require_finite(value, "input value");
@@ -800,7 +1188,7 @@ Vector Model::predict(const Vector& input) const {
     return impl_->forward(input);
 }
 
-Matrix Model::predict_batch(const Matrix& inputs) const {
+Matrix TrainingModel::predict_batch(const Matrix& inputs) const {
     validate_matrix(inputs, input_size(), "inputs", true);
     Matrix result;
     result.reserve(inputs.size());
@@ -810,7 +1198,7 @@ Matrix Model::predict_batch(const Matrix& inputs) const {
     return result;
 }
 
-Scalar Model::evaluate_loss(const Matrix& inputs, const Matrix& targets) const {
+Scalar TrainingModel::evaluate_loss(const Matrix& inputs, const Matrix& targets) const {
     validate_training_data(inputs, targets, input_size(), output_size(), impl_->loss);
     Scalar total = 0.0;
     for (std::size_t i = 0; i < inputs.size(); ++i) {
@@ -819,7 +1207,7 @@ Scalar Model::evaluate_loss(const Matrix& inputs, const Matrix& targets) const {
     return total / static_cast<Scalar>(inputs.size());
 }
 
-TrainingHistory Model::fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options) {
+TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options) {
     validate_training_options(options);
     validate_training_data(inputs, targets, input_size(), output_size(), impl_->loss);
 
@@ -894,22 +1282,26 @@ TrainingHistory Model::fit(const Matrix& inputs, const Matrix& targets, const Tr
     return history;
 }
 
-std::vector<LayerParameters> Model::parameters() const {
+std::vector<LayerParameters> TrainingModel::parameters() const {
     return impl_->parameters();
 }
 
-void Model::set_parameters(const std::vector<LayerParameters>& parameters) {
+void TrainingModel::set_parameters(const std::vector<LayerParameters>& parameters) {
     impl_->set_parameters(parameters);
 }
 
-void Model::save(const std::filesystem::path& path) const {
+InferenceModel TrainingModel::to_inference_model() const {
+    return InferenceModel::from_parameters(impl_->parameters());
+}
+
+void TrainingModel::save(const std::filesystem::path& path) const {
     std::ofstream output(path);
     if (!output) {
         throw std::runtime_error("failed to open model file for writing: " + path.string());
     }
 
     output << std::setprecision(17);
-    output << "BRUTAL_MLP_V1\n";
+    output << "BRUTAL_MLP_TRAINING_V1\n";
     output << impl_->input_size << '\n';
     output << to_string(impl_->loss) << '\n';
     output << to_string(impl_->optimizer.type) << ' '
@@ -942,14 +1334,14 @@ void Model::save(const std::filesystem::path& path) const {
     }
 }
 
-Model Model::load(const std::filesystem::path& path) {
+TrainingModel TrainingModel::load(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) {
         throw std::runtime_error("failed to open model file for reading: " + path.string());
     }
 
     const std::string magic = read_token(input, "magic");
-    if (magic != "BRUTAL_MLP_V1") {
+    if (magic != "BRUTAL_MLP_TRAINING_V1" && magic != "BRUTAL_MLP_V1") {
         throw std::runtime_error("unsupported model file format");
     }
 
@@ -969,7 +1361,7 @@ Model Model::load(const std::filesystem::path& path) {
     const std::uint64_t seed = read_value<std::uint64_t>(input, "seed");
     const std::size_t layer_count = read_value<std::size_t>(input, "layer_count");
 
-    Builder builder = Model::builder()
+    Builder builder = TrainingModel::builder()
                           .input_size(input_size)
                           .loss(loss)
                           .optimizer(optimizer)
@@ -998,7 +1390,7 @@ Model Model::load(const std::filesystem::path& path) {
         parameters.push_back(std::move(layer));
     }
 
-    Model model = builder.build();
+    TrainingModel model = builder.build();
     model.set_parameters(parameters);
     return model;
 }
