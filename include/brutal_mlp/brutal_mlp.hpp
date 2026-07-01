@@ -327,12 +327,22 @@ private:
 };
 
 struct MiniBatch {
-    Matrix inputs;
-    Matrix targets;
+    Vector inputs;
+    Vector targets;
+    std::size_t sample_count{0};
+    std::size_t input_size{0};
+    std::size_t output_size{0};
 
+    void resize(std::size_t samples, std::size_t input_width, std::size_t output_width);
     [[nodiscard]] std::size_t size() const noexcept;
     [[nodiscard]] bool empty() const noexcept;
     void clear() noexcept;
+    [[nodiscard]] Scalar* input_data(std::size_t sample);
+    [[nodiscard]] const Scalar* input_data(std::size_t sample) const;
+    [[nodiscard]] Scalar* target_data(std::size_t sample);
+    [[nodiscard]] const Scalar* target_data(std::size_t sample) const;
+    [[nodiscard]] Vector input(std::size_t sample) const;
+    [[nodiscard]] Vector target(std::size_t sample) const;
 };
 
 class BatchGenerator {

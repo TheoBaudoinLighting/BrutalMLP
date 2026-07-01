@@ -882,13 +882,47 @@ TEST(DatasetPipeline, SplitViewAndBatchGeneratorWork) {
     bm::MiniBatch batch;
     ASSERT_TRUE(generator.next(batch));
     ASSERT_EQ(batch.size(), 4U);
-    expect_vector_near(batch.inputs.front(), {bm::Scalar{0}}, kTightTolerance);
-    expect_vector_near(batch.targets.back(), {bm::Scalar{7}}, kTightTolerance);
+    EXPECT_EQ(batch.sample_count, 4U);
+    EXPECT_EQ(batch.input_size, 1U);
+    EXPECT_EQ(batch.output_size, 1U);
+    EXPECT_EQ(batch.inputs.size(), batch.size() * batch.input_size);
+    EXPECT_EQ(batch.targets.size(), batch.size() * batch.output_size);
+    expect_vector_near(batch.input(0), {bm::Scalar{0}}, kTightTolerance);
+    expect_vector_near(batch.target(3), {bm::Scalar{7}}, kTightTolerance);
     ASSERT_TRUE(generator.next(batch));
     ASSERT_EQ(batch.size(), 4U);
     ASSERT_TRUE(generator.next(batch));
     ASSERT_EQ(batch.size(), 2U);
     EXPECT_FALSE(generator.next(batch));
+}
+
+TEST(DatasetPipeline, MiniBatchStoresRowsContiguously) {
+    const bm::Matrix inputs{{bm::Scalar{0}, bm::Scalar{10}},
+                            {bm::Scalar{1}, bm::Scalar{11}},
+                            {bm::Scalar{2}, bm::Scalar{12}}};
+    const bm::Matrix targets{{bm::Scalar{100}, bm::Scalar{200}},
+                             {bm::Scalar{101}, bm::Scalar{201}},
+                             {bm::Scalar{102}, bm::Scalar{202}}};
+    const bm::MatrixDataset dataset(inputs, targets);
+
+    bm::BatchGenerator generator(dataset, 2, false, 0);
+    bm::MiniBatch batch;
+    ASSERT_TRUE(generator.next(batch));
+
+    EXPECT_EQ(batch.inputs, (bm::Vector{bm::Scalar{0}, bm::Scalar{10}, bm::Scalar{1}, bm::Scalar{11}}));
+    EXPECT_EQ(batch.targets, (bm::Vector{bm::Scalar{100}, bm::Scalar{200}, bm::Scalar{101}, bm::Scalar{201}}));
+    EXPECT_EQ(batch.input_data(1)[0], bm::Scalar{1});
+    EXPECT_EQ(batch.input_data(1)[1], bm::Scalar{11});
+    EXPECT_EQ(batch.target_data(1)[0], bm::Scalar{101});
+    EXPECT_EQ(batch.target_data(1)[1], bm::Scalar{201});
+    expect_vector_near(batch.input(1), {bm::Scalar{1}, bm::Scalar{11}}, kTightTolerance);
+    expect_vector_near(batch.target(1), {bm::Scalar{101}, bm::Scalar{201}}, kTightTolerance);
+
+    batch.clear();
+    EXPECT_TRUE(batch.empty());
+    EXPECT_TRUE(batch.inputs.empty());
+    EXPECT_TRUE(batch.targets.empty());
+    EXPECT_THROW((void)batch.input(0), std::invalid_argument);
 }
 
 TEST(DatasetPipeline, GeneratedDatasetCanTrainWithoutMatrixStorage) {

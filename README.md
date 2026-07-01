@@ -204,9 +204,15 @@ brutal_mlp::BatchGenerator batches(dataset, 128, true, 123);
 brutal_mlp::MiniBatch batch;
 
 while (batches.next(batch)) {
-    // batch.inputs and batch.targets contain only this mini-batch.
+    // Row-major contiguous buffers:
+    // batch.inputs.size() == batch.size() * batch.input_size
+    // batch.targets.size() == batch.size() * batch.output_size
+    const brutal_mlp::Scalar* first_input = batch.input_data(0);
+    const brutal_mlp::Scalar* first_target = batch.target_data(0);
 }
 ```
+
+`MiniBatch::input(i)` and `MiniBatch::target(i)` are convenience copies. Hot paths should use `input_data(i)` and `target_data(i)`.
 
 Generated datasets fill caller-owned sample buffers:
 

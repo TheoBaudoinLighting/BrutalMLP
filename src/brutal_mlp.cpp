@@ -194,7 +194,8 @@ void validate_matrix(const Matrix& matrix,
     }
 }
 
-void validate_target_for_loss(const Vector& target, Loss loss) {
+void validate_target_for_loss(const Scalar* target, std::size_t target_size, Loss loss) {
+    require(target != nullptr || target_size == 0, "target buffer must not be null");
     switch (loss) {
     case Loss::mean_squared_error:
     case Loss::mean_absolute_error:
@@ -205,14 +206,16 @@ void validate_target_for_loss(const Vector& target, Loss loss) {
     case Loss::custom:
         return;
     case Loss::binary_cross_entropy:
-        for (Scalar value : target) {
+        for (std::size_t i = 0; i < target_size; ++i) {
+            const Scalar value = target[i];
             require(value >= Scalar{0} && value <= Scalar{1},
                     "binary_cross_entropy targets must be in [0, 1]");
         }
         return;
     case Loss::categorical_cross_entropy: {
         Scalar sum = Scalar{0};
-        for (Scalar value : target) {
+        for (std::size_t i = 0; i < target_size; ++i) {
+            const Scalar value = target[i];
             require(value >= Scalar{0}, "categorical_cross_entropy targets must be non-negative");
             sum += value;
         }
@@ -223,6 +226,10 @@ void validate_target_for_loss(const Vector& target, Loss loss) {
     }
 
     throw std::invalid_argument("unknown loss");
+}
+
+void validate_target_for_loss(const Vector& target, Loss loss) {
+    validate_target_for_loss(target.data(), target.size(), loss);
 }
 
 void validate_targets_for_loss(const Matrix& targets, Loss loss) {
@@ -260,6 +267,22 @@ void validate_sample_values(const Vector& input, const Vector& target, Loss loss
         require_finite(value, "dataset target value");
     }
     validate_target_for_loss(target, loss);
+}
+
+void validate_sample_values(const Scalar* input,
+                            std::size_t input_size,
+                            const Scalar* target,
+                            std::size_t target_size,
+                            Loss loss) {
+    require(input != nullptr || input_size == 0, "dataset input buffer must not be null");
+    require(target != nullptr || target_size == 0, "dataset target buffer must not be null");
+    for (std::size_t i = 0; i < input_size; ++i) {
+        require_finite(input[i], "dataset input value");
+    }
+    for (std::size_t i = 0; i < target_size; ++i) {
+        require_finite(target[i], "dataset target value");
+    }
+    validate_target_for_loss(target, target_size, loss);
 }
 
 void validate_dataset_split_options(const DatasetSplitOptions& options) {
@@ -708,17 +731,30 @@ void validate_normalization_for_loss(const NormalizationSpec& normalization, con
     return result;
 }
 
+void normalize_buffer_into(const Scalar* values,
+                           std::size_t size,
+                           const std::vector<FeatureNormalization>& features,
+                           Scalar* result) {
+    require(values != nullptr || size == 0, "normalization input buffer must not be null");
+    require(result != nullptr || size == 0, "normalization output buffer must not be null");
+    require(features.empty() || features.size() == size, "normalization feature count mismatch");
+    if (size == 0) {
+        return;
+    }
+    if (!has_feature_normalization(features)) {
+        std::copy(values, values + size, result);
+        return;
+    }
+    for (std::size_t i = 0; i < size; ++i) {
+        result[i] = normalize_value(values[i], features[i]);
+    }
+}
+
 void normalize_vector_into(const Vector& values,
                            const std::vector<FeatureNormalization>& features,
                            Vector& result) {
     result.resize(values.size());
-    if (!has_feature_normalization(features)) {
-        std::copy(values.begin(), values.end(), result.begin());
-        return;
-    }
-    for (std::size_t i = 0; i < values.size(); ++i) {
-        result[i] = normalize_value(values[i], features[i]);
-    }
+    normalize_buffer_into(values.data(), values.size(), features, result.data());
 }
 
 [[nodiscard]] Vector denormalize_vector(const Vector& values, const std::vector<FeatureNormalization>& features) {
@@ -1513,17 +1549,60 @@ void DatasetView::sample(std::size_t index,
     source_->sample(indices_[index], input, provided_input_size, target, provided_target_size);
 }
 
+void MiniBatch::resize(std::size_t samples, std::size_t input_width, std::size_t output_width) {
+    require(input_width > 0 || samples == 0, "mini-batch input width must be positive");
+    require(output_width > 0 || samples == 0, "mini-batch output width must be positive");
+    sample_count = samples;
+    input_size = input_width;
+    output_size = output_width;
+    inputs.resize(sample_count * input_size);
+    targets.resize(sample_count * output_size);
+}
+
 std::size_t MiniBatch::size() const noexcept {
-    return inputs.size();
+    return sample_count;
 }
 
 bool MiniBatch::empty() const noexcept {
-    return inputs.empty();
+    return sample_count == 0;
 }
 
 void MiniBatch::clear() noexcept {
+    sample_count = 0;
+    input_size = 0;
+    output_size = 0;
     inputs.clear();
     targets.clear();
+}
+
+Scalar* MiniBatch::input_data(std::size_t sample) {
+    require(sample < sample_count, "mini-batch input sample index is out of range");
+    return inputs.data() + sample * input_size;
+}
+
+const Scalar* MiniBatch::input_data(std::size_t sample) const {
+    require(sample < sample_count, "mini-batch input sample index is out of range");
+    return inputs.data() + sample * input_size;
+}
+
+Scalar* MiniBatch::target_data(std::size_t sample) {
+    require(sample < sample_count, "mini-batch target sample index is out of range");
+    return targets.data() + sample * output_size;
+}
+
+const Scalar* MiniBatch::target_data(std::size_t sample) const {
+    require(sample < sample_count, "mini-batch target sample index is out of range");
+    return targets.data() + sample * output_size;
+}
+
+Vector MiniBatch::input(std::size_t sample) const {
+    const Scalar* row = input_data(sample);
+    return Vector(row, row + input_size);
+}
+
+Vector MiniBatch::target(std::size_t sample) const {
+    const Scalar* row = target_data(sample);
+    return Vector(row, row + output_size);
 }
 
 struct BatchGenerator::Impl {
@@ -1533,8 +1612,6 @@ struct BatchGenerator::Impl {
     std::uint64_t seed{0};
     std::size_t cursor{0};
     std::vector<std::size_t> indices;
-    Vector input_buffer;
-    Vector target_buffer;
 };
 
 BatchGenerator::BatchGenerator(const Dataset& dataset,
@@ -1548,8 +1625,6 @@ BatchGenerator::BatchGenerator(const Dataset& dataset,
     impl_->batch_size = batch_size;
     impl_->shuffle = shuffle;
     impl_->seed = seed;
-    impl_->input_buffer.resize(dataset.input_size());
-    impl_->target_buffer.resize(dataset.output_size());
     reset();
 }
 
@@ -1587,18 +1662,16 @@ bool BatchGenerator::next(MiniBatch& batch) {
     }
 
     const std::size_t count = std::min(impl_->batch_size, impl_->indices.size() - impl_->cursor);
-    batch.inputs.reserve(count);
-    batch.targets.reserve(count);
+    batch.resize(count, impl_->dataset->input_size(), impl_->dataset->output_size());
     for (std::size_t i = 0; i < count; ++i) {
-        const std::size_t row = impl_->indices[impl_->cursor++];
+        const std::size_t row = impl_->indices[impl_->cursor + i];
         impl_->dataset->sample(row,
-                               impl_->input_buffer.data(),
-                               impl_->input_buffer.size(),
-                               impl_->target_buffer.data(),
-                               impl_->target_buffer.size());
-        batch.inputs.push_back(impl_->input_buffer);
-        batch.targets.push_back(impl_->target_buffer);
+                               batch.input_data(i),
+                               batch.input_size,
+                               batch.target_data(i),
+                               batch.output_size);
     }
+    impl_->cursor += count;
     return true;
 }
 
@@ -2410,14 +2483,17 @@ struct TrainingModel::Impl {
                                   normalization.output_features);
     }
 
-    [[nodiscard]] Vector forward_cached(const Vector& input,
+    [[nodiscard]] Vector forward_cached(const Scalar* input,
+                                        std::size_t input_count,
                                         std::vector<Vector>& activations,
                                         std::vector<Vector>& pre_activations) const {
+        require(input != nullptr, "input buffer must not be null");
+        require(input_count == input_size, "input has an invalid size");
         activations.clear();
         pre_activations.clear();
         activations.reserve(layers.size() + 1);
         pre_activations.reserve(layers.size());
-        activations.push_back(input);
+        activations.emplace_back(input, input + input_count);
 
         for (const Layer& layer : layers) {
             const Vector& previous = activations.back();
@@ -2435,6 +2511,12 @@ struct TrainingModel::Impl {
         }
 
         return activations.back();
+    }
+
+    [[nodiscard]] Vector forward_cached(const Vector& input,
+                                        std::vector<Vector>& activations,
+                                        std::vector<Vector>& pre_activations) const {
+        return forward_cached(input.data(), input.size(), activations, pre_activations);
     }
 
     [[nodiscard]] Scalar sample_loss(const Vector& prediction, const Vector& target) const {
@@ -2511,8 +2593,11 @@ struct TrainingModel::Impl {
     }
 
     [[nodiscard]] Vector output_delta(const Vector& prediction,
-                                      const Vector& target,
+                                      const Scalar* target,
+                                      std::size_t target_count,
                                       const Vector& output_pre_activation) const {
+        require(target != nullptr, "target buffer must not be null");
+        require(target_count == prediction.size(), "target has an invalid size");
         const Layer& output_layer = layers.back();
         Vector delta(prediction.size(), Scalar{0});
 
@@ -2604,7 +2689,7 @@ struct TrainingModel::Impl {
             break;
         case Loss::custom:
             loss.custom_loss.gradient(prediction.data(),
-                                      target.data(),
+                                      target,
                                       prediction.size(),
                                       activation_gradient.data(),
                                       loss.custom_loss.context);
@@ -2632,11 +2717,24 @@ struct TrainingModel::Impl {
         return delta;
     }
 
+    [[nodiscard]] Vector output_delta(const Vector& prediction,
+                                      const Vector& target,
+                                      const Vector& output_pre_activation) const {
+        return output_delta(prediction, target.data(), target.size(), output_pre_activation);
+    }
+
     void accumulate_gradients(const Vector& input, const Vector& target) {
+        accumulate_gradients(input.data(), input.size(), target.data(), target.size());
+    }
+
+    void accumulate_gradients(const Scalar* input,
+                              std::size_t input_count,
+                              const Scalar* target,
+                              std::size_t target_count) {
         std::vector<Vector> activations;
         std::vector<Vector> pre_activations;
-        const Vector prediction = forward_cached(input, activations, pre_activations);
-        Vector delta = output_delta(prediction, target, pre_activations.back());
+        const Vector prediction = forward_cached(input, input_count, activations, pre_activations);
+        Vector delta = output_delta(prediction, target, target_count, pre_activations.back());
 
         for (std::size_t layer_offset = layers.size(); layer_offset-- > 0;) {
             Layer& layer = layers[layer_offset];
@@ -2667,6 +2765,17 @@ struct TrainingModel::Impl {
                                                   activations[layer_offset][in]);
             }
             delta = std::move(previous_delta);
+        }
+    }
+
+    void accumulate_batch_gradients(const MiniBatch& batch) {
+        require(batch.input_size == input_size, "mini-batch input width mismatch");
+        require(batch.output_size == output_size(), "mini-batch output width mismatch");
+        for (std::size_t sample = 0; sample < batch.size(); ++sample) {
+            accumulate_gradients(batch.input_data(sample),
+                                 batch.input_size,
+                                 batch.target_data(sample),
+                                 batch.output_size);
         }
     }
 
@@ -2776,13 +2885,29 @@ struct TrainingModel::Impl {
         return total / static_cast<Scalar>(indices.size());
     }
 
+    void normalize_sample(const Scalar* raw_input,
+                          std::size_t raw_input_size,
+                          const Scalar* raw_target,
+                          std::size_t raw_target_size,
+                          Scalar* normalized_input,
+                          Scalar* normalized_target) const {
+        validate_sample_values(raw_input, raw_input_size, raw_target, raw_target_size, loss.type);
+        normalize_buffer_into(raw_input, raw_input_size, normalization.input_features, normalized_input);
+        normalize_buffer_into(raw_target, raw_target_size, normalization.output_features, normalized_target);
+    }
+
     void normalize_sample(const Vector& raw_input,
                           const Vector& raw_target,
                           Vector& normalized_input,
                           Vector& normalized_target) const {
-        validate_sample_values(raw_input, raw_target, loss.type);
-        normalize_vector_into(raw_input, normalization.input_features, normalized_input);
-        normalize_vector_into(raw_target, normalization.output_features, normalized_target);
+        normalized_input.resize(raw_input.size());
+        normalized_target.resize(raw_target.size());
+        normalize_sample(raw_input.data(),
+                         raw_input.size(),
+                         raw_target.data(),
+                         raw_target.size(),
+                         normalized_input.data(),
+                         normalized_target.data());
     }
 
     void read_dataset_sample(const Dataset& dataset,
@@ -2793,6 +2918,32 @@ struct TrainingModel::Impl {
                              Vector& normalized_target) const {
         dataset.sample(index, raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size());
         normalize_sample(raw_input, raw_target, normalized_input, normalized_target);
+    }
+
+    void fill_dataset_batch(const Dataset& dataset,
+                            const std::vector<std::size_t>& indices,
+                            std::size_t begin,
+                            std::size_t count,
+                            MiniBatch& raw_batch,
+                            MiniBatch& normalized_batch) const {
+        require(begin <= indices.size(), "batch begin index is out of range");
+        require(count <= indices.size() - begin, "batch count is out of range");
+        raw_batch.resize(count, input_size, output_size());
+        normalized_batch.resize(count, input_size, output_size());
+
+        for (std::size_t sample = 0; sample < count; ++sample) {
+            dataset.sample(indices[begin + sample],
+                           raw_batch.input_data(sample),
+                           raw_batch.input_size,
+                           raw_batch.target_data(sample),
+                           raw_batch.output_size);
+            normalize_sample(raw_batch.input_data(sample),
+                             raw_batch.input_size,
+                             raw_batch.target_data(sample),
+                             raw_batch.output_size,
+                             normalized_batch.input_data(sample),
+                             normalized_batch.target_data(sample));
+        }
     }
 
     [[nodiscard]] Scalar loss_for_dataset_indices(const Dataset& dataset,
@@ -3088,10 +3239,8 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
     std::vector<LayerParameters> best_parameters;
     std::size_t stale_epochs = 0;
 
-    Vector raw_input(input_size());
-    Vector raw_target(output_size());
-    Vector normalized_input(input_size());
-    Vector normalized_target(output_size());
+    MiniBatch raw_batch;
+    MiniBatch normalized_batch;
 
     for (std::size_t epoch = 0; epoch < options.epochs; ++epoch) {
         std::mt19937_64 epoch_rng(non_zero_seed(options.seed, impl_->seed) + epoch);
@@ -3099,18 +3248,11 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
             std::shuffle(training_indices.begin(), training_indices.end(), epoch_rng);
         }
 
-        impl_->zero_gradients();
-        std::size_t batch_count = 0;
-        for (std::size_t row : training_indices) {
-            impl_->read_dataset_sample(dataset, row, raw_input, raw_target, normalized_input, normalized_target);
-            impl_->accumulate_gradients(normalized_input, normalized_target);
-            ++batch_count;
-            if (batch_count == options.batch_size) {
-                impl_->apply_gradients(batch_count);
-                batch_count = 0;
-            }
-        }
-        if (batch_count > 0) {
+        for (std::size_t begin = 0; begin < training_indices.size(); begin += options.batch_size) {
+            const std::size_t batch_count = std::min(options.batch_size, training_indices.size() - begin);
+            impl_->fill_dataset_batch(dataset, training_indices, begin, batch_count, raw_batch, normalized_batch);
+            impl_->zero_gradients();
+            impl_->accumulate_batch_gradients(normalized_batch);
             impl_->apply_gradients(batch_count);
         }
 
