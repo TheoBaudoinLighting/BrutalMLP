@@ -118,6 +118,12 @@ TEST(ApiShape, ModelIsLegacyAliasForTrainingModel) {
                   "Model should remain a source-compatible alias for TrainingModel");
     static_assert(noexcept(std::declval<const bm::InferenceModel&>().predict_to(nullptr, 0, nullptr, 0, nullptr, 0)),
                   "InferenceModel::predict_to must remain noexcept");
+    static_assert(noexcept(std::declval<const bm::InferenceModel&>().predict_to(
+                      nullptr, 0, std::declval<bm::InferenceWorkspace&>())),
+                  "InferenceModel::predict_to(workspace) must remain noexcept");
+    static_assert(noexcept(std::declval<const bm::InferenceModel&>().predict_batch_to(
+                      nullptr, 0, 0, nullptr, 0, nullptr, 0)),
+                  "InferenceModel::predict_batch_to must remain noexcept");
 }
 
 TEST(StringConversions, RoundTripSupportedEnums) {
@@ -138,6 +144,8 @@ TEST(StringConversions, RoundTripSupportedEnums) {
     EXPECT_EQ(bm::optimizer_type_from_string(bm::to_string(bm::OptimizerType::adam)), bm::OptimizerType::adam);
 
     EXPECT_EQ(bm::to_string(bm::InferenceStatus::ok), "ok");
+    EXPECT_EQ(bm::to_string(bm::InferenceStatus::invalid_input_stride), "invalid_input_stride");
+    EXPECT_EQ(bm::to_string(bm::InferenceStatus::invalid_output_stride), "invalid_output_stride");
     EXPECT_EQ(bm::to_string(bm::InferenceStatus::insufficient_scratch), "insufficient_scratch");
 }
 
@@ -535,6 +543,63 @@ TEST(InferenceModel, PredictToDoesNotAllocateOnHotPath) {
     EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0U);
 }
 
+TEST(InferenceModel, WorkspacePredictDoesNotAllocateOnHotPath) {
+    const auto inference = make_known_two_layer_model().to_inference_model();
+    const bm::Vector input{2.0, -1.0};
+    bm::InferenceWorkspace workspace(inference);
+
+    EXPECT_EQ(workspace.output_size(), inference.output_size());
+    EXPECT_EQ(workspace.scratch_size(), inference.scratch_size());
+
+    g_allocation_count.store(0, std::memory_order_relaxed);
+    g_count_allocations.store(true, std::memory_order_relaxed);
+    const auto status = inference.predict_to(input.data(), input.size(), workspace);
+    g_count_allocations.store(false, std::memory_order_relaxed);
+
+    EXPECT_EQ(status, bm::InferenceStatus::ok);
+    EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0U);
+    expect_vector_near(workspace.output(), inference.predict(input), 1e-12);
+}
+
+TEST(InferenceModel, BatchPredictToMatchesScalarPredictionAndDoesNotAllocate) {
+    const auto inference = make_known_two_layer_model().to_inference_model();
+    const std::size_t samples = 3;
+    const std::size_t input_stride = 4;
+    const std::size_t output_stride = 3;
+
+    bm::Vector inputs(samples * input_stride, -777.0);
+    inputs[0] = 2.0;
+    inputs[1] = -1.0;
+    inputs[input_stride] = -1.0;
+    inputs[input_stride + 1] = 0.5;
+    inputs[2 * input_stride] = 0.25;
+    inputs[2 * input_stride + 1] = 3.0;
+
+    bm::Vector outputs(samples * output_stride, -999.0);
+    bm::Vector scratch(inference.scratch_size(), 0.0);
+
+    g_allocation_count.store(0, std::memory_order_relaxed);
+    g_count_allocations.store(true, std::memory_order_relaxed);
+    const auto status = inference.predict_batch_to(inputs.data(),
+                                                   samples,
+                                                   input_stride,
+                                                   outputs.data(),
+                                                   output_stride,
+                                                   scratch.data(),
+                                                   scratch.size());
+    g_count_allocations.store(false, std::memory_order_relaxed);
+
+    EXPECT_EQ(status, bm::InferenceStatus::ok);
+    EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0U);
+
+    for (std::size_t sample = 0; sample < samples; ++sample) {
+        bm::Vector input{inputs[sample * input_stride], inputs[sample * input_stride + 1]};
+        bm::Vector actual{outputs[sample * output_stride], outputs[sample * output_stride + 1]};
+        expect_vector_near(actual, inference.predict(input), 1e-12);
+        EXPECT_EQ(outputs[sample * output_stride + 2], -999.0);
+    }
+}
+
 TEST(InferenceModel, PredictToReportsStatusInsteadOfThrowing) {
     const auto inference = make_known_two_layer_model().to_inference_model();
     const bm::Vector input{2.0, -1.0};
@@ -553,6 +618,28 @@ TEST(InferenceModel, PredictToReportsStatusInsteadOfThrowing) {
               bm::InferenceStatus::null_scratch);
     EXPECT_EQ(inference.predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), 1),
               bm::InferenceStatus::insufficient_scratch);
+}
+
+TEST(InferenceModel, BatchPredictToReportsStatusInsteadOfThrowing) {
+    const auto inference = make_known_two_layer_model().to_inference_model();
+    bm::Vector inputs{2.0, -1.0, 0.5, 3.0};
+    bm::Vector outputs(4, 0.0);
+    bm::Vector scratch(inference.scratch_size(), 0.0);
+
+    EXPECT_EQ(inference.predict_batch_to(nullptr, 2, 2, outputs.data(), 2, scratch.data(), scratch.size()),
+              bm::InferenceStatus::null_input);
+    EXPECT_EQ(inference.predict_batch_to(inputs.data(), 2, 2, nullptr, 2, scratch.data(), scratch.size()),
+              bm::InferenceStatus::null_output);
+    EXPECT_EQ(inference.predict_batch_to(inputs.data(), 2, 1, outputs.data(), 2, scratch.data(), scratch.size()),
+              bm::InferenceStatus::invalid_input_stride);
+    EXPECT_EQ(inference.predict_batch_to(inputs.data(), 2, 2, outputs.data(), 1, scratch.data(), scratch.size()),
+              bm::InferenceStatus::invalid_output_stride);
+    EXPECT_EQ(inference.predict_batch_to(inputs.data(), 2, 2, outputs.data(), 2, nullptr, scratch.size()),
+              bm::InferenceStatus::null_scratch);
+    EXPECT_EQ(inference.predict_batch_to(inputs.data(), 2, 2, outputs.data(), 2, scratch.data(), 1),
+              bm::InferenceStatus::insufficient_scratch);
+    EXPECT_EQ(inference.predict_batch_to(nullptr, 0, 0, nullptr, 0, nullptr, 0),
+              bm::InferenceStatus::ok);
 }
 
 TEST(InferenceModel, OneLayerModelDoesNotRequireScratch) {

@@ -330,6 +330,10 @@ std::string to_string(InferenceStatus status) {
         return "invalid_input_size";
     case InferenceStatus::invalid_output_size:
         return "invalid_output_size";
+    case InferenceStatus::invalid_input_stride:
+        return "invalid_input_stride";
+    case InferenceStatus::invalid_output_stride:
+        return "invalid_output_stride";
     case InferenceStatus::null_scratch:
         return "null_scratch";
     case InferenceStatus::insufficient_scratch:
@@ -565,6 +569,64 @@ InferenceStatus InferenceModel::predict_to(const Scalar* input,
     return InferenceStatus::ok;
 }
 
+InferenceStatus InferenceModel::predict_to(const Scalar* input,
+                                           std::size_t provided_input_size,
+                                           InferenceWorkspace& workspace) const noexcept {
+    return predict_to(input,
+                      provided_input_size,
+                      workspace.output_data(),
+                      workspace.output_size(),
+                      workspace.scratch_data(),
+                      workspace.scratch_size());
+}
+
+InferenceStatus InferenceModel::predict_batch_to(const Scalar* inputs,
+                                                 std::size_t sample_count,
+                                                 std::size_t input_stride,
+                                                 Scalar* outputs,
+                                                 std::size_t output_stride,
+                                                 Scalar* scratch,
+                                                 std::size_t provided_scratch_size) const noexcept {
+    if (empty()) {
+        return InferenceStatus::invalid_input_size;
+    }
+    if (sample_count == 0) {
+        return InferenceStatus::ok;
+    }
+    if (!inputs) {
+        return InferenceStatus::null_input;
+    }
+    if (!outputs) {
+        return InferenceStatus::null_output;
+    }
+    if (input_stride < impl_->input_size) {
+        return InferenceStatus::invalid_input_stride;
+    }
+    if (output_stride < impl_->output_size) {
+        return InferenceStatus::invalid_output_stride;
+    }
+    if (impl_->scratch_size() > 0 && !scratch) {
+        return InferenceStatus::null_scratch;
+    }
+    if (provided_scratch_size < impl_->scratch_size()) {
+        return InferenceStatus::insufficient_scratch;
+    }
+
+    for (std::size_t sample = 0; sample < sample_count; ++sample) {
+        const InferenceStatus status = predict_to(inputs + sample * input_stride,
+                                                  impl_->input_size,
+                                                  outputs + sample * output_stride,
+                                                  impl_->output_size,
+                                                  scratch,
+                                                  provided_scratch_size);
+        if (status != InferenceStatus::ok) {
+            return status;
+        }
+    }
+
+    return InferenceStatus::ok;
+}
+
 Vector InferenceModel::predict(const Vector& input) const {
     Vector output(output_size(), 0.0);
     Vector scratch(scratch_size(), 0.0);
@@ -593,6 +655,48 @@ Matrix InferenceModel::predict_batch(const Matrix& inputs) const {
     }
 
     return result;
+}
+
+InferenceWorkspace::InferenceWorkspace(const InferenceModel& model) {
+    resize_for(model);
+}
+
+void InferenceWorkspace::resize_for(const InferenceModel& model) {
+    output_.assign(model.output_size(), 0.0);
+    scratch_.assign(model.scratch_size(), 0.0);
+}
+
+void InferenceWorkspace::clear() noexcept {
+    output_.clear();
+    scratch_.clear();
+}
+
+std::size_t InferenceWorkspace::output_size() const noexcept {
+    return output_.size();
+}
+
+std::size_t InferenceWorkspace::scratch_size() const noexcept {
+    return scratch_.size();
+}
+
+Scalar* InferenceWorkspace::output_data() noexcept {
+    return output_.data();
+}
+
+const Scalar* InferenceWorkspace::output_data() const noexcept {
+    return output_.data();
+}
+
+Scalar* InferenceWorkspace::scratch_data() noexcept {
+    return scratch_.data();
+}
+
+const Scalar* InferenceWorkspace::scratch_data() const noexcept {
+    return scratch_.data();
+}
+
+const Vector& InferenceWorkspace::output() const noexcept {
+    return output_;
 }
 
 std::vector<LayerParameters> InferenceModel::parameters() const {

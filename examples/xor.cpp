@@ -27,21 +27,15 @@ int main() {
     training.fit(inputs, targets, options);
 
     const auto inference = training.to_inference_model();
-    brutal_mlp::Vector output(inference.output_size(), 0.0);
-    brutal_mlp::Vector scratch(inference.scratch_size(), 0.0);
+    brutal_mlp::InferenceWorkspace workspace(inference);
 
     for (const auto& input : inputs) {
-        const auto status = inference.predict_to(input.data(),
-                                                 input.size(),
-                                                 output.data(),
-                                                 output.size(),
-                                                 scratch.data(),
-                                                 scratch.size());
+        const auto status = inference.predict_to(input.data(), input.size(), workspace);
         if (status != brutal_mlp::InferenceStatus::ok) {
             std::cerr << "inference failed: " << brutal_mlp::to_string(status) << '\n';
             return 1;
         }
-        std::cout << input[0] << " xor " << input[1] << " = " << output[0] << '\n';
+        std::cout << input[0] << " xor " << input[1] << " = " << workspace.output()[0] << '\n';
     }
 
     return 0;

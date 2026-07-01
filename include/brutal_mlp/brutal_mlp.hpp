@@ -39,6 +39,8 @@ enum class InferenceStatus {
     null_output,
     invalid_input_size,
     invalid_output_size,
+    invalid_input_stride,
+    invalid_output_stride,
     null_scratch,
     insufficient_scratch
 };
@@ -95,6 +97,8 @@ struct LayerParameters {
     Vector biases;
 };
 
+class InferenceWorkspace;
+
 class InferenceModel {
 public:
     [[nodiscard]] static InferenceModel from_parameters(const std::vector<LayerParameters>& parameters);
@@ -122,6 +126,16 @@ public:
                                              std::size_t output_size,
                                              Scalar* scratch,
                                              std::size_t scratch_size) const noexcept;
+    [[nodiscard]] InferenceStatus predict_to(const Scalar* input,
+                                             std::size_t input_size,
+                                             InferenceWorkspace& workspace) const noexcept;
+    [[nodiscard]] InferenceStatus predict_batch_to(const Scalar* inputs,
+                                                   std::size_t sample_count,
+                                                   std::size_t input_stride,
+                                                   Scalar* outputs,
+                                                   std::size_t output_stride,
+                                                   Scalar* scratch,
+                                                   std::size_t scratch_size) const noexcept;
 
     [[nodiscard]] Vector predict(const Vector& input) const;
     [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
@@ -135,6 +149,27 @@ private:
     explicit InferenceModel(std::unique_ptr<Impl> impl);
 
     std::unique_ptr<Impl> impl_;
+};
+
+class InferenceWorkspace {
+public:
+    InferenceWorkspace() = default;
+    explicit InferenceWorkspace(const InferenceModel& model);
+
+    void resize_for(const InferenceModel& model);
+    void clear() noexcept;
+
+    [[nodiscard]] std::size_t output_size() const noexcept;
+    [[nodiscard]] std::size_t scratch_size() const noexcept;
+    [[nodiscard]] Scalar* output_data() noexcept;
+    [[nodiscard]] const Scalar* output_data() const noexcept;
+    [[nodiscard]] Scalar* scratch_data() noexcept;
+    [[nodiscard]] const Scalar* scratch_data() const noexcept;
+    [[nodiscard]] const Vector& output() const noexcept;
+
+private:
+    Vector output_{};
+    Vector scratch_{};
 };
 
 class TrainingModel {

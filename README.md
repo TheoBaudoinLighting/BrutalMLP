@@ -7,7 +7,8 @@ The runtime library only uses the C++ standard library. GoogleTest and Google Be
 ## API split
 
 - `brutal_mlp::TrainingModel`: owns training state, gradients, optimizer moments, validation, history, serialization, and debug-friendly APIs.
-- `brutal_mlp::InferenceModel`: frozen model for production inference. It stores weights and biases contiguously, has no optimizer or gradient state, and exposes `predict_to(...) noexcept` so callers provide input, output, and scratch buffers.
+- `brutal_mlp::InferenceModel`: frozen model for production inference. It stores weights and biases contiguously, has no optimizer or gradient state, and exposes `predict_to(...) noexcept` and `predict_batch_to(...) noexcept` so callers provide all runtime buffers.
+- `brutal_mlp::InferenceWorkspace`: reusable output + scratch storage for single-sample inference. Allocate one per thread, worker, renderer tile, or calling context, then reuse it.
 - `brutal_mlp::Model`: legacy alias for `TrainingModel`.
 
 ## Integration
@@ -60,22 +61,32 @@ training.fit(x, y, options);
 auto inference = training.to_inference_model();
 
 brutal_mlp::Vector input{1.0, 0.0};
-brutal_mlp::Vector output(inference.output_size());
-brutal_mlp::Vector scratch(inference.scratch_size());
+brutal_mlp::InferenceWorkspace workspace(inference);
 
-auto status = inference.predict_to(input.data(),
-                                   input.size(),
-                                   output.data(),
-                                   output.size(),
-                                   scratch.data(),
-                                   scratch.size());
+auto status = inference.predict_to(input.data(), input.size(), workspace);
 
 if (status != brutal_mlp::InferenceStatus::ok) {
     // Handle invalid buffers or shape mismatch outside the hot path.
 }
 ```
 
-`InferenceModel::predict_to(...)` does not allocate, does not throw, and does not mutate the model.
+For flat batch inference, use caller-owned contiguous memory:
+
+```cpp
+std::vector<brutal_mlp::Scalar> inputs(sample_count * inference.input_size());
+std::vector<brutal_mlp::Scalar> outputs(sample_count * inference.output_size());
+std::vector<brutal_mlp::Scalar> scratch(inference.scratch_size());
+
+auto status = inference.predict_batch_to(inputs.data(),
+                                         sample_count,
+                                         inference.input_size(),
+                                         outputs.data(),
+                                         inference.output_size(),
+                                         scratch.data(),
+                                         scratch.size());
+```
+
+`InferenceModel::predict_to(...)` and `InferenceModel::predict_batch_to(...)` do not allocate, do not throw, and do not mutate the model. The convenience methods `predict(...)` and `predict_batch(...)` return `Vector`/`Matrix` and are intentionally outside the hot path.
 
 ## Build
 
