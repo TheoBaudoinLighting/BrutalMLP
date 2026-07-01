@@ -110,6 +110,18 @@ void custom_mse_gradient(const bm::Scalar* prediction,
     }
 }
 
+bm::Scalar custom_max_absolute_error(const bm::Matrix& predictions, const bm::Matrix& targets, void*) {
+    bm::Scalar result{0};
+    for (std::size_t row = 0; row < predictions.size(); ++row) {
+        for (std::size_t column = 0; column < predictions[row].size(); ++column) {
+            const bm::Scalar absolute_error =
+                static_cast<bm::Scalar>(std::abs(predictions[row][column] - targets[row][column]));
+            result = std::max(result, absolute_error);
+        }
+    }
+    return result;
+}
+
 bm::TrainingOptions quick_options(std::size_t epochs, std::size_t batch_size) {
     bm::TrainingOptions options;
     options.epochs = epochs;
@@ -330,6 +342,25 @@ TEST(StringConversions, RoundTripSupportedEnums) {
               bm::Loss::categorical_cross_entropy);
     EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::custom)), bm::Loss::custom);
 
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::mean_squared_error)),
+              bm::Metric::mean_squared_error);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::mean_absolute_error)),
+              bm::Metric::mean_absolute_error);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::root_mean_squared_error)),
+              bm::Metric::root_mean_squared_error);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::r2_score)), bm::Metric::r2_score);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::accuracy)), bm::Metric::accuracy);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::precision)), bm::Metric::precision);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::recall)), bm::Metric::recall);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::f1_score)), bm::Metric::f1_score);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::confusion_matrix)),
+              bm::Metric::confusion_matrix);
+    EXPECT_EQ(bm::metric_from_string(bm::to_string(bm::Metric::custom)), bm::Metric::custom);
+
+    EXPECT_EQ(bm::averaging_from_string(bm::to_string(bm::Averaging::binary)), bm::Averaging::binary);
+    EXPECT_EQ(bm::averaging_from_string(bm::to_string(bm::Averaging::macro)), bm::Averaging::macro);
+    EXPECT_EQ(bm::averaging_from_string(bm::to_string(bm::Averaging::micro)), bm::Averaging::micro);
+
     EXPECT_EQ(bm::optimizer_type_from_string(bm::to_string(bm::OptimizerType::sgd)), bm::OptimizerType::sgd);
     EXPECT_EQ(bm::optimizer_type_from_string(bm::to_string(bm::OptimizerType::adam)), bm::OptimizerType::adam);
 
@@ -342,6 +373,8 @@ TEST(StringConversions, RoundTripSupportedEnums) {
 TEST(StringConversions, RejectUnknownValues) {
     EXPECT_THROW((void)bm::activation_from_string("swish"), std::invalid_argument);
     EXPECT_THROW((void)bm::loss_from_string("hinge"), std::invalid_argument);
+    EXPECT_THROW((void)bm::metric_from_string("balanced_accuracy"), std::invalid_argument);
+    EXPECT_THROW((void)bm::averaging_from_string("weighted"), std::invalid_argument);
     EXPECT_THROW((void)bm::optimizer_type_from_string("rmsprop"), std::invalid_argument);
 }
 
@@ -625,6 +658,161 @@ TEST(Losses, RejectsInvalidLossConfigurations) {
                      .add_layer(1, bm::Activation::linear)
                      .loss(bm::LossConfig::weighted_mean_squared_error({bm::Scalar{1}, bm::Scalar{1}}))
                      .build(),
+                 std::invalid_argument);
+}
+
+TEST(Metrics, RegressionMetricsMatchKnownValues) {
+    const bm::Matrix predictions{{bm::Scalar{2}, bm::Scalar{4}}, {bm::Scalar{6}, bm::Scalar{8}}};
+    const bm::Matrix targets{{bm::Scalar{1}, bm::Scalar{5}}, {bm::Scalar{5}, bm::Scalar{10}}};
+
+    const auto result = bm::evaluate_predictions(predictions, targets);
+
+    EXPECT_TRUE(result.has_metric(bm::Metric::mean_squared_error));
+    EXPECT_FALSE(result.has_metric(bm::Metric::confusion_matrix));
+    EXPECT_NEAR(result.metric(bm::Metric::mean_squared_error), 1.75, kTightTolerance);
+    EXPECT_NEAR(result.metric(bm::Metric::mean_absolute_error), 1.25, kTightTolerance);
+    EXPECT_NEAR(result.metric(bm::Metric::root_mean_squared_error), std::sqrt(1.75), kTightTolerance);
+    EXPECT_NEAR(result.metric(bm::Metric::r2_score), 1.0 - 7.0 / 40.75, kTightTolerance);
+}
+
+TEST(Metrics, R2HandlesConstantTargets) {
+    EXPECT_NEAR(bm::evaluate_predictions({{bm::Scalar{2}}, {bm::Scalar{2}}},
+                                         {{bm::Scalar{2}}, {bm::Scalar{2}}})
+                    .metric(bm::Metric::r2_score),
+                1.0,
+                kTightTolerance);
+    EXPECT_NEAR(bm::evaluate_predictions({{bm::Scalar{3}}, {bm::Scalar{2}}},
+                                         {{bm::Scalar{2}}, {bm::Scalar{2}}})
+                    .metric(bm::Metric::r2_score),
+                0.0,
+                kTightTolerance);
+}
+
+TEST(Metrics, BinaryClassificationMetricsAndConfusionMatrixMatchKnownValues) {
+    const bm::Matrix predictions{{bm::Scalar{0.9}},
+                                 {bm::Scalar{0.8}},
+                                 {bm::Scalar{0.4}},
+                                 {bm::Scalar{0.7}},
+                                 {bm::Scalar{0.2}}};
+    const bm::Matrix targets{{bm::Scalar{1}},
+                             {bm::Scalar{0}},
+                             {bm::Scalar{0}},
+                             {bm::Scalar{1}},
+                             {bm::Scalar{1}}};
+
+    const auto result = bm::evaluate_predictions(predictions, targets, bm::EvaluationOptions::binary_classification());
+
+    ASSERT_TRUE(result.has_confusion_matrix);
+    ASSERT_EQ(result.confusion_matrix.class_count(), 2U);
+    EXPECT_EQ(result.confusion_matrix.total(), 5U);
+    EXPECT_EQ(result.confusion_matrix.counts[0][0], 1U);
+    EXPECT_EQ(result.confusion_matrix.counts[0][1], 1U);
+    EXPECT_EQ(result.confusion_matrix.counts[1][0], 1U);
+    EXPECT_EQ(result.confusion_matrix.counts[1][1], 2U);
+
+    EXPECT_NEAR(result.metric(bm::Metric::accuracy), 0.6, kTightTolerance);
+    EXPECT_NEAR(result.metric(bm::Metric::precision), 2.0 / 3.0, kTightTolerance);
+    EXPECT_NEAR(result.metric(bm::Metric::recall), 2.0 / 3.0, kTightTolerance);
+    EXPECT_NEAR(result.metric(bm::Metric::f1_score), 2.0 / 3.0, kTightTolerance);
+}
+
+TEST(Metrics, MulticlassMacroAndMicroMetricsMatchKnownValues) {
+    const bm::Matrix predictions{{bm::Scalar{0.9}, bm::Scalar{0.1}, bm::Scalar{0.0}},
+                                 {bm::Scalar{0.1}, bm::Scalar{0.2}, bm::Scalar{0.7}},
+                                 {bm::Scalar{0.1}, bm::Scalar{0.3}, bm::Scalar{0.6}},
+                                 {bm::Scalar{0.1}, bm::Scalar{0.8}, bm::Scalar{0.1}}};
+    const bm::Matrix targets{{bm::Scalar{1}, bm::Scalar{0}, bm::Scalar{0}},
+                             {bm::Scalar{0}, bm::Scalar{1}, bm::Scalar{0}},
+                             {bm::Scalar{0}, bm::Scalar{0}, bm::Scalar{1}},
+                             {bm::Scalar{0}, bm::Scalar{0}, bm::Scalar{1}}};
+
+    const auto macro = bm::evaluate_predictions(
+        predictions, targets, bm::EvaluationOptions::multiclass_classification(bm::Averaging::macro));
+    const auto micro = bm::evaluate_predictions(
+        predictions, targets, bm::EvaluationOptions::multiclass_classification(bm::Averaging::micro));
+
+    ASSERT_TRUE(macro.has_confusion_matrix);
+    ASSERT_EQ(macro.confusion_matrix.class_count(), 3U);
+    EXPECT_EQ(macro.confusion_matrix.counts[0][0], 1U);
+    EXPECT_EQ(macro.confusion_matrix.counts[1][2], 1U);
+    EXPECT_EQ(macro.confusion_matrix.counts[2][1], 1U);
+    EXPECT_EQ(macro.confusion_matrix.counts[2][2], 1U);
+
+    EXPECT_NEAR(macro.metric(bm::Metric::accuracy), 0.5, kTightTolerance);
+    EXPECT_NEAR(macro.metric(bm::Metric::precision), 0.5, kTightTolerance);
+    EXPECT_NEAR(macro.metric(bm::Metric::recall), 0.5, kTightTolerance);
+    EXPECT_NEAR(macro.metric(bm::Metric::f1_score), 0.5, kTightTolerance);
+
+    EXPECT_NEAR(micro.metric(bm::Metric::precision), 0.5, kTightTolerance);
+    EXPECT_NEAR(micro.metric(bm::Metric::recall), 0.5, kTightTolerance);
+    EXPECT_NEAR(micro.metric(bm::Metric::f1_score), 0.5, kTightTolerance);
+}
+
+TEST(Metrics, CustomMetricIsEvaluatedSeparately) {
+    bm::EvaluationOptions options;
+    options.add_custom_metric("max_absolute_error", custom_max_absolute_error);
+
+    const auto result = bm::evaluate_predictions({{bm::Scalar{2}}, {bm::Scalar{5}}},
+                                                 {{bm::Scalar{1}}, {bm::Scalar{9}}},
+                                                 options);
+
+    EXPECT_TRUE(result.has_custom_metric("max_absolute_error"));
+    EXPECT_FALSE(result.has_metric(bm::Metric::mean_squared_error));
+    EXPECT_NEAR(result.custom_metric("max_absolute_error"), 4.0, kTightTolerance);
+    EXPECT_THROW((void)result.metric(bm::Metric::custom), std::invalid_argument);
+    EXPECT_THROW((void)result.custom_metric("missing"), std::out_of_range);
+}
+
+TEST(Metrics, ModelEvaluationUsesPredictionsAndNormalization) {
+    const auto normalization = bm::NormalizationSpec::standard_score(
+        {bm::Scalar{10}, bm::Scalar{20}},
+        {bm::Scalar{2}, bm::Scalar{4}},
+        {bm::Scalar{100}},
+        {bm::Scalar{10}});
+
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .normalization(normalization)
+                     .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{1}, bm::Scalar{2}}, {bm::Scalar{0.5}}},
+    });
+
+    const bm::Matrix inputs{{bm::Scalar{12}, bm::Scalar{28}}};
+    const bm::Matrix targets{{bm::Scalar{165}}};
+    const auto training_metrics = model.evaluate_metrics(inputs, targets);
+    const auto inference_metrics = model.to_inference_model().evaluate_metrics(inputs, targets);
+
+    EXPECT_NEAR(training_metrics.metric(bm::Metric::mean_squared_error), 100.0, 1e-2);
+    EXPECT_NEAR(inference_metrics.metric(bm::Metric::mean_squared_error), 100.0, 1e-2);
+}
+
+TEST(Metrics, RejectsInvalidMetricInputsAndOptions) {
+    EXPECT_THROW((void)bm::evaluate_predictions({}, {}), std::invalid_argument);
+    EXPECT_THROW((void)bm::evaluate_predictions({{bm::Scalar{1}}}, {{bm::Scalar{1}, bm::Scalar{2}}}),
+                 std::invalid_argument);
+
+    bm::EvaluationOptions duplicate;
+    duplicate.metrics = {bm::Metric::accuracy, bm::Metric::accuracy};
+    EXPECT_THROW((void)bm::evaluate_predictions({{bm::Scalar{1}}}, {{bm::Scalar{1}}}, duplicate),
+                 std::invalid_argument);
+
+    bm::EvaluationOptions invalid_custom_metric;
+    EXPECT_THROW((void)invalid_custom_metric.add_custom_metric("", custom_max_absolute_error), std::invalid_argument);
+    EXPECT_THROW((void)invalid_custom_metric.add_custom_metric("bad", nullptr), std::invalid_argument);
+
+    bm::EvaluationOptions invalid_metric;
+    EXPECT_THROW((void)invalid_metric.include(bm::Metric::custom), std::invalid_argument);
+
+    bm::EvaluationOptions invalid_threshold = bm::EvaluationOptions::binary_classification();
+    invalid_threshold.classification_threshold = bm::Scalar{2};
+    EXPECT_THROW((void)bm::evaluate_predictions({{bm::Scalar{1}}}, {{bm::Scalar{1}}}, invalid_threshold),
+                 std::invalid_argument);
+
+    bm::EvaluationOptions invalid_positive_class = bm::EvaluationOptions::binary_classification();
+    invalid_positive_class.positive_class = 2;
+    EXPECT_THROW((void)bm::evaluate_predictions({{bm::Scalar{1}}}, {{bm::Scalar{1}}}, invalid_positive_class),
                  std::invalid_argument);
 }
 

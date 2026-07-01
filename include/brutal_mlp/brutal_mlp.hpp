@@ -39,6 +39,25 @@ enum class Loss {
     custom
 };
 
+enum class Metric {
+    mean_squared_error,
+    mean_absolute_error,
+    root_mean_squared_error,
+    r2_score,
+    accuracy,
+    precision,
+    recall,
+    f1_score,
+    confusion_matrix,
+    custom
+};
+
+enum class Averaging {
+    binary,
+    macro,
+    micro
+};
+
 enum class OptimizerType {
     sgd,
     adam
@@ -64,12 +83,16 @@ enum class InferenceStatus {
 
 [[nodiscard]] std::string to_string(Activation activation);
 [[nodiscard]] std::string to_string(Loss loss);
+[[nodiscard]] std::string to_string(Metric metric);
+[[nodiscard]] std::string to_string(Averaging averaging);
 [[nodiscard]] std::string to_string(OptimizerType optimizer);
 [[nodiscard]] std::string to_string(NormalizationMode mode);
 [[nodiscard]] std::string to_string(InferenceStatus status);
 
 [[nodiscard]] Activation activation_from_string(std::string_view value);
 [[nodiscard]] Loss loss_from_string(std::string_view value);
+[[nodiscard]] Metric metric_from_string(std::string_view value);
+[[nodiscard]] Averaging averaging_from_string(std::string_view value);
 [[nodiscard]] OptimizerType optimizer_type_from_string(std::string_view value);
 [[nodiscard]] NormalizationMode normalization_mode_from_string(std::string_view value);
 
@@ -109,6 +132,59 @@ struct LossConfig {
                                            CustomLossGradientFunction gradient,
                                            void* context = nullptr);
 };
+
+using CustomMetricFunction = Scalar (*)(const Matrix& predictions, const Matrix& targets, void* context);
+
+struct CustomMetric {
+    std::string name;
+    CustomMetricFunction evaluate{nullptr};
+    void* context{nullptr};
+};
+
+struct ConfusionMatrix {
+    std::vector<std::vector<std::size_t>> counts;
+
+    [[nodiscard]] std::size_t class_count() const noexcept;
+    [[nodiscard]] std::size_t total() const noexcept;
+};
+
+struct MetricValue {
+    Metric metric{Metric::custom};
+    std::string name;
+    Scalar value{static_cast<Scalar>(0)};
+};
+
+struct EvaluationOptions {
+    std::vector<Metric> metrics;
+    std::vector<CustomMetric> custom_metrics;
+    Scalar classification_threshold{static_cast<Scalar>(0.5)};
+    std::size_t positive_class{1};
+    Averaging averaging{Averaging::macro};
+
+    [[nodiscard]] static EvaluationOptions regression();
+    [[nodiscard]] static EvaluationOptions binary_classification(Scalar threshold = static_cast<Scalar>(0.5),
+                                                                 std::size_t positive_class = 1);
+    [[nodiscard]] static EvaluationOptions multiclass_classification(Averaging averaging = Averaging::macro);
+    [[nodiscard]] static EvaluationOptions all();
+
+    EvaluationOptions& include(Metric metric);
+    EvaluationOptions& add_custom_metric(std::string name, CustomMetricFunction evaluate, void* context = nullptr);
+};
+
+struct EvaluationResult {
+    std::vector<MetricValue> values;
+    ConfusionMatrix confusion_matrix;
+    bool has_confusion_matrix{false};
+
+    [[nodiscard]] bool has_metric(Metric metric) const noexcept;
+    [[nodiscard]] bool has_custom_metric(std::string_view name) const noexcept;
+    [[nodiscard]] Scalar metric(Metric metric) const;
+    [[nodiscard]] Scalar custom_metric(std::string_view name) const;
+};
+
+[[nodiscard]] EvaluationResult evaluate_predictions(const Matrix& predictions,
+                                                    const Matrix& targets,
+                                                    const EvaluationOptions& options = {});
 
 struct OptimizerConfig {
     OptimizerType type{OptimizerType::adam};
@@ -244,6 +320,9 @@ public:
 
     [[nodiscard]] Vector predict(const Vector& input) const;
     [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
+    [[nodiscard]] EvaluationResult evaluate_metrics(const Matrix& inputs,
+                                                    const Matrix& targets,
+                                                    const EvaluationOptions& options = {}) const;
 
     [[nodiscard]] std::vector<LayerParameters> parameters() const;
     void save(const std::filesystem::path& path) const;
@@ -322,6 +401,9 @@ public:
     [[nodiscard]] Vector predict(const Vector& input) const;
     [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
     [[nodiscard]] Scalar evaluate_loss(const Matrix& inputs, const Matrix& targets) const;
+    [[nodiscard]] EvaluationResult evaluate_metrics(const Matrix& inputs,
+                                                    const Matrix& targets,
+                                                    const EvaluationOptions& options = {}) const;
 
     TrainingHistory fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options = {});
 

@@ -234,6 +234,241 @@ void validate_training_data(const Matrix& inputs,
     validate_targets_for_loss(targets, loss.type);
 }
 
+[[nodiscard]] bool is_regression_metric(Metric metric) noexcept {
+    return metric == Metric::mean_squared_error ||
+           metric == Metric::mean_absolute_error ||
+           metric == Metric::root_mean_squared_error ||
+           metric == Metric::r2_score;
+}
+
+[[nodiscard]] bool is_classification_metric(Metric metric) noexcept {
+    return metric == Metric::accuracy ||
+           metric == Metric::precision ||
+           metric == Metric::recall ||
+           metric == Metric::f1_score ||
+           metric == Metric::confusion_matrix;
+}
+
+[[nodiscard]] bool contains_metric(const std::vector<Metric>& metrics, Metric metric) {
+    return std::find(metrics.begin(), metrics.end(), metric) != metrics.end();
+}
+
+void validate_evaluation_options(const EvaluationOptions& options) {
+    require_finite(options.classification_threshold, "classification_threshold");
+    require(options.classification_threshold >= Scalar{0} && options.classification_threshold <= Scalar{1},
+            "classification_threshold must be in [0, 1]");
+
+    for (std::size_t i = 0; i < options.metrics.size(); ++i) {
+        require(options.metrics[i] != Metric::custom, "custom metrics must be registered with add_custom_metric");
+        for (std::size_t j = i + 1; j < options.metrics.size(); ++j) {
+            require(options.metrics[i] != options.metrics[j], "duplicate metric requested");
+        }
+    }
+
+    for (std::size_t i = 0; i < options.custom_metrics.size(); ++i) {
+        const CustomMetric& metric = options.custom_metrics[i];
+        require(!metric.name.empty(), "custom metric name must not be empty");
+        require(metric.evaluate != nullptr, "custom metric callback is required");
+        for (std::size_t j = i + 1; j < options.custom_metrics.size(); ++j) {
+            require(metric.name != options.custom_metrics[j].name, "duplicate custom metric name");
+        }
+    }
+}
+
+[[nodiscard]] std::vector<Metric> selected_metrics(const EvaluationOptions& options) {
+    if (!options.metrics.empty() || !options.custom_metrics.empty()) {
+        return options.metrics;
+    }
+    return EvaluationOptions::regression().metrics;
+}
+
+void validate_evaluation_data(const Matrix& predictions,
+                              const Matrix& targets) {
+    validate_matrix(predictions, predictions.empty() ? 0 : predictions.front().size(), "predictions");
+    require(!predictions.front().empty(), "predictions must have at least one column");
+    validate_matrix(targets, predictions.front().size(), "targets");
+    require(predictions.size() == targets.size(), "predictions and targets must have the same number of rows");
+}
+
+[[nodiscard]] std::size_t argmax_index(const Vector& values) {
+    return static_cast<std::size_t>(std::distance(values.begin(), std::max_element(values.begin(), values.end())));
+}
+
+[[nodiscard]] std::size_t class_count_for_output_size(std::size_t output_size) noexcept {
+    return output_size == 1 ? std::size_t{2} : output_size;
+}
+
+[[nodiscard]] std::size_t class_label_from_row(const Vector& row, Scalar threshold) {
+    if (row.size() == 1) {
+        return row[0] >= threshold ? std::size_t{1} : std::size_t{0};
+    }
+    return argmax_index(row);
+}
+
+[[nodiscard]] ConfusionMatrix make_confusion_matrix(const Matrix& predictions,
+                                                    const Matrix& targets,
+                                                    Scalar threshold) {
+    const std::size_t class_count = class_count_for_output_size(predictions.front().size());
+    ConfusionMatrix matrix;
+    matrix.counts.assign(class_count, std::vector<std::size_t>(class_count, 0));
+
+    for (std::size_t row = 0; row < predictions.size(); ++row) {
+        const std::size_t actual = class_label_from_row(targets[row], threshold);
+        const std::size_t predicted = class_label_from_row(predictions[row], threshold);
+        ++matrix.counts[actual][predicted];
+    }
+    return matrix;
+}
+
+[[nodiscard]] Scalar ratio_or_zero(std::size_t numerator, std::size_t denominator) noexcept {
+    return denominator == 0 ? Scalar{0} : static_cast<Scalar>(numerator) / static_cast<Scalar>(denominator);
+}
+
+struct ClassificationSummary {
+    Scalar accuracy{Scalar{0}};
+    Scalar precision{Scalar{0}};
+    Scalar recall{Scalar{0}};
+    Scalar f1_score{Scalar{0}};
+};
+
+struct ClassCounts {
+    std::size_t true_positive{0};
+    std::size_t false_positive{0};
+    std::size_t false_negative{0};
+};
+
+[[nodiscard]] ClassCounts counts_for_class(const ConfusionMatrix& matrix, std::size_t class_index) {
+    ClassCounts counts;
+    counts.true_positive = matrix.counts[class_index][class_index];
+
+    for (std::size_t i = 0; i < matrix.counts.size(); ++i) {
+        if (i != class_index) {
+            counts.false_positive += matrix.counts[i][class_index];
+            counts.false_negative += matrix.counts[class_index][i];
+        }
+    }
+    return counts;
+}
+
+[[nodiscard]] Scalar precision_from_counts(const ClassCounts& counts) noexcept {
+    return ratio_or_zero(counts.true_positive, counts.true_positive + counts.false_positive);
+}
+
+[[nodiscard]] Scalar recall_from_counts(const ClassCounts& counts) noexcept {
+    return ratio_or_zero(counts.true_positive, counts.true_positive + counts.false_negative);
+}
+
+[[nodiscard]] Scalar f1_from_precision_recall(Scalar precision, Scalar recall) noexcept {
+    return precision + recall == Scalar{0} ? Scalar{0} : Scalar{2} * precision * recall / (precision + recall);
+}
+
+[[nodiscard]] ClassificationSummary summarize_classification(const ConfusionMatrix& matrix,
+                                                             const EvaluationOptions& options) {
+    const std::size_t class_count = matrix.counts.size();
+    require(class_count > 0, "confusion matrix must not be empty");
+    require(options.positive_class < class_count, "positive_class is out of range");
+
+    std::size_t correct = 0;
+    std::size_t total = 0;
+    for (std::size_t actual = 0; actual < class_count; ++actual) {
+        for (std::size_t predicted = 0; predicted < class_count; ++predicted) {
+            const std::size_t count = matrix.counts[actual][predicted];
+            total += count;
+            if (actual == predicted) {
+                correct += count;
+            }
+        }
+    }
+
+    ClassificationSummary summary;
+    summary.accuracy = ratio_or_zero(correct, total);
+
+    if (options.averaging == Averaging::binary) {
+        const ClassCounts counts = counts_for_class(matrix, options.positive_class);
+        summary.precision = precision_from_counts(counts);
+        summary.recall = recall_from_counts(counts);
+        summary.f1_score = f1_from_precision_recall(summary.precision, summary.recall);
+        return summary;
+    }
+
+    if (options.averaging == Averaging::micro) {
+        ClassCounts counts;
+        for (std::size_t class_index = 0; class_index < class_count; ++class_index) {
+            const ClassCounts current = counts_for_class(matrix, class_index);
+            counts.true_positive += current.true_positive;
+            counts.false_positive += current.false_positive;
+            counts.false_negative += current.false_negative;
+        }
+        summary.precision = precision_from_counts(counts);
+        summary.recall = recall_from_counts(counts);
+        summary.f1_score = f1_from_precision_recall(summary.precision, summary.recall);
+        return summary;
+    }
+
+    Scalar precision_total = Scalar{0};
+    Scalar recall_total = Scalar{0};
+    Scalar f1_total = Scalar{0};
+    for (std::size_t class_index = 0; class_index < class_count; ++class_index) {
+        const ClassCounts counts = counts_for_class(matrix, class_index);
+        const Scalar precision = precision_from_counts(counts);
+        const Scalar recall = recall_from_counts(counts);
+        precision_total += precision;
+        recall_total += recall;
+        f1_total += f1_from_precision_recall(precision, recall);
+    }
+
+    const Scalar scale = Scalar{1} / static_cast<Scalar>(class_count);
+    summary.precision = precision_total * scale;
+    summary.recall = recall_total * scale;
+    summary.f1_score = f1_total * scale;
+    return summary;
+}
+
+struct RegressionSummary {
+    Scalar mean_squared_error{Scalar{0}};
+    Scalar mean_absolute_error{Scalar{0}};
+    Scalar root_mean_squared_error{Scalar{0}};
+    Scalar r2_score{Scalar{0}};
+};
+
+[[nodiscard]] RegressionSummary summarize_regression(const Matrix& predictions, const Matrix& targets) {
+    Scalar squared_error = Scalar{0};
+    Scalar absolute_error = Scalar{0};
+    Scalar target_sum = Scalar{0};
+    std::size_t count = 0;
+
+    for (std::size_t row = 0; row < predictions.size(); ++row) {
+        for (std::size_t column = 0; column < predictions[row].size(); ++column) {
+            const Scalar delta = predictions[row][column] - targets[row][column];
+            squared_error += delta * delta;
+            absolute_error += static_cast<Scalar>(std::abs(delta));
+            target_sum += targets[row][column];
+            ++count;
+        }
+    }
+
+    const Scalar count_scalar = static_cast<Scalar>(count);
+    const Scalar mean_target = target_sum / count_scalar;
+    Scalar target_variance_sum = Scalar{0};
+    for (const Vector& target : targets) {
+        for (Scalar value : target) {
+            const Scalar centered = value - mean_target;
+            target_variance_sum += centered * centered;
+        }
+    }
+
+    RegressionSummary summary;
+    summary.mean_squared_error = squared_error / count_scalar;
+    summary.mean_absolute_error = absolute_error / count_scalar;
+    summary.root_mean_squared_error = static_cast<Scalar>(std::sqrt(summary.mean_squared_error));
+    if (target_variance_sum == Scalar{0}) {
+        summary.r2_score = squared_error == Scalar{0} ? Scalar{1} : Scalar{0};
+    } else {
+        summary.r2_score = Scalar{1} - squared_error / target_variance_sum;
+    }
+    return summary;
+}
+
 [[nodiscard]] std::vector<std::size_t> make_indices(std::size_t size) {
     std::vector<std::size_t> indices(size);
     std::iota(indices.begin(), indices.end(), std::size_t{0});
@@ -593,6 +828,46 @@ std::string to_string(Loss loss) {
     throw std::invalid_argument("unknown loss");
 }
 
+std::string to_string(Metric metric) {
+    switch (metric) {
+    case Metric::mean_squared_error:
+        return "mean_squared_error";
+    case Metric::mean_absolute_error:
+        return "mean_absolute_error";
+    case Metric::root_mean_squared_error:
+        return "root_mean_squared_error";
+    case Metric::r2_score:
+        return "r2_score";
+    case Metric::accuracy:
+        return "accuracy";
+    case Metric::precision:
+        return "precision";
+    case Metric::recall:
+        return "recall";
+    case Metric::f1_score:
+        return "f1_score";
+    case Metric::confusion_matrix:
+        return "confusion_matrix";
+    case Metric::custom:
+        return "custom";
+    }
+
+    throw std::invalid_argument("unknown metric");
+}
+
+std::string to_string(Averaging averaging) {
+    switch (averaging) {
+    case Averaging::binary:
+        return "binary";
+    case Averaging::macro:
+        return "macro";
+    case Averaging::micro:
+        return "micro";
+    }
+
+    throw std::invalid_argument("unknown averaging");
+}
+
 std::string to_string(OptimizerType optimizer) {
     switch (optimizer) {
     case OptimizerType::sgd:
@@ -690,6 +965,53 @@ Loss loss_from_string(std::string_view value) {
         return Loss::custom;
     }
     throw std::invalid_argument("unknown loss: " + std::string(value));
+}
+
+Metric metric_from_string(std::string_view value) {
+    if (value == "mean_squared_error") {
+        return Metric::mean_squared_error;
+    }
+    if (value == "mean_absolute_error") {
+        return Metric::mean_absolute_error;
+    }
+    if (value == "root_mean_squared_error") {
+        return Metric::root_mean_squared_error;
+    }
+    if (value == "r2_score") {
+        return Metric::r2_score;
+    }
+    if (value == "accuracy") {
+        return Metric::accuracy;
+    }
+    if (value == "precision") {
+        return Metric::precision;
+    }
+    if (value == "recall") {
+        return Metric::recall;
+    }
+    if (value == "f1_score") {
+        return Metric::f1_score;
+    }
+    if (value == "confusion_matrix") {
+        return Metric::confusion_matrix;
+    }
+    if (value == "custom") {
+        return Metric::custom;
+    }
+    throw std::invalid_argument("unknown metric: " + std::string(value));
+}
+
+Averaging averaging_from_string(std::string_view value) {
+    if (value == "binary") {
+        return Averaging::binary;
+    }
+    if (value == "macro") {
+        return Averaging::macro;
+    }
+    if (value == "micro") {
+        return Averaging::micro;
+    }
+    throw std::invalid_argument("unknown averaging: " + std::string(value));
 }
 
 OptimizerType optimizer_type_from_string(std::string_view value) {
@@ -804,6 +1126,194 @@ LossConfig LossConfig::custom(CustomLossValueFunction value,
     config.custom_loss.context = context;
     validate_loss_config(config, 0);
     return config;
+}
+
+std::size_t ConfusionMatrix::class_count() const noexcept {
+    return counts.size();
+}
+
+std::size_t ConfusionMatrix::total() const noexcept {
+    std::size_t result = 0;
+    for (const auto& row : counts) {
+        result += std::accumulate(row.begin(), row.end(), std::size_t{0});
+    }
+    return result;
+}
+
+EvaluationOptions EvaluationOptions::regression() {
+    EvaluationOptions options;
+    options.metrics = {
+        Metric::mean_squared_error,
+        Metric::mean_absolute_error,
+        Metric::root_mean_squared_error,
+        Metric::r2_score,
+    };
+    return options;
+}
+
+EvaluationOptions EvaluationOptions::binary_classification(Scalar threshold, std::size_t positive_class_value) {
+    EvaluationOptions options;
+    options.metrics = {
+        Metric::accuracy,
+        Metric::precision,
+        Metric::recall,
+        Metric::f1_score,
+        Metric::confusion_matrix,
+    };
+    options.classification_threshold = threshold;
+    options.positive_class = positive_class_value;
+    options.averaging = Averaging::binary;
+    validate_evaluation_options(options);
+    return options;
+}
+
+EvaluationOptions EvaluationOptions::multiclass_classification(Averaging averaging_value) {
+    EvaluationOptions options;
+    options.metrics = {
+        Metric::accuracy,
+        Metric::precision,
+        Metric::recall,
+        Metric::f1_score,
+        Metric::confusion_matrix,
+    };
+    options.averaging = averaging_value;
+    validate_evaluation_options(options);
+    return options;
+}
+
+EvaluationOptions EvaluationOptions::all() {
+    EvaluationOptions options;
+    options.metrics = {
+        Metric::mean_squared_error,
+        Metric::mean_absolute_error,
+        Metric::root_mean_squared_error,
+        Metric::r2_score,
+        Metric::accuracy,
+        Metric::precision,
+        Metric::recall,
+        Metric::f1_score,
+        Metric::confusion_matrix,
+    };
+    return options;
+}
+
+EvaluationOptions& EvaluationOptions::include(Metric metric) {
+    require(metric != Metric::custom, "custom metrics must be registered with add_custom_metric");
+    require(!contains_metric(metrics, metric), "duplicate metric requested");
+    metrics.push_back(metric);
+    return *this;
+}
+
+EvaluationOptions& EvaluationOptions::add_custom_metric(std::string metric_name,
+                                                        CustomMetricFunction evaluate,
+                                                        void* context) {
+    require(!metric_name.empty(), "custom metric name must not be empty");
+    require(evaluate != nullptr, "custom metric callback is required");
+    for (const CustomMetric& metric : custom_metrics) {
+        require(metric.name != metric_name, "duplicate custom metric name");
+    }
+    custom_metrics.push_back(CustomMetric{std::move(metric_name), evaluate, context});
+    return *this;
+}
+
+bool EvaluationResult::has_metric(Metric metric_value) const noexcept {
+    if (metric_value == Metric::confusion_matrix) {
+        return has_confusion_matrix;
+    }
+    return std::any_of(values.begin(), values.end(), [metric_value](const MetricValue& value) {
+        return value.metric == metric_value;
+    });
+}
+
+bool EvaluationResult::has_custom_metric(std::string_view metric_name) const noexcept {
+    return std::any_of(values.begin(), values.end(), [metric_name](const MetricValue& value) {
+        return value.metric == Metric::custom && value.name == metric_name;
+    });
+}
+
+Scalar EvaluationResult::metric(Metric metric_value) const {
+    require(metric_value != Metric::custom, "use custom_metric to read custom metric values");
+    require(metric_value != Metric::confusion_matrix, "confusion_matrix is not a scalar metric");
+    for (const MetricValue& value : values) {
+        if (value.metric == metric_value) {
+            return value.value;
+        }
+    }
+    throw std::out_of_range("metric is not present: " + to_string(metric_value));
+}
+
+Scalar EvaluationResult::custom_metric(std::string_view metric_name) const {
+    for (const MetricValue& value : values) {
+        if (value.metric == Metric::custom && value.name == metric_name) {
+            return value.value;
+        }
+    }
+    throw std::out_of_range("custom metric is not present: " + std::string(metric_name));
+}
+
+EvaluationResult evaluate_predictions(const Matrix& predictions,
+                                      const Matrix& targets,
+                                      const EvaluationOptions& options) {
+    validate_evaluation_data(predictions, targets);
+    validate_evaluation_options(options);
+
+    const std::vector<Metric> metrics = selected_metrics(options);
+    const bool needs_regression = std::any_of(metrics.begin(), metrics.end(), is_regression_metric);
+    const bool needs_classification = std::any_of(metrics.begin(), metrics.end(), is_classification_metric);
+
+    EvaluationResult result;
+    RegressionSummary regression;
+    if (needs_regression) {
+        regression = summarize_regression(predictions, targets);
+    }
+
+    ClassificationSummary classification;
+    if (needs_classification) {
+        result.confusion_matrix = make_confusion_matrix(predictions, targets, options.classification_threshold);
+        result.has_confusion_matrix = true;
+        classification = summarize_classification(result.confusion_matrix, options);
+    }
+
+    for (Metric metric : metrics) {
+        switch (metric) {
+        case Metric::mean_squared_error:
+            result.values.push_back(MetricValue{metric, to_string(metric), regression.mean_squared_error});
+            break;
+        case Metric::mean_absolute_error:
+            result.values.push_back(MetricValue{metric, to_string(metric), regression.mean_absolute_error});
+            break;
+        case Metric::root_mean_squared_error:
+            result.values.push_back(MetricValue{metric, to_string(metric), regression.root_mean_squared_error});
+            break;
+        case Metric::r2_score:
+            result.values.push_back(MetricValue{metric, to_string(metric), regression.r2_score});
+            break;
+        case Metric::accuracy:
+            result.values.push_back(MetricValue{metric, to_string(metric), classification.accuracy});
+            break;
+        case Metric::precision:
+            result.values.push_back(MetricValue{metric, to_string(metric), classification.precision});
+            break;
+        case Metric::recall:
+            result.values.push_back(MetricValue{metric, to_string(metric), classification.recall});
+            break;
+        case Metric::f1_score:
+            result.values.push_back(MetricValue{metric, to_string(metric), classification.f1_score});
+            break;
+        case Metric::confusion_matrix:
+            break;
+        case Metric::custom:
+            throw std::invalid_argument("custom metrics must be registered with add_custom_metric");
+        }
+    }
+
+    for (const CustomMetric& metric : options.custom_metrics) {
+        const Scalar value = metric.evaluate(predictions, targets, metric.context);
+        require_finite(value, "custom metric");
+        result.values.push_back(MetricValue{Metric::custom, metric.name, value});
+    }
+
+    return result;
 }
 
 OptimizerConfig OptimizerConfig::adam(Scalar learning_rate) {
@@ -1199,6 +1709,14 @@ Matrix InferenceModel::predict_batch(const Matrix& inputs) const {
     }
 
     return result;
+}
+
+EvaluationResult InferenceModel::evaluate_metrics(const Matrix& inputs,
+                                                  const Matrix& targets,
+                                                  const EvaluationOptions& options) const {
+    validate_matrix(inputs, input_size(), "inputs");
+    validate_matrix(targets, output_size(), "targets");
+    return evaluate_predictions(predict_batch(inputs), targets, options);
 }
 
 InferenceWorkspace::InferenceWorkspace(const InferenceModel& model) {
@@ -1998,6 +2516,14 @@ Scalar TrainingModel::evaluate_loss(const Matrix& inputs, const Matrix& targets)
         total += impl_->sample_loss(impl_->predict_raw(inputs[i]), targets[i]);
     }
     return total / static_cast<Scalar>(inputs.size());
+}
+
+EvaluationResult TrainingModel::evaluate_metrics(const Matrix& inputs,
+                                                 const Matrix& targets,
+                                                 const EvaluationOptions& options) const {
+    validate_matrix(inputs, input_size(), "inputs");
+    validate_matrix(targets, output_size(), "targets");
+    return evaluate_predictions(predict_batch(inputs), targets, options);
 }
 
 TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options) {

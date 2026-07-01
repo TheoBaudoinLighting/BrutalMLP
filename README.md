@@ -111,6 +111,59 @@ void gradient(const brutal_mlp::Scalar* prediction,
 
 Custom loss callbacks are not serialized. Convert trained weights to `InferenceModel` for production, or use a built-in loss when the training model itself must be saved.
 
+## Metrics
+
+Losses are used for optimization. Metrics are evaluated separately on predictions and targets.
+
+Built-in metrics:
+
+- `mean_squared_error`
+- `mean_absolute_error`
+- `root_mean_squared_error`
+- `r2_score`
+- `accuracy`
+- `precision`
+- `recall`
+- `f1_score`
+- `confusion_matrix`
+
+Regression metrics are the default:
+
+```cpp
+auto report = training.evaluate_metrics(inputs, targets);
+
+auto mse = report.metric(brutal_mlp::Metric::mean_squared_error);
+auto rmse = report.metric(brutal_mlp::Metric::root_mean_squared_error);
+auto r2 = report.metric(brutal_mlp::Metric::r2_score);
+```
+
+Classification metrics use a binary threshold for one-output models and argmax for multi-output models. Precision, recall, and F1 support binary, macro, and micro averaging:
+
+```cpp
+auto options = brutal_mlp::EvaluationOptions::binary_classification(0.5f);
+auto report = training.evaluate_metrics(inputs, targets, options);
+
+auto accuracy = report.metric(brutal_mlp::Metric::accuracy);
+auto f1 = report.metric(brutal_mlp::Metric::f1_score);
+const auto& confusion = report.confusion_matrix.counts; // rows = target class, columns = predicted class
+```
+
+Custom metrics receive the full prediction and target matrices:
+
+```cpp
+brutal_mlp::Scalar max_error(const brutal_mlp::Matrix& predictions,
+                             const brutal_mlp::Matrix& targets,
+                             void* context);
+
+brutal_mlp::EvaluationOptions options;
+options.add_custom_metric("max_error", max_error);
+
+auto report = training.evaluate_metrics(inputs, targets, options);
+auto max_error_value = report.custom_metric("max_error");
+```
+
+`evaluate_predictions(predictions, targets, options)` is also available when predictions are produced outside a model.
+
 ## Integration
 
 ```cmake
