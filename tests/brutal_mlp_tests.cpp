@@ -122,6 +122,44 @@ bm::Scalar custom_max_absolute_error(const bm::Matrix& predictions, const bm::Ma
     return result;
 }
 
+void generated_linear_sample(std::size_t index,
+                             bm::Scalar* input,
+                             std::size_t input_size,
+                             bm::Scalar* target,
+                             std::size_t target_size,
+                             void*) {
+    ASSERT_EQ(input_size, 1U);
+    ASSERT_EQ(target_size, 1U);
+    input[0] = static_cast<bm::Scalar>(static_cast<double>(index) - 4.0);
+    target[0] = bm::Scalar{2} * input[0] + bm::Scalar{1};
+}
+
+struct StreamingLinearContext {
+    std::size_t index{0};
+    std::size_t count{0};
+};
+
+void reset_streaming_linear(void* context) {
+    static_cast<StreamingLinearContext*>(context)->index = 0;
+}
+
+bool next_streaming_linear(bm::Scalar* input,
+                           std::size_t input_size,
+                           bm::Scalar* target,
+                           std::size_t target_size,
+                           void* context) {
+    EXPECT_EQ(input_size, 1U);
+    EXPECT_EQ(target_size, 1U);
+    auto* state = static_cast<StreamingLinearContext*>(context);
+    if (state->index >= state->count) {
+        return false;
+    }
+    input[0] = static_cast<bm::Scalar>(static_cast<double>(state->index) - 4.0);
+    target[0] = bm::Scalar{2} * input[0] + bm::Scalar{1};
+    ++state->index;
+    return true;
+}
+
 bm::TrainingOptions quick_options(std::size_t epochs, std::size_t batch_size) {
     bm::TrainingOptions options;
     options.epochs = epochs;
@@ -814,6 +852,149 @@ TEST(Metrics, RejectsInvalidMetricInputsAndOptions) {
     invalid_positive_class.positive_class = 2;
     EXPECT_THROW((void)bm::evaluate_predictions({{bm::Scalar{1}}}, {{bm::Scalar{1}}}, invalid_positive_class),
                  std::invalid_argument);
+}
+
+TEST(DatasetPipeline, SplitViewAndBatchGeneratorWork) {
+    const bm::Matrix inputs{{bm::Scalar{0}}, {bm::Scalar{1}}, {bm::Scalar{2}}, {bm::Scalar{3}}, {bm::Scalar{4}},
+                            {bm::Scalar{5}}, {bm::Scalar{6}}, {bm::Scalar{7}}, {bm::Scalar{8}}, {bm::Scalar{9}}};
+    const bm::Matrix targets{{bm::Scalar{1}}, {bm::Scalar{3}}, {bm::Scalar{5}}, {bm::Scalar{7}}, {bm::Scalar{9}},
+                             {bm::Scalar{11}}, {bm::Scalar{13}}, {bm::Scalar{15}}, {bm::Scalar{17}}, {bm::Scalar{19}}};
+    const bm::MatrixDataset dataset(inputs, targets);
+
+    bm::DatasetSplitOptions split_options;
+    split_options.validation_split = bm::Scalar{0.2};
+    split_options.test_split = bm::Scalar{0.2};
+    split_options.shuffle = false;
+    const auto split = bm::make_dataset_split(dataset.sample_count(), split_options);
+
+    EXPECT_EQ(split.training_indices, (std::vector<std::size_t>{0, 1, 2, 3, 4, 5}));
+    EXPECT_EQ(split.validation_indices, (std::vector<std::size_t>{6, 7}));
+    EXPECT_EQ(split.test_indices, (std::vector<std::size_t>{8, 9}));
+
+    const bm::DatasetView test_view(dataset, split.test_indices);
+    bm::Vector input(test_view.input_size(), bm::Scalar{0});
+    bm::Vector target(test_view.output_size(), bm::Scalar{0});
+    test_view.sample(1, input.data(), input.size(), target.data(), target.size());
+    expect_vector_near(input, {bm::Scalar{9}}, kTightTolerance);
+    expect_vector_near(target, {bm::Scalar{19}}, kTightTolerance);
+
+    bm::BatchGenerator generator(dataset, 4, false, 0);
+    bm::MiniBatch batch;
+    ASSERT_TRUE(generator.next(batch));
+    ASSERT_EQ(batch.size(), 4U);
+    expect_vector_near(batch.inputs.front(), {bm::Scalar{0}}, kTightTolerance);
+    expect_vector_near(batch.targets.back(), {bm::Scalar{7}}, kTightTolerance);
+    ASSERT_TRUE(generator.next(batch));
+    ASSERT_EQ(batch.size(), 4U);
+    ASSERT_TRUE(generator.next(batch));
+    ASSERT_EQ(batch.size(), 2U);
+    EXPECT_FALSE(generator.next(batch));
+}
+
+TEST(DatasetPipeline, GeneratedDatasetCanTrainWithoutMatrixStorage) {
+    bm::GeneratedDataset dataset(16, 1, 1, generated_linear_sample);
+
+    auto model = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .optimizer(bm::OptimizerConfig::adam(bm::Scalar{0.05}))
+                     .seed(501)
+                     .build();
+
+    auto options = quick_options(500, 4);
+    options.validation_split = bm::Scalar{0.25};
+    options.test_split = bm::Scalar{0.25};
+    options.shuffle = true;
+    const auto history = model.fit(dataset, options);
+
+    ASSERT_FALSE(history.training_loss.empty());
+    EXPECT_EQ(history.validation_loss.size(), history.training_loss.size());
+    EXPECT_EQ(history.test_loss.size(), history.training_loss.size());
+    EXPECT_NEAR(model.predict({bm::Scalar{3}})[0], 7.0, 0.15);
+}
+
+TEST(DatasetPipeline, StreamingFunctionDatasetCanTrainWithBoundedShuffleBuffer) {
+    StreamingLinearContext context;
+    context.count = 16;
+    bm::FunctionStreamingDataset dataset(context.count, 1, 1, next_streaming_linear, reset_streaming_linear, &context);
+
+    auto model = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .optimizer(bm::OptimizerConfig::adam(bm::Scalar{0.05}))
+                     .seed(502)
+                     .build();
+
+    auto options = quick_options(450, 4);
+    options.validation_split = bm::Scalar{0.25};
+    options.test_split = bm::Scalar{0.25};
+    options.streaming_shuffle_buffer_size = 3;
+    const auto history = model.fit(dataset, options);
+
+    ASSERT_FALSE(history.training_loss.empty());
+    EXPECT_EQ(history.validation_loss.size(), history.training_loss.size());
+    EXPECT_EQ(history.test_loss.size(), history.training_loss.size());
+    EXPECT_NEAR(model.predict({bm::Scalar{2}})[0], 5.0, 0.2);
+}
+
+TEST(DatasetPipeline, CsvStreamingDatasetReadsFromDiskAndTrains) {
+    const auto path = std::filesystem::temp_directory_path() / "brutal_mlp_streaming_dataset.csv";
+    {
+        std::ofstream file(path);
+        file << "x,y\n";
+        for (int i = -4; i <= 11; ++i) {
+            file << i << ',' << (2 * i + 1) << '\n';
+        }
+    }
+
+    auto model = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .optimizer(bm::OptimizerConfig::adam(bm::Scalar{0.05}))
+                     .seed(503)
+                     .build();
+
+    {
+        bm::CsvStreamingOptions csv_options;
+        csv_options.has_header = true;
+        bm::CsvStreamingDataset dataset(path, 1, 1, csv_options);
+        EXPECT_EQ(dataset.sample_count(), 16U);
+
+        bm::Vector input(dataset.input_size(), bm::Scalar{0});
+        bm::Vector target(dataset.output_size(), bm::Scalar{0});
+        ASSERT_TRUE(dataset.next(input.data(), input.size(), target.data(), target.size()));
+        expect_vector_near(input, {bm::Scalar{-4}}, kTightTolerance);
+        expect_vector_near(target, {bm::Scalar{-7}}, kTightTolerance);
+
+        auto options = quick_options(450, 4);
+        options.validation_split = bm::Scalar{0.25};
+        options.test_split = bm::Scalar{0.25};
+        options.streaming_shuffle_buffer_size = 4;
+        model.fit(dataset, options);
+    }
+    std::filesystem::remove(path);
+
+    EXPECT_NEAR(model.predict({bm::Scalar{4}})[0], 9.0, 0.2);
+}
+
+TEST(DatasetPipeline, RejectsInvalidDatasetsAndSplits) {
+    EXPECT_THROW((void)bm::GeneratedDataset(0, 1, 1, generated_linear_sample), std::invalid_argument);
+    EXPECT_THROW((void)bm::GeneratedDataset(1, 0, 1, generated_linear_sample), std::invalid_argument);
+    EXPECT_THROW((void)bm::GeneratedDataset(1, 1, 1, nullptr), std::invalid_argument);
+
+    bm::DatasetSplitOptions invalid_split;
+    invalid_split.validation_split = bm::Scalar{0.7};
+    invalid_split.test_split = bm::Scalar{0.4};
+    EXPECT_THROW((void)bm::make_dataset_split(10, invalid_split), std::invalid_argument);
+
+    const bm::Matrix inputs{{bm::Scalar{0}}, {bm::Scalar{1}}};
+    const bm::Matrix targets{{bm::Scalar{1}}, {bm::Scalar{3}}};
+    const bm::MatrixDataset dataset(inputs, targets);
+    EXPECT_THROW((void)bm::DatasetView(dataset, {0, 2}), std::invalid_argument);
+    EXPECT_THROW((void)bm::BatchGenerator(dataset, 0), std::invalid_argument);
+
+    auto model = bm::TrainingModel::builder().input_size(2).add_layer(1, bm::Activation::linear).build();
+    EXPECT_THROW((void)model.fit(dataset, one_step_options(1)), std::invalid_argument);
 }
 
 TEST(Normalization, StringConversionsAndFactoryValidation) {

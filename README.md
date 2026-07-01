@@ -164,6 +164,78 @@ auto max_error_value = report.custom_metric("max_error");
 
 `evaluate_predictions(predictions, targets, options)` is also available when predictions are produced outside a model.
 
+## Datasets
+
+`fit(inputs, targets)` remains available for small in-memory datasets. For larger or generated data, use the dataset pipeline.
+
+Random-access datasets support deterministic train/validation/test splits and shuffled mini-batches without copying the full dataset:
+
+```cpp
+brutal_mlp::MatrixDataset dataset(inputs, targets);
+
+brutal_mlp::TrainingOptions options;
+options.epochs = 500;
+options.batch_size = 64;
+options.validation_split = 0.15f;
+options.test_split = 0.15f;
+options.shuffle = true;
+options.seed = 42;
+
+auto history = training.fit(dataset, options);
+```
+
+Split utilities are exposed directly:
+
+```cpp
+brutal_mlp::DatasetSplitOptions split_options;
+split_options.validation_split = 0.2f;
+split_options.test_split = 0.1f;
+split_options.shuffle = true;
+split_options.seed = 123;
+
+auto split = brutal_mlp::make_dataset_split(dataset.sample_count(), split_options);
+brutal_mlp::DatasetView validation(dataset, split.validation_indices);
+```
+
+Mini-batches can be generated independently from training:
+
+```cpp
+brutal_mlp::BatchGenerator batches(dataset, 128, true, 123);
+brutal_mlp::MiniBatch batch;
+
+while (batches.next(batch)) {
+    // batch.inputs and batch.targets contain only this mini-batch.
+}
+```
+
+Generated datasets fill caller-owned sample buffers:
+
+```cpp
+void sample(std::size_t index,
+            brutal_mlp::Scalar* input,
+            std::size_t input_size,
+            brutal_mlp::Scalar* target,
+            std::size_t target_size,
+            void* context);
+
+brutal_mlp::GeneratedDataset generated(sample_count, input_size, output_size, sample, context);
+training.fit(generated, options);
+```
+
+Streaming datasets are resettable streams. They keep only one sample plus an optional bounded shuffle buffer in memory:
+
+```cpp
+options.streaming_shuffle_buffer_size = 4096;
+
+brutal_mlp::CsvStreamingOptions csv;
+csv.has_header = true;
+
+brutal_mlp::CsvStreamingDataset streamed("train.csv", input_size, output_size, csv);
+training.fit(streamed, options);
+```
+
+`FunctionStreamingDataset` is available for procedural or application-owned streams. Its callback returns `false` when the stream is exhausted.
+
 ## Integration
 
 ```cmake

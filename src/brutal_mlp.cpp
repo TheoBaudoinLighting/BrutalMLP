@@ -7,6 +7,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -130,6 +131,10 @@ void validate_training_options(const TrainingOptions& options) {
     require_finite(options.validation_split, "validation_split");
     require(options.validation_split >= Scalar{0} && options.validation_split < Scalar{1},
             "validation_split must be in [0, 1)");
+    require_finite(options.test_split, "test_split");
+    require(options.test_split >= Scalar{0} && options.test_split < Scalar{1}, "test_split must be in [0, 1)");
+    require(options.validation_split + options.test_split < Scalar{1},
+            "validation_split + test_split must be less than 1");
     require_finite(options.min_delta, "min_delta");
     require(options.min_delta >= Scalar{0}, "min_delta must be non-negative");
 }
@@ -189,7 +194,7 @@ void validate_matrix(const Matrix& matrix,
     }
 }
 
-void validate_targets_for_loss(const Matrix& targets, Loss loss) {
+void validate_target_for_loss(const Vector& target, Loss loss) {
     switch (loss) {
     case Loss::mean_squared_error:
     case Loss::mean_absolute_error:
@@ -200,27 +205,30 @@ void validate_targets_for_loss(const Matrix& targets, Loss loss) {
     case Loss::custom:
         return;
     case Loss::binary_cross_entropy:
-        for (const Vector& target : targets) {
-            for (Scalar value : target) {
-                require(value >= Scalar{0} && value <= Scalar{1},
-                        "binary_cross_entropy targets must be in [0, 1]");
-            }
+        for (Scalar value : target) {
+            require(value >= Scalar{0} && value <= Scalar{1},
+                    "binary_cross_entropy targets must be in [0, 1]");
         }
         return;
-    case Loss::categorical_cross_entropy:
-        for (const Vector& target : targets) {
-            Scalar sum = Scalar{0};
-            for (Scalar value : target) {
-                require(value >= Scalar{0}, "categorical_cross_entropy targets must be non-negative");
-                sum += value;
-            }
-            require(std::abs(sum - Scalar{1}) <= kTargetSumTolerance,
-                    "categorical_cross_entropy targets must sum to 1");
+    case Loss::categorical_cross_entropy: {
+        Scalar sum = Scalar{0};
+        for (Scalar value : target) {
+            require(value >= Scalar{0}, "categorical_cross_entropy targets must be non-negative");
+            sum += value;
         }
+        require(std::abs(sum - Scalar{1}) <= kTargetSumTolerance,
+                "categorical_cross_entropy targets must sum to 1");
         return;
+    }
     }
 
     throw std::invalid_argument("unknown loss");
+}
+
+void validate_targets_for_loss(const Matrix& targets, Loss loss) {
+    for (const Vector& target : targets) {
+        validate_target_for_loss(target, loss);
+    }
 }
 
 void validate_training_data(const Matrix& inputs,
@@ -232,6 +240,36 @@ void validate_training_data(const Matrix& inputs,
     validate_matrix(targets, output_size, "targets");
     require(inputs.size() == targets.size(), "inputs and targets must have the same number of rows");
     validate_targets_for_loss(targets, loss.type);
+}
+
+void validate_dataset_shape(std::size_t sample_count,
+                            std::size_t dataset_input_size,
+                            std::size_t dataset_output_size,
+                            std::size_t expected_input_size,
+                            std::size_t expected_output_size) {
+    require(sample_count > 0, "dataset must not be empty");
+    require(dataset_input_size == expected_input_size, "dataset input_size mismatch");
+    require(dataset_output_size == expected_output_size, "dataset output_size mismatch");
+}
+
+void validate_sample_values(const Vector& input, const Vector& target, Loss loss) {
+    for (Scalar value : input) {
+        require_finite(value, "dataset input value");
+    }
+    for (Scalar value : target) {
+        require_finite(value, "dataset target value");
+    }
+    validate_target_for_loss(target, loss);
+}
+
+void validate_dataset_split_options(const DatasetSplitOptions& options) {
+    require_finite(options.validation_split, "validation_split");
+    require_finite(options.test_split, "test_split");
+    require(options.validation_split >= Scalar{0} && options.validation_split < Scalar{1},
+            "validation_split must be in [0, 1)");
+    require(options.test_split >= Scalar{0} && options.test_split < Scalar{1}, "test_split must be in [0, 1)");
+    require(options.validation_split + options.test_split < Scalar{1},
+            "validation_split + test_split must be less than 1");
 }
 
 [[nodiscard]] bool is_regression_metric(Metric metric) noexcept {
@@ -668,6 +706,19 @@ void validate_normalization_for_loss(const NormalizationSpec& normalization, con
         result[i] = normalize_value(values[i], features[i]);
     }
     return result;
+}
+
+void normalize_vector_into(const Vector& values,
+                           const std::vector<FeatureNormalization>& features,
+                           Vector& result) {
+    result.resize(values.size());
+    if (!has_feature_normalization(features)) {
+        std::copy(values.begin(), values.end(), result.begin());
+        return;
+    }
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        result[i] = normalize_value(values[i], features[i]);
+    }
 }
 
 [[nodiscard]] Vector denormalize_vector(const Vector& values, const std::vector<FeatureNormalization>& features) {
@@ -1314,6 +1365,446 @@ EvaluationResult evaluate_predictions(const Matrix& predictions,
     }
 
     return result;
+}
+
+Dataset::~Dataset() = default;
+
+MatrixDataset::MatrixDataset(const Matrix& inputs, const Matrix& targets)
+    : inputs_(&inputs),
+      targets_(&targets),
+      input_size_(inputs.empty() ? 0 : inputs.front().size()),
+      output_size_(targets.empty() ? 0 : targets.front().size()) {
+    validate_matrix(inputs, input_size_, "inputs");
+    validate_matrix(targets, output_size_, "targets");
+    require(inputs.size() == targets.size(), "inputs and targets must have the same number of rows");
+    require(input_size_ > 0, "inputs must have at least one column");
+    require(output_size_ > 0, "targets must have at least one column");
+}
+
+std::size_t MatrixDataset::sample_count() const noexcept {
+    return inputs_ ? inputs_->size() : 0;
+}
+
+std::size_t MatrixDataset::input_size() const noexcept {
+    return input_size_;
+}
+
+std::size_t MatrixDataset::output_size() const noexcept {
+    return output_size_;
+}
+
+void MatrixDataset::sample(std::size_t index,
+                           Scalar* input,
+                           std::size_t provided_input_size,
+                           Scalar* target,
+                           std::size_t provided_target_size) const {
+    require(inputs_ != nullptr && targets_ != nullptr, "matrix dataset is not initialized");
+    require(index < sample_count(), "dataset sample index is out of range");
+    require(input != nullptr, "dataset input buffer must not be null");
+    require(target != nullptr, "dataset target buffer must not be null");
+    require(provided_input_size == input_size_, "dataset input buffer size mismatch");
+    require(provided_target_size == output_size_, "dataset target buffer size mismatch");
+
+    const Vector& source_input = (*inputs_)[index];
+    const Vector& source_target = (*targets_)[index];
+    std::copy(source_input.begin(), source_input.end(), input);
+    std::copy(source_target.begin(), source_target.end(), target);
+}
+
+GeneratedDataset::GeneratedDataset(std::size_t sample_count_value,
+                                   std::size_t input_size_value,
+                                   std::size_t output_size_value,
+                                   IndexedSampleFunction generate,
+                                   void* context)
+    : sample_count_(sample_count_value),
+      input_size_(input_size_value),
+      output_size_(output_size_value),
+      generate_(generate),
+      context_(context) {
+    require(sample_count_ > 0, "generated dataset sample_count must be positive");
+    require(input_size_ > 0, "generated dataset input_size must be positive");
+    require(output_size_ > 0, "generated dataset output_size must be positive");
+    require(generate_ != nullptr, "generated dataset callback is required");
+}
+
+std::size_t GeneratedDataset::sample_count() const noexcept {
+    return sample_count_;
+}
+
+std::size_t GeneratedDataset::input_size() const noexcept {
+    return input_size_;
+}
+
+std::size_t GeneratedDataset::output_size() const noexcept {
+    return output_size_;
+}
+
+void GeneratedDataset::sample(std::size_t index,
+                              Scalar* input,
+                              std::size_t provided_input_size,
+                              Scalar* target,
+                              std::size_t provided_target_size) const {
+    require(index < sample_count_, "generated dataset sample index is out of range");
+    require(input != nullptr, "generated dataset input buffer must not be null");
+    require(target != nullptr, "generated dataset target buffer must not be null");
+    require(provided_input_size == input_size_, "generated dataset input buffer size mismatch");
+    require(provided_target_size == output_size_, "generated dataset target buffer size mismatch");
+    generate_(index, input, input_size_, target, output_size_, context_);
+}
+
+DatasetSplit make_dataset_split(std::size_t sample_count, const DatasetSplitOptions& options) {
+    require(sample_count > 0, "sample_count must be positive");
+    validate_dataset_split_options(options);
+
+    std::vector<std::size_t> indices = make_indices(sample_count);
+    if (options.shuffle) {
+        std::mt19937_64 rng(non_zero_seed(options.seed, 5489u));
+        std::shuffle(indices.begin(), indices.end(), rng);
+    }
+
+    const std::size_t validation_count =
+        static_cast<std::size_t>(std::floor(static_cast<Scalar>(sample_count) * options.validation_split));
+    const std::size_t test_count =
+        static_cast<std::size_t>(std::floor(static_cast<Scalar>(sample_count) * options.test_split));
+    require(validation_count + test_count < sample_count,
+            "dataset split leaves no training samples");
+
+    DatasetSplit split;
+    const auto test_begin = indices.end() - static_cast<std::ptrdiff_t>(test_count);
+    const auto validation_begin = test_begin - static_cast<std::ptrdiff_t>(validation_count);
+    split.training_indices.assign(indices.begin(), validation_begin);
+    split.validation_indices.assign(validation_begin, test_begin);
+    split.test_indices.assign(test_begin, indices.end());
+    return split;
+}
+
+DatasetView::DatasetView(const Dataset& source, std::vector<std::size_t> indices)
+    : source_(&source),
+      indices_(std::move(indices)) {
+    require(source_ != nullptr, "dataset view source must not be null");
+    for (std::size_t index : indices_) {
+        require(index < source.sample_count(), "dataset view index is out of range");
+    }
+}
+
+std::size_t DatasetView::sample_count() const noexcept {
+    return indices_.size();
+}
+
+std::size_t DatasetView::input_size() const noexcept {
+    return source_ ? source_->input_size() : 0;
+}
+
+std::size_t DatasetView::output_size() const noexcept {
+    return source_ ? source_->output_size() : 0;
+}
+
+const std::vector<std::size_t>& DatasetView::indices() const noexcept {
+    return indices_;
+}
+
+void DatasetView::sample(std::size_t index,
+                         Scalar* input,
+                         std::size_t provided_input_size,
+                         Scalar* target,
+                         std::size_t provided_target_size) const {
+    require(source_ != nullptr, "dataset view source must not be null");
+    require(index < indices_.size(), "dataset view sample index is out of range");
+    source_->sample(indices_[index], input, provided_input_size, target, provided_target_size);
+}
+
+std::size_t MiniBatch::size() const noexcept {
+    return inputs.size();
+}
+
+bool MiniBatch::empty() const noexcept {
+    return inputs.empty();
+}
+
+void MiniBatch::clear() noexcept {
+    inputs.clear();
+    targets.clear();
+}
+
+struct BatchGenerator::Impl {
+    const Dataset* dataset{nullptr};
+    std::size_t batch_size{0};
+    bool shuffle{false};
+    std::uint64_t seed{0};
+    std::size_t cursor{0};
+    std::vector<std::size_t> indices;
+    Vector input_buffer;
+    Vector target_buffer;
+};
+
+BatchGenerator::BatchGenerator(const Dataset& dataset,
+                               std::size_t batch_size,
+                               bool shuffle,
+                               std::uint64_t seed)
+    : impl_(std::make_unique<Impl>()) {
+    require(batch_size > 0, "batch_size must be positive");
+    require(dataset.sample_count() > 0, "dataset must not be empty");
+    impl_->dataset = &dataset;
+    impl_->batch_size = batch_size;
+    impl_->shuffle = shuffle;
+    impl_->seed = seed;
+    impl_->input_buffer.resize(dataset.input_size());
+    impl_->target_buffer.resize(dataset.output_size());
+    reset();
+}
+
+BatchGenerator::BatchGenerator(const BatchGenerator& other)
+    : impl_(std::make_unique<Impl>(*other.impl_)) {}
+
+BatchGenerator& BatchGenerator::operator=(const BatchGenerator& other) {
+    if (this != &other) {
+        impl_ = std::make_unique<Impl>(*other.impl_);
+    }
+    return *this;
+}
+
+BatchGenerator::BatchGenerator(BatchGenerator&& other) noexcept = default;
+
+BatchGenerator& BatchGenerator::operator=(BatchGenerator&& other) noexcept = default;
+
+BatchGenerator::~BatchGenerator() = default;
+
+void BatchGenerator::reset(std::uint64_t epoch) {
+    require(impl_ && impl_->dataset, "batch generator is not initialized");
+    impl_->indices = make_indices(impl_->dataset->sample_count());
+    impl_->cursor = 0;
+    if (impl_->shuffle) {
+        std::mt19937_64 rng(non_zero_seed(impl_->seed, 5489u) + epoch);
+        std::shuffle(impl_->indices.begin(), impl_->indices.end(), rng);
+    }
+}
+
+bool BatchGenerator::next(MiniBatch& batch) {
+    require(impl_ && impl_->dataset, "batch generator is not initialized");
+    batch.clear();
+    if (impl_->cursor >= impl_->indices.size()) {
+        return false;
+    }
+
+    const std::size_t count = std::min(impl_->batch_size, impl_->indices.size() - impl_->cursor);
+    batch.inputs.reserve(count);
+    batch.targets.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::size_t row = impl_->indices[impl_->cursor++];
+        impl_->dataset->sample(row,
+                               impl_->input_buffer.data(),
+                               impl_->input_buffer.size(),
+                               impl_->target_buffer.data(),
+                               impl_->target_buffer.size());
+        batch.inputs.push_back(impl_->input_buffer);
+        batch.targets.push_back(impl_->target_buffer);
+    }
+    return true;
+}
+
+StreamingDataset::~StreamingDataset() = default;
+
+FunctionStreamingDataset::FunctionStreamingDataset(std::size_t sample_count_value,
+                                                   std::size_t input_size_value,
+                                                   std::size_t output_size_value,
+                                                   StreamingSampleFunction next,
+                                                   StreamingResetFunction reset,
+                                                   void* context)
+    : sample_count_(sample_count_value),
+      input_size_(input_size_value),
+      output_size_(output_size_value),
+      next_(next),
+      reset_(reset),
+      context_(context) {
+    require(sample_count_ > 0, "streaming dataset sample_count must be positive");
+    require(input_size_ > 0, "streaming dataset input_size must be positive");
+    require(output_size_ > 0, "streaming dataset output_size must be positive");
+    require(next_ != nullptr, "streaming dataset callback is required");
+}
+
+std::size_t FunctionStreamingDataset::sample_count() const noexcept {
+    return sample_count_;
+}
+
+std::size_t FunctionStreamingDataset::input_size() const noexcept {
+    return input_size_;
+}
+
+std::size_t FunctionStreamingDataset::output_size() const noexcept {
+    return output_size_;
+}
+
+void FunctionStreamingDataset::reset() {
+    if (reset_) {
+        reset_(context_);
+    }
+}
+
+bool FunctionStreamingDataset::next(Scalar* input,
+                                    std::size_t provided_input_size,
+                                    Scalar* target,
+                                    std::size_t provided_target_size) {
+    require(input != nullptr, "streaming dataset input buffer must not be null");
+    require(target != nullptr, "streaming dataset target buffer must not be null");
+    require(provided_input_size == input_size_, "streaming dataset input buffer size mismatch");
+    require(provided_target_size == output_size_, "streaming dataset target buffer size mismatch");
+    return next_(input, input_size_, target, output_size_, context_);
+}
+
+namespace {
+
+[[nodiscard]] std::size_t count_csv_samples(const std::filesystem::path& path, const CsvStreamingOptions& options) {
+    std::ifstream input(path);
+    if (!input) {
+        throw std::runtime_error("failed to open csv dataset for reading: " + path.string());
+    }
+
+    std::string line;
+    if (options.has_header) {
+        std::getline(input, line);
+    }
+
+    std::size_t count = 0;
+    while (std::getline(input, line)) {
+        if (!line.empty()) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+void parse_csv_line(const std::string& line,
+                    char delimiter,
+                    Scalar* input,
+                    std::size_t input_size,
+                    Scalar* target,
+                    std::size_t target_size) {
+    std::stringstream stream(line);
+    std::string token;
+    std::size_t column = 0;
+    const std::size_t total_columns = input_size + target_size;
+
+    while (std::getline(stream, token, delimiter)) {
+        require(column < total_columns, "csv row has too many columns");
+        Scalar value{};
+        try {
+            value = static_cast<Scalar>(std::stod(token));
+        } catch (const std::exception&) {
+            throw std::runtime_error("failed to parse csv numeric value");
+        }
+        require_finite(value, "csv value");
+        if (column < input_size) {
+            input[column] = value;
+        } else {
+            target[column - input_size] = value;
+        }
+        ++column;
+    }
+
+    require(column == total_columns, "csv row has an invalid column count");
+}
+
+} // namespace
+
+struct CsvStreamingDataset::Impl {
+    std::filesystem::path path;
+    std::size_t input_size{0};
+    std::size_t output_size{0};
+    CsvStreamingOptions options{};
+    std::size_t sample_count{0};
+    std::ifstream stream;
+};
+
+CsvStreamingDataset::CsvStreamingDataset(const std::filesystem::path& path,
+                                         std::size_t input_size,
+                                         std::size_t output_size,
+                                         CsvStreamingOptions options)
+    : impl_(std::make_unique<Impl>()) {
+    require(input_size > 0, "csv dataset input_size must be positive");
+    require(output_size > 0, "csv dataset output_size must be positive");
+    impl_->path = path;
+    impl_->input_size = input_size;
+    impl_->output_size = output_size;
+    impl_->options = options;
+    impl_->sample_count = count_csv_samples(path, options);
+    require(impl_->sample_count > 0, "csv dataset must not be empty");
+    reset();
+}
+
+CsvStreamingDataset::CsvStreamingDataset(const CsvStreamingDataset& other)
+    : impl_(std::make_unique<Impl>()) {
+    impl_->path = other.impl_->path;
+    impl_->input_size = other.impl_->input_size;
+    impl_->output_size = other.impl_->output_size;
+    impl_->options = other.impl_->options;
+    impl_->sample_count = other.impl_->sample_count;
+    reset();
+}
+
+CsvStreamingDataset& CsvStreamingDataset::operator=(const CsvStreamingDataset& other) {
+    if (this != &other) {
+        impl_ = std::make_unique<Impl>();
+        impl_->path = other.impl_->path;
+        impl_->input_size = other.impl_->input_size;
+        impl_->output_size = other.impl_->output_size;
+        impl_->options = other.impl_->options;
+        impl_->sample_count = other.impl_->sample_count;
+        reset();
+    }
+    return *this;
+}
+
+CsvStreamingDataset::CsvStreamingDataset(CsvStreamingDataset&& other) noexcept = default;
+
+CsvStreamingDataset& CsvStreamingDataset::operator=(CsvStreamingDataset&& other) noexcept = default;
+
+CsvStreamingDataset::~CsvStreamingDataset() = default;
+
+std::size_t CsvStreamingDataset::sample_count() const noexcept {
+    return impl_ ? impl_->sample_count : 0;
+}
+
+std::size_t CsvStreamingDataset::input_size() const noexcept {
+    return impl_ ? impl_->input_size : 0;
+}
+
+std::size_t CsvStreamingDataset::output_size() const noexcept {
+    return impl_ ? impl_->output_size : 0;
+}
+
+void CsvStreamingDataset::reset() {
+    require(impl_ != nullptr, "csv dataset is not initialized");
+    impl_->stream.close();
+    impl_->stream.clear();
+    impl_->stream.open(impl_->path);
+    if (!impl_->stream) {
+        throw std::runtime_error("failed to open csv dataset for reading: " + impl_->path.string());
+    }
+    if (impl_->options.has_header) {
+        std::string header;
+        std::getline(impl_->stream, header);
+    }
+}
+
+bool CsvStreamingDataset::next(Scalar* input,
+                               std::size_t provided_input_size,
+                               Scalar* target,
+                               std::size_t provided_target_size) {
+    require(impl_ != nullptr, "csv dataset is not initialized");
+    require(input != nullptr, "csv dataset input buffer must not be null");
+    require(target != nullptr, "csv dataset target buffer must not be null");
+    require(provided_input_size == impl_->input_size, "csv dataset input buffer size mismatch");
+    require(provided_target_size == impl_->output_size, "csv dataset target buffer size mismatch");
+
+    std::string line;
+    while (std::getline(impl_->stream, line)) {
+        if (line.empty()) {
+            continue;
+        }
+        parse_csv_line(line, impl_->options.delimiter, input, impl_->input_size, target, impl_->output_size);
+        return true;
+    }
+    return false;
 }
 
 OptimizerConfig OptimizerConfig::adam(Scalar learning_rate) {
@@ -2285,6 +2776,51 @@ struct TrainingModel::Impl {
         return total / static_cast<Scalar>(indices.size());
     }
 
+    void normalize_sample(const Vector& raw_input,
+                          const Vector& raw_target,
+                          Vector& normalized_input,
+                          Vector& normalized_target) const {
+        validate_sample_values(raw_input, raw_target, loss.type);
+        normalize_vector_into(raw_input, normalization.input_features, normalized_input);
+        normalize_vector_into(raw_target, normalization.output_features, normalized_target);
+    }
+
+    void read_dataset_sample(const Dataset& dataset,
+                             std::size_t index,
+                             Vector& raw_input,
+                             Vector& raw_target,
+                             Vector& normalized_input,
+                             Vector& normalized_target) const {
+        dataset.sample(index, raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size());
+        normalize_sample(raw_input, raw_target, normalized_input, normalized_target);
+    }
+
+    [[nodiscard]] Scalar loss_for_dataset_indices(const Dataset& dataset,
+                                                  const std::vector<std::size_t>& indices) const {
+        require(!indices.empty(), "dataset loss requires at least one sample");
+        Vector raw_input(input_size);
+        Vector raw_target(output_size());
+        Vector normalized_input(input_size);
+        Vector normalized_target(output_size());
+        Scalar total = Scalar{0};
+        for (std::size_t index : indices) {
+            read_dataset_sample(dataset, index, raw_input, raw_target, normalized_input, normalized_target);
+            total += sample_loss(forward(normalized_input), normalized_target);
+        }
+        return total / static_cast<Scalar>(indices.size());
+    }
+
+    void read_streaming_sample(StreamingDataset& dataset,
+                               Vector& raw_input,
+                               Vector& raw_target,
+                               Vector& normalized_input,
+                               Vector& normalized_target) const {
+        const bool has_sample =
+            dataset.next(raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size());
+        require(has_sample, "streaming dataset ended before sample_count");
+        normalize_sample(raw_input, raw_target, normalized_input, normalized_target);
+    }
+
     [[nodiscard]] std::vector<LayerParameters> parameters() const {
         std::vector<LayerParameters> result;
         result.reserve(layers.size());
@@ -2527,34 +3063,35 @@ EvaluationResult TrainingModel::evaluate_metrics(const Matrix& inputs,
 }
 
 TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options) {
+    MatrixDataset dataset(inputs, targets);
+    return fit(dataset, options);
+}
+
+TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions& options) {
     validate_training_options(options);
-    validate_training_data(inputs, targets, input_size(), output_size(), impl_->loss);
+    validate_dataset_shape(dataset.sample_count(), dataset.input_size(), dataset.output_size(), input_size(), output_size());
 
-    const Matrix normalized_inputs = normalize_matrix(inputs, impl_->normalization.input_features);
-    const Matrix normalized_targets = normalize_matrix(targets, impl_->normalization.output_features);
-
-    std::vector<std::size_t> indices = make_indices(inputs.size());
-    std::mt19937_64 split_rng(non_zero_seed(options.seed, impl_->seed));
-    if (options.validation_split > Scalar{0}) {
-        std::shuffle(indices.begin(), indices.end(), split_rng);
-    }
-
-    const auto validation_count =
-        static_cast<std::size_t>(std::floor(static_cast<Scalar>(inputs.size()) * options.validation_split));
-    require(validation_count < inputs.size(), "validation_split leaves no training samples");
-
-    std::vector<std::size_t> validation_indices(indices.end() - static_cast<std::ptrdiff_t>(validation_count),
-                                                indices.end());
-    std::vector<std::size_t> training_indices(indices.begin(),
-                                              indices.end() - static_cast<std::ptrdiff_t>(validation_count));
+    DatasetSplitOptions split_options;
+    split_options.validation_split = options.validation_split;
+    split_options.test_split = options.test_split;
+    split_options.shuffle = options.shuffle;
+    split_options.seed = non_zero_seed(options.seed, impl_->seed);
+    DatasetSplit split = make_dataset_split(dataset.sample_count(), split_options);
+    std::vector<std::size_t> training_indices = split.training_indices;
 
     TrainingHistory history;
     history.training_loss.reserve(options.epochs);
     history.validation_loss.reserve(options.epochs);
+    history.test_loss.reserve(options.epochs);
 
     Scalar best_metric = std::numeric_limits<Scalar>::infinity();
     std::vector<LayerParameters> best_parameters;
     std::size_t stale_epochs = 0;
+
+    Vector raw_input(input_size());
+    Vector raw_target(output_size());
+    Vector normalized_input(input_size());
+    Vector normalized_target(output_size());
 
     for (std::size_t epoch = 0; epoch < options.epochs; ++epoch) {
         std::mt19937_64 epoch_rng(non_zero_seed(options.seed, impl_->seed) + epoch);
@@ -2562,24 +3099,180 @@ TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, 
             std::shuffle(training_indices.begin(), training_indices.end(), epoch_rng);
         }
 
-        for (std::size_t begin = 0; begin < training_indices.size(); begin += options.batch_size) {
-            const std::size_t end = std::min(begin + options.batch_size, training_indices.size());
-            impl_->zero_gradients();
-            for (std::size_t position = begin; position < end; ++position) {
-                const std::size_t row = training_indices[position];
-                impl_->accumulate_gradients(normalized_inputs[row], normalized_targets[row]);
+        impl_->zero_gradients();
+        std::size_t batch_count = 0;
+        for (std::size_t row : training_indices) {
+            impl_->read_dataset_sample(dataset, row, raw_input, raw_target, normalized_input, normalized_target);
+            impl_->accumulate_gradients(normalized_input, normalized_target);
+            ++batch_count;
+            if (batch_count == options.batch_size) {
+                impl_->apply_gradients(batch_count);
+                batch_count = 0;
             }
-            impl_->apply_gradients(end - begin);
+        }
+        if (batch_count > 0) {
+            impl_->apply_gradients(batch_count);
         }
 
-        const Scalar training_loss = impl_->loss_for_indices(normalized_inputs, normalized_targets, training_indices);
+        const Scalar training_loss = impl_->loss_for_dataset_indices(dataset, training_indices);
         history.training_loss.push_back(training_loss);
 
         Scalar monitored_metric = training_loss;
-        if (!validation_indices.empty()) {
-            const Scalar validation_loss = impl_->loss_for_indices(normalized_inputs, normalized_targets, validation_indices);
+        if (!split.validation_indices.empty()) {
+            const Scalar validation_loss = impl_->loss_for_dataset_indices(dataset, split.validation_indices);
             history.validation_loss.push_back(validation_loss);
             monitored_metric = validation_loss;
+        }
+        if (!split.test_indices.empty()) {
+            history.test_loss.push_back(impl_->loss_for_dataset_indices(dataset, split.test_indices));
+        }
+
+        if (monitored_metric + options.min_delta < best_metric) {
+            best_metric = monitored_metric;
+            stale_epochs = 0;
+            if (options.restore_best_weights) {
+                best_parameters = impl_->parameters();
+            }
+        } else {
+            ++stale_epochs;
+        }
+
+        if (options.early_stopping_patience > 0 && stale_epochs >= options.early_stopping_patience) {
+            break;
+        }
+    }
+
+    if (options.restore_best_weights && !best_parameters.empty()) {
+        impl_->set_parameters(best_parameters);
+    }
+
+    return history;
+}
+
+TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOptions& options) {
+    validate_training_options(options);
+    validate_dataset_shape(dataset.sample_count(), dataset.input_size(), dataset.output_size(), input_size(), output_size());
+
+    DatasetSplitOptions split_options;
+    split_options.validation_split = options.validation_split;
+    split_options.test_split = options.test_split;
+    split_options.shuffle = options.shuffle;
+    split_options.seed = non_zero_seed(options.seed, impl_->seed);
+    const DatasetSplit split = make_dataset_split(dataset.sample_count(), split_options);
+
+    std::vector<unsigned char> partition(dataset.sample_count(), 0);
+    for (std::size_t index : split.validation_indices) {
+        partition[index] = 1;
+    }
+    for (std::size_t index : split.test_indices) {
+        partition[index] = 2;
+    }
+
+    TrainingHistory history;
+    history.training_loss.reserve(options.epochs);
+    history.validation_loss.reserve(options.epochs);
+    history.test_loss.reserve(options.epochs);
+
+    Scalar best_metric = std::numeric_limits<Scalar>::infinity();
+    std::vector<LayerParameters> best_parameters;
+    std::size_t stale_epochs = 0;
+
+    struct BufferedSample {
+        Vector input;
+        Vector target;
+    };
+
+    Vector raw_input(input_size());
+    Vector raw_target(output_size());
+    Vector normalized_input(input_size());
+    Vector normalized_target(output_size());
+
+    auto stream_loss_for_partition = [&](unsigned char requested_partition) {
+        dataset.reset();
+        Scalar total = Scalar{0};
+        std::size_t count = 0;
+        for (std::size_t index = 0; index < dataset.sample_count(); ++index) {
+            impl_->read_streaming_sample(dataset, raw_input, raw_target, normalized_input, normalized_target);
+            if (partition[index] == requested_partition) {
+                total += impl_->sample_loss(impl_->forward(normalized_input), normalized_target);
+                ++count;
+            }
+        }
+        require(!dataset.next(raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size()),
+                "streaming dataset produced more samples than sample_count");
+        require(count > 0, "streaming loss partition is empty");
+        return total / static_cast<Scalar>(count);
+    };
+
+    for (std::size_t epoch = 0; epoch < options.epochs; ++epoch) {
+        std::mt19937_64 epoch_rng(non_zero_seed(options.seed, impl_->seed) + epoch);
+        std::vector<BufferedSample> shuffle_buffer;
+        const bool use_shuffle_buffer = options.shuffle && options.streaming_shuffle_buffer_size > 0;
+        if (use_shuffle_buffer) {
+            shuffle_buffer.reserve(options.streaming_shuffle_buffer_size);
+        }
+
+        impl_->zero_gradients();
+        std::size_t batch_count = 0;
+
+        auto train_normalized_sample = [&](const Vector& input_sample, const Vector& target_sample) {
+            impl_->accumulate_gradients(input_sample, target_sample);
+            ++batch_count;
+            if (batch_count == options.batch_size) {
+                impl_->apply_gradients(batch_count);
+                batch_count = 0;
+            }
+        };
+
+        auto submit_training_sample = [&](const Vector& input_sample, const Vector& target_sample) {
+            if (!use_shuffle_buffer) {
+                train_normalized_sample(input_sample, target_sample);
+                return;
+            }
+
+            if (shuffle_buffer.size() < options.streaming_shuffle_buffer_size) {
+                shuffle_buffer.push_back(BufferedSample{input_sample, target_sample});
+                return;
+            }
+
+            std::uniform_int_distribution<std::size_t> distribution(0, shuffle_buffer.size() - 1);
+            const std::size_t selected = distribution(epoch_rng);
+            train_normalized_sample(shuffle_buffer[selected].input, shuffle_buffer[selected].target);
+            shuffle_buffer[selected].input = input_sample;
+            shuffle_buffer[selected].target = target_sample;
+        };
+
+        dataset.reset();
+        for (std::size_t index = 0; index < dataset.sample_count(); ++index) {
+            impl_->read_streaming_sample(dataset, raw_input, raw_target, normalized_input, normalized_target);
+            if (partition[index] == 0) {
+                submit_training_sample(normalized_input, normalized_target);
+            }
+        }
+        require(!dataset.next(raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size()),
+                "streaming dataset produced more samples than sample_count");
+
+        if (use_shuffle_buffer) {
+            std::shuffle(shuffle_buffer.begin(), shuffle_buffer.end(), epoch_rng);
+            for (const BufferedSample& sample : shuffle_buffer) {
+                train_normalized_sample(sample.input, sample.target);
+            }
+        }
+        if (batch_count > 0) {
+            impl_->apply_gradients(batch_count);
+        }
+
+        const Scalar training_loss = stream_loss_for_partition(0);
+        history.training_loss.push_back(training_loss);
+
+        Scalar monitored_metric = training_loss;
+        if (!split.validation_indices.empty()) {
+            const Scalar validation_loss = stream_loss_for_partition(1);
+            history.validation_loss.push_back(validation_loss);
+            monitored_metric = validation_loss;
+        }
+        if (!split.test_indices.empty()) {
+            history.test_loss.push_back(stream_loss_for_partition(2));
         }
 
         if (monitored_metric + options.min_delta < best_metric) {

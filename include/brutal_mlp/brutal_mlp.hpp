@@ -207,6 +207,8 @@ struct TrainingOptions {
     bool shuffle{true};
     std::uint64_t seed{0};
     Scalar validation_split{static_cast<Scalar>(0)};
+    Scalar test_split{static_cast<Scalar>(0)};
+    std::size_t streaming_shuffle_buffer_size{0};
     std::size_t early_stopping_patience{0};
     Scalar min_delta{static_cast<Scalar>(1e-8)};
     bool restore_best_weights{true};
@@ -215,6 +217,214 @@ struct TrainingOptions {
 struct TrainingHistory {
     std::vector<Scalar> training_loss;
     std::vector<Scalar> validation_loss;
+    std::vector<Scalar> test_loss;
+};
+
+using IndexedSampleFunction = void (*)(std::size_t index,
+                                       Scalar* input,
+                                       std::size_t input_size,
+                                       Scalar* target,
+                                       std::size_t target_size,
+                                       void* context);
+using StreamingSampleFunction = bool (*)(Scalar* input,
+                                         std::size_t input_size,
+                                         Scalar* target,
+                                         std::size_t target_size,
+                                         void* context);
+using StreamingResetFunction = void (*)(void* context);
+
+class Dataset {
+public:
+    virtual ~Dataset();
+
+    [[nodiscard]] virtual std::size_t sample_count() const noexcept = 0;
+    [[nodiscard]] virtual std::size_t input_size() const noexcept = 0;
+    [[nodiscard]] virtual std::size_t output_size() const noexcept = 0;
+    virtual void sample(std::size_t index,
+                        Scalar* input,
+                        std::size_t input_size,
+                        Scalar* target,
+                        std::size_t target_size) const = 0;
+};
+
+class MatrixDataset final : public Dataset {
+public:
+    MatrixDataset(const Matrix& inputs, const Matrix& targets);
+
+    [[nodiscard]] std::size_t sample_count() const noexcept override;
+    [[nodiscard]] std::size_t input_size() const noexcept override;
+    [[nodiscard]] std::size_t output_size() const noexcept override;
+    void sample(std::size_t index,
+                Scalar* input,
+                std::size_t input_size,
+                Scalar* target,
+                std::size_t target_size) const override;
+
+private:
+    const Matrix* inputs_{nullptr};
+    const Matrix* targets_{nullptr};
+    std::size_t input_size_{0};
+    std::size_t output_size_{0};
+};
+
+class GeneratedDataset final : public Dataset {
+public:
+    GeneratedDataset(std::size_t sample_count,
+                     std::size_t input_size,
+                     std::size_t output_size,
+                     IndexedSampleFunction generate,
+                     void* context = nullptr);
+
+    [[nodiscard]] std::size_t sample_count() const noexcept override;
+    [[nodiscard]] std::size_t input_size() const noexcept override;
+    [[nodiscard]] std::size_t output_size() const noexcept override;
+    void sample(std::size_t index,
+                Scalar* input,
+                std::size_t input_size,
+                Scalar* target,
+                std::size_t target_size) const override;
+
+private:
+    std::size_t sample_count_{0};
+    std::size_t input_size_{0};
+    std::size_t output_size_{0};
+    IndexedSampleFunction generate_{nullptr};
+    void* context_{nullptr};
+};
+
+struct DatasetSplitOptions {
+    Scalar validation_split{static_cast<Scalar>(0)};
+    Scalar test_split{static_cast<Scalar>(0)};
+    bool shuffle{true};
+    std::uint64_t seed{0};
+};
+
+struct DatasetSplit {
+    std::vector<std::size_t> training_indices;
+    std::vector<std::size_t> validation_indices;
+    std::vector<std::size_t> test_indices;
+};
+
+[[nodiscard]] DatasetSplit make_dataset_split(std::size_t sample_count, const DatasetSplitOptions& options = {});
+
+class DatasetView final : public Dataset {
+public:
+    DatasetView(const Dataset& source, std::vector<std::size_t> indices);
+
+    [[nodiscard]] std::size_t sample_count() const noexcept override;
+    [[nodiscard]] std::size_t input_size() const noexcept override;
+    [[nodiscard]] std::size_t output_size() const noexcept override;
+    [[nodiscard]] const std::vector<std::size_t>& indices() const noexcept;
+    void sample(std::size_t index,
+                Scalar* input,
+                std::size_t input_size,
+                Scalar* target,
+                std::size_t target_size) const override;
+
+private:
+    const Dataset* source_{nullptr};
+    std::vector<std::size_t> indices_;
+};
+
+struct MiniBatch {
+    Matrix inputs;
+    Matrix targets;
+
+    [[nodiscard]] std::size_t size() const noexcept;
+    [[nodiscard]] bool empty() const noexcept;
+    void clear() noexcept;
+};
+
+class BatchGenerator {
+public:
+    BatchGenerator(const Dataset& dataset,
+                   std::size_t batch_size,
+                   bool shuffle = false,
+                   std::uint64_t seed = 0);
+    BatchGenerator(const BatchGenerator& other);
+    BatchGenerator& operator=(const BatchGenerator& other);
+    BatchGenerator(BatchGenerator&& other) noexcept;
+    BatchGenerator& operator=(BatchGenerator&& other) noexcept;
+    ~BatchGenerator();
+
+    void reset(std::uint64_t epoch = 0);
+    [[nodiscard]] bool next(MiniBatch& batch);
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
+};
+
+class StreamingDataset {
+public:
+    virtual ~StreamingDataset();
+
+    [[nodiscard]] virtual std::size_t sample_count() const noexcept = 0;
+    [[nodiscard]] virtual std::size_t input_size() const noexcept = 0;
+    [[nodiscard]] virtual std::size_t output_size() const noexcept = 0;
+    virtual void reset() = 0;
+    [[nodiscard]] virtual bool next(Scalar* input,
+                                    std::size_t input_size,
+                                    Scalar* target,
+                                    std::size_t target_size) = 0;
+};
+
+class FunctionStreamingDataset final : public StreamingDataset {
+public:
+    FunctionStreamingDataset(std::size_t sample_count,
+                             std::size_t input_size,
+                             std::size_t output_size,
+                             StreamingSampleFunction next,
+                             StreamingResetFunction reset = nullptr,
+                             void* context = nullptr);
+
+    [[nodiscard]] std::size_t sample_count() const noexcept override;
+    [[nodiscard]] std::size_t input_size() const noexcept override;
+    [[nodiscard]] std::size_t output_size() const noexcept override;
+    void reset() override;
+    [[nodiscard]] bool next(Scalar* input,
+                            std::size_t input_size,
+                            Scalar* target,
+                            std::size_t target_size) override;
+
+private:
+    std::size_t sample_count_{0};
+    std::size_t input_size_{0};
+    std::size_t output_size_{0};
+    StreamingSampleFunction next_{nullptr};
+    StreamingResetFunction reset_{nullptr};
+    void* context_{nullptr};
+};
+
+struct CsvStreamingOptions {
+    char delimiter{','};
+    bool has_header{false};
+};
+
+class CsvStreamingDataset final : public StreamingDataset {
+public:
+    CsvStreamingDataset(const std::filesystem::path& path,
+                        std::size_t input_size,
+                        std::size_t output_size,
+                        CsvStreamingOptions options = {});
+    CsvStreamingDataset(const CsvStreamingDataset& other);
+    CsvStreamingDataset& operator=(const CsvStreamingDataset& other);
+    CsvStreamingDataset(CsvStreamingDataset&& other) noexcept;
+    CsvStreamingDataset& operator=(CsvStreamingDataset&& other) noexcept;
+    ~CsvStreamingDataset();
+
+    [[nodiscard]] std::size_t sample_count() const noexcept override;
+    [[nodiscard]] std::size_t input_size() const noexcept override;
+    [[nodiscard]] std::size_t output_size() const noexcept override;
+    void reset() override;
+    [[nodiscard]] bool next(Scalar* input,
+                            std::size_t input_size,
+                            Scalar* target,
+                            std::size_t target_size) override;
+
+private:
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 struct LayerSpec {
@@ -406,6 +616,8 @@ public:
                                                     const EvaluationOptions& options = {}) const;
 
     TrainingHistory fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options = {});
+    TrainingHistory fit(const Dataset& dataset, const TrainingOptions& options = {});
+    TrainingHistory fit(StreamingDataset& dataset, const TrainingOptions& options = {});
 
     [[nodiscard]] std::vector<LayerParameters> parameters() const;
     void set_parameters(const std::vector<LayerParameters>& parameters);
