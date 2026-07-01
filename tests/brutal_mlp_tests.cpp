@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -19,6 +20,11 @@ namespace bm = brutal_mlp;
 namespace {
 
 constexpr double kTightTolerance = sizeof(bm::Scalar) == sizeof(float) ? 1e-5 : 1e-12;
+constexpr bm::Scalar kGradientStep = sizeof(bm::Scalar) == sizeof(float) ? bm::Scalar{1e-2f} : bm::Scalar{1e-5};
+constexpr bm::Scalar kGradientLearningRate =
+    sizeof(bm::Scalar) == sizeof(float) ? bm::Scalar{1e-2f} : bm::Scalar{1e-4};
+constexpr double kGradientAbsTolerance = sizeof(bm::Scalar) == sizeof(float) ? 6e-3 : 1e-6;
+constexpr double kGradientRelTolerance = sizeof(bm::Scalar) == sizeof(float) ? 6e-2 : 1e-5;
 
 std::atomic<bool> g_count_allocations{false};
 std::atomic<std::size_t> g_allocation_count{0};
@@ -75,6 +81,114 @@ bm::TrainingOptions quick_options(std::size_t epochs, std::size_t batch_size) {
     options.seed = 1234;
     options.restore_best_weights = true;
     return options;
+}
+
+bm::TrainingOptions one_step_options(std::size_t batch_size) {
+    bm::TrainingOptions options;
+    options.epochs = 1;
+    options.batch_size = batch_size;
+    options.shuffle = false;
+    options.restore_best_weights = false;
+    return options;
+}
+
+std::vector<bm::LayerParameters> analytic_gradients_from_sgd_step(const bm::TrainingModel& base_model,
+                                                                  const std::vector<bm::LayerParameters>& parameters,
+                                                                  const bm::Matrix& inputs,
+                                                                  const bm::Matrix& targets,
+                                                                  bm::Scalar learning_rate) {
+    auto model = base_model;
+    model.set_parameters(parameters);
+    model.fit(inputs, targets, one_step_options(inputs.size()));
+    const auto updated = model.parameters();
+
+    auto gradients = parameters;
+    for (std::size_t layer = 0; layer < parameters.size(); ++layer) {
+        for (std::size_t i = 0; i < parameters[layer].weights.size(); ++i) {
+            gradients[layer].weights[i] = (parameters[layer].weights[i] - updated[layer].weights[i]) / learning_rate;
+        }
+        for (std::size_t i = 0; i < parameters[layer].biases.size(); ++i) {
+            gradients[layer].biases[i] = (parameters[layer].biases[i] - updated[layer].biases[i]) / learning_rate;
+        }
+    }
+    return gradients;
+}
+
+bm::Scalar evaluate_with_parameters(const bm::TrainingModel& base_model,
+                                    const std::vector<bm::LayerParameters>& parameters,
+                                    const bm::Matrix& inputs,
+                                    const bm::Matrix& targets) {
+    auto model = base_model;
+    model.set_parameters(parameters);
+    return model.evaluate_loss(inputs, targets);
+}
+
+std::vector<bm::LayerParameters> numerical_gradients(const bm::TrainingModel& base_model,
+                                                     const std::vector<bm::LayerParameters>& parameters,
+                                                     const bm::Matrix& inputs,
+                                                     const bm::Matrix& targets,
+                                                     bm::Scalar epsilon) {
+    auto gradients = parameters;
+    for (std::size_t layer = 0; layer < parameters.size(); ++layer) {
+        for (std::size_t i = 0; i < parameters[layer].weights.size(); ++i) {
+            auto plus = parameters;
+            auto minus = parameters;
+            plus[layer].weights[i] += epsilon;
+            minus[layer].weights[i] -= epsilon;
+            const bm::Scalar loss_plus = evaluate_with_parameters(base_model, plus, inputs, targets);
+            const bm::Scalar loss_minus = evaluate_with_parameters(base_model, minus, inputs, targets);
+            gradients[layer].weights[i] = (loss_plus - loss_minus) / (bm::Scalar{2} * epsilon);
+        }
+
+        for (std::size_t i = 0; i < parameters[layer].biases.size(); ++i) {
+            auto plus = parameters;
+            auto minus = parameters;
+            plus[layer].biases[i] += epsilon;
+            minus[layer].biases[i] -= epsilon;
+            const bm::Scalar loss_plus = evaluate_with_parameters(base_model, plus, inputs, targets);
+            const bm::Scalar loss_minus = evaluate_with_parameters(base_model, minus, inputs, targets);
+            gradients[layer].biases[i] = (loss_plus - loss_minus) / (bm::Scalar{2} * epsilon);
+        }
+    }
+    return gradients;
+}
+
+void expect_gradient_near(bm::Scalar analytic,
+                          bm::Scalar numerical,
+                          const char* parameter_kind,
+                          std::size_t layer,
+                          std::size_t index) {
+    const double a = static_cast<double>(analytic);
+    const double n = static_cast<double>(numerical);
+    const double scale = std::max({1.0, std::abs(a), std::abs(n)});
+    EXPECT_LE(std::abs(a - n), kGradientAbsTolerance + kGradientRelTolerance * scale)
+        << parameter_kind << " layer " << layer << " index " << index
+        << " analytic=" << a << " numerical=" << n;
+}
+
+void expect_gradients_match(const std::vector<bm::LayerParameters>& analytic,
+                            const std::vector<bm::LayerParameters>& numerical) {
+    ASSERT_EQ(analytic.size(), numerical.size());
+    for (std::size_t layer = 0; layer < analytic.size(); ++layer) {
+        ASSERT_EQ(analytic[layer].weights.size(), numerical[layer].weights.size());
+        ASSERT_EQ(analytic[layer].biases.size(), numerical[layer].biases.size());
+        for (std::size_t i = 0; i < analytic[layer].weights.size(); ++i) {
+            expect_gradient_near(analytic[layer].weights[i], numerical[layer].weights[i], "weight", layer, i);
+        }
+        for (std::size_t i = 0; i < analytic[layer].biases.size(); ++i) {
+            expect_gradient_near(analytic[layer].biases[i], numerical[layer].biases[i], "bias", layer, i);
+        }
+    }
+}
+
+void expect_backprop_matches_finite_difference(const bm::TrainingModel& model,
+                                               const std::vector<bm::LayerParameters>& parameters,
+                                               const bm::Matrix& inputs,
+                                               const bm::Matrix& targets,
+                                               bm::Scalar learning_rate) {
+    const auto analytic = analytic_gradients_from_sgd_step(model, parameters, inputs, targets, learning_rate);
+    const auto numerical = numerical_gradients(model, parameters, inputs, targets, kGradientStep);
+    expect_gradients_match(analytic, numerical);
 }
 
 } // namespace
@@ -333,6 +447,113 @@ TEST(Losses, RejectsInvalidTargetsForLossContracts) {
                            .build();
     EXPECT_THROW((void)categorical.evaluate_loss({{0.0}}, {{0.0, 0.5, 0.0}}), std::invalid_argument);
     EXPECT_THROW((void)categorical.evaluate_loss({{0.0}}, {{0.0, -1.0, 2.0}}), std::invalid_argument);
+}
+
+TEST(GradientCheck, MeanSquaredErrorTanhLinearNetwork) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(2, bm::Activation::tanh)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::Loss::mean_squared_error)
+                     .optimizer(bm::OptimizerConfig::sgd(kGradientLearningRate, bm::Scalar{0}))
+                     .seed(101)
+                     .build();
+
+    const std::vector<bm::LayerParameters> parameters{
+        bm::LayerParameters{2, 2, bm::Activation::tanh,
+                            {bm::Scalar{0.35}, bm::Scalar{-0.21},
+                             bm::Scalar{0.17}, bm::Scalar{0.44}},
+                            {bm::Scalar{0.08}, bm::Scalar{-0.11}}},
+        bm::LayerParameters{2, 1, bm::Activation::linear,
+                            {bm::Scalar{0.31}, bm::Scalar{-0.27}},
+                            {bm::Scalar{0.06}}},
+    };
+    const bm::Matrix inputs{{bm::Scalar{0.2}, bm::Scalar{-0.4}},
+                            {bm::Scalar{-0.3}, bm::Scalar{0.7}}};
+    const bm::Matrix targets{{bm::Scalar{0.15}}, {bm::Scalar{-0.25}}};
+
+    expect_backprop_matches_finite_difference(model, parameters, inputs, targets, kGradientLearningRate);
+}
+
+TEST(GradientCheck, BinaryCrossEntropySigmoidNetwork) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(2, bm::Activation::tanh)
+                     .add_layer(1, bm::Activation::sigmoid)
+                     .loss(bm::Loss::binary_cross_entropy)
+                     .optimizer(bm::OptimizerConfig::sgd(kGradientLearningRate, bm::Scalar{0}))
+                     .seed(102)
+                     .build();
+
+    const std::vector<bm::LayerParameters> parameters{
+        bm::LayerParameters{2, 2, bm::Activation::tanh,
+                            {bm::Scalar{0.22}, bm::Scalar{-0.37},
+                             bm::Scalar{0.41}, bm::Scalar{0.19}},
+                            {bm::Scalar{-0.03}, bm::Scalar{0.07}}},
+        bm::LayerParameters{2, 1, bm::Activation::sigmoid,
+                            {bm::Scalar{0.28}, bm::Scalar{-0.33}},
+                            {bm::Scalar{0.04}}},
+    };
+    const bm::Matrix inputs{{bm::Scalar{0.6}, bm::Scalar{-0.2}},
+                            {bm::Scalar{-0.5}, bm::Scalar{0.3}}};
+    const bm::Matrix targets{{bm::Scalar{1}}, {bm::Scalar{0}}};
+
+    expect_backprop_matches_finite_difference(model, parameters, inputs, targets, kGradientLearningRate);
+}
+
+TEST(GradientCheck, CategoricalCrossEntropySoftmaxNetwork) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(2, bm::Activation::tanh)
+                     .add_layer(3, bm::Activation::softmax)
+                     .loss(bm::Loss::categorical_cross_entropy)
+                     .optimizer(bm::OptimizerConfig::sgd(kGradientLearningRate, bm::Scalar{0}))
+                     .seed(103)
+                     .build();
+
+    const std::vector<bm::LayerParameters> parameters{
+        bm::LayerParameters{2, 2, bm::Activation::tanh,
+                            {bm::Scalar{0.19}, bm::Scalar{-0.24},
+                             bm::Scalar{0.33}, bm::Scalar{0.12}},
+                            {bm::Scalar{0.02}, bm::Scalar{-0.05}}},
+        bm::LayerParameters{2, 3, bm::Activation::softmax,
+                            {bm::Scalar{0.21}, bm::Scalar{-0.16},
+                             bm::Scalar{-0.11}, bm::Scalar{0.26},
+                             bm::Scalar{0.08}, bm::Scalar{0.14}},
+                            {bm::Scalar{0.03}, bm::Scalar{-0.02}, bm::Scalar{0.01}}},
+    };
+    const bm::Matrix inputs{{bm::Scalar{0.4}, bm::Scalar{-0.1}},
+                            {bm::Scalar{-0.2}, bm::Scalar{0.5}}};
+    const bm::Matrix targets{{bm::Scalar{1}, bm::Scalar{0}, bm::Scalar{0}},
+                             {bm::Scalar{0}, bm::Scalar{0}, bm::Scalar{1}}};
+
+    expect_backprop_matches_finite_difference(model, parameters, inputs, targets, kGradientLearningRate);
+}
+
+TEST(GradientCheck, ReluNetworkAwayFromKinks) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(2, bm::Activation::relu)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::Loss::mean_squared_error)
+                     .optimizer(bm::OptimizerConfig::sgd(kGradientLearningRate, bm::Scalar{0}))
+                     .seed(104)
+                     .build();
+
+    const std::vector<bm::LayerParameters> parameters{
+        bm::LayerParameters{2, 2, bm::Activation::relu,
+                            {bm::Scalar{0.8}, bm::Scalar{-0.3},
+                             bm::Scalar{-1.2}, bm::Scalar{0.4}},
+                            {bm::Scalar{1.0}, bm::Scalar{-1.1}}},
+        bm::LayerParameters{2, 1, bm::Activation::linear,
+                            {bm::Scalar{0.25}, bm::Scalar{-0.45}},
+                            {bm::Scalar{0.12}}},
+    };
+    const bm::Matrix inputs{{bm::Scalar{0.2}, bm::Scalar{-0.4}},
+                            {bm::Scalar{-0.6}, bm::Scalar{0.3}}};
+    const bm::Matrix targets{{bm::Scalar{0.35}}, {bm::Scalar{-0.15}}};
+
+    expect_backprop_matches_finite_difference(model, parameters, inputs, targets, kGradientLearningRate);
 }
 
 TEST(Training, LinearRegressionConvergesWithAdam) {
