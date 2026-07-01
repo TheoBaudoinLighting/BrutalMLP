@@ -134,6 +134,47 @@ void validate_training_options(const TrainingOptions& options) {
     require(options.min_delta >= Scalar{0}, "min_delta must be non-negative");
 }
 
+[[nodiscard]] bool is_classification_loss(Loss loss) noexcept {
+    return loss == Loss::binary_cross_entropy || loss == Loss::categorical_cross_entropy;
+}
+
+void validate_loss_config(const LossConfig& loss, std::size_t output_size) {
+    require_finite(loss.huber_delta, "huber_delta");
+    require(loss.huber_delta > Scalar{0}, "huber_delta must be positive");
+    require_finite(loss.relative_epsilon, "relative_epsilon");
+    require(loss.relative_epsilon > Scalar{0}, "relative_epsilon must be positive");
+
+    for (Scalar weight : loss.weights) {
+        require_finite(weight, "loss weight");
+        require(weight >= Scalar{0}, "loss weights must be non-negative");
+    }
+
+    switch (loss.type) {
+    case Loss::mean_squared_error:
+    case Loss::mean_absolute_error:
+    case Loss::huber:
+    case Loss::relative_mean_squared_error:
+    case Loss::log_cosh:
+    case Loss::binary_cross_entropy:
+    case Loss::categorical_cross_entropy:
+        require(loss.weights.empty(), "loss weights are only supported with weighted_mean_squared_error");
+        return;
+    case Loss::weighted_mean_squared_error: {
+        require(loss.weights.size() == output_size, "weighted_mean_squared_error weight count mismatch");
+        const Scalar total_weight = std::accumulate(loss.weights.begin(), loss.weights.end(), Scalar{0});
+        require(total_weight > Scalar{0}, "weighted_mean_squared_error requires at least one positive weight");
+        return;
+    }
+    case Loss::custom:
+        require(loss.weights.empty(), "custom loss does not use built-in weights");
+        require(loss.custom_loss.value != nullptr, "custom loss value callback is required");
+        require(loss.custom_loss.gradient != nullptr, "custom loss gradient callback is required");
+        return;
+    }
+
+    throw std::invalid_argument("unknown loss");
+}
+
 void validate_matrix(const Matrix& matrix,
                      std::size_t expected_columns,
                      const std::string& name,
@@ -151,6 +192,12 @@ void validate_matrix(const Matrix& matrix,
 void validate_targets_for_loss(const Matrix& targets, Loss loss) {
     switch (loss) {
     case Loss::mean_squared_error:
+    case Loss::mean_absolute_error:
+    case Loss::huber:
+    case Loss::relative_mean_squared_error:
+    case Loss::log_cosh:
+    case Loss::weighted_mean_squared_error:
+    case Loss::custom:
         return;
     case Loss::binary_cross_entropy:
         for (const Vector& target : targets) {
@@ -180,11 +227,11 @@ void validate_training_data(const Matrix& inputs,
                             const Matrix& targets,
                             std::size_t input_size,
                             std::size_t output_size,
-                            Loss loss) {
+                            const LossConfig& loss) {
     validate_matrix(inputs, input_size, "inputs");
     validate_matrix(targets, output_size, "targets");
     require(inputs.size() == targets.size(), "inputs and targets must have the same number of rows");
-    validate_targets_for_loss(targets, loss);
+    validate_targets_for_loss(targets, loss.type);
 }
 
 [[nodiscard]] std::vector<std::size_t> make_indices(std::size_t size) {
@@ -281,6 +328,227 @@ void validate_layer_parameters(const std::vector<LayerParameters>& parameters) {
     }
 }
 
+[[nodiscard]] bool feature_changes_value(const FeatureNormalization& feature) noexcept {
+    return feature.mode != NormalizationMode::none || feature.clamp;
+}
+
+[[nodiscard]] bool has_feature_normalization(const std::vector<FeatureNormalization>& features) noexcept {
+    return std::any_of(features.begin(), features.end(), feature_changes_value);
+}
+
+void validate_feature_normalization(const FeatureNormalization& feature) {
+    require_finite(feature.mean, "normalization mean");
+    require_finite(feature.stddev, "normalization stddev");
+    require_finite(feature.minimum, "normalization minimum");
+    require_finite(feature.maximum, "normalization maximum");
+    require_finite(feature.normalized_min, "normalization normalized_min");
+    require_finite(feature.normalized_max, "normalization normalized_max");
+    require_finite(feature.clamp_min, "normalization clamp_min");
+    require_finite(feature.clamp_max, "normalization clamp_max");
+    require(feature.clamp_min <= feature.clamp_max, "normalization clamp range is invalid");
+
+    switch (feature.mode) {
+    case NormalizationMode::none:
+        break;
+    case NormalizationMode::standard_score:
+        require(feature.stddev > Scalar{0}, "standard_score stddev must be positive");
+        break;
+    case NormalizationMode::min_max:
+        require(feature.maximum > feature.minimum, "min_max range must be positive");
+        require(feature.normalized_max != feature.normalized_min, "min_max normalized range must be non-zero");
+        break;
+    }
+}
+
+void validate_normalization_features(const std::vector<FeatureNormalization>& features,
+                                     std::size_t expected_size,
+                                     const std::string& name) {
+    if (features.empty()) {
+        return;
+    }
+    require(features.size() == expected_size, name + " normalization feature count mismatch");
+    for (const FeatureNormalization& feature : features) {
+        validate_feature_normalization(feature);
+    }
+}
+
+void validate_normalization_spec(const NormalizationSpec& normalization,
+                                 std::size_t input_size,
+                                 std::size_t output_size) {
+    validate_normalization_features(normalization.input_features, input_size, "input");
+    validate_normalization_features(normalization.output_features, output_size, "output");
+}
+
+void validate_normalization_for_loss(const NormalizationSpec& normalization, const LossConfig& loss) {
+    if (normalization.has_output_normalization()) {
+        require(!is_classification_loss(loss.type), "output normalization is not supported with classification losses");
+    }
+}
+
+[[nodiscard]] Scalar clamp_value(Scalar value, Scalar minimum, Scalar maximum) noexcept {
+    return std::min(std::max(value, minimum), maximum);
+}
+
+[[nodiscard]] Scalar normalize_value(Scalar value, const FeatureNormalization& feature) noexcept {
+    Scalar result = value;
+    switch (feature.mode) {
+    case NormalizationMode::none:
+        break;
+    case NormalizationMode::standard_score:
+        result = (value - feature.mean) / feature.stddev;
+        break;
+    case NormalizationMode::min_max:
+        result = feature.normalized_min +
+                 (value - feature.minimum) * (feature.normalized_max - feature.normalized_min) /
+                     (feature.maximum - feature.minimum);
+        break;
+    }
+    if (feature.clamp) {
+        result = clamp_value(result, feature.clamp_min, feature.clamp_max);
+    }
+    return result;
+}
+
+[[nodiscard]] Scalar denormalize_value(Scalar value, const FeatureNormalization& feature) noexcept {
+    Scalar adjusted = feature.clamp ? clamp_value(value, feature.clamp_min, feature.clamp_max) : value;
+    switch (feature.mode) {
+    case NormalizationMode::none:
+        return adjusted;
+    case NormalizationMode::standard_score:
+        return adjusted * feature.stddev + feature.mean;
+    case NormalizationMode::min_max:
+        return feature.minimum +
+               (adjusted - feature.normalized_min) * (feature.maximum - feature.minimum) /
+                   (feature.normalized_max - feature.normalized_min);
+    }
+    return adjusted;
+}
+
+[[nodiscard]] Vector normalize_vector(const Vector& values, const std::vector<FeatureNormalization>& features) {
+    if (!has_feature_normalization(features)) {
+        return values;
+    }
+    Vector result(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        result[i] = normalize_value(values[i], features[i]);
+    }
+    return result;
+}
+
+[[nodiscard]] Vector denormalize_vector(const Vector& values, const std::vector<FeatureNormalization>& features) {
+    if (!has_feature_normalization(features)) {
+        return values;
+    }
+    Vector result(values.size());
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        result[i] = denormalize_value(values[i], features[i]);
+    }
+    return result;
+}
+
+[[nodiscard]] Matrix normalize_matrix(const Matrix& values, const std::vector<FeatureNormalization>& features) {
+    if (!has_feature_normalization(features)) {
+        return values;
+    }
+    Matrix result;
+    result.reserve(values.size());
+    for (const Vector& row : values) {
+        result.push_back(normalize_vector(row, features));
+    }
+    return result;
+}
+
+void write_normalization_features(std::ostream& output, const std::vector<FeatureNormalization>& features) {
+    output << features.size() << '\n';
+    for (const FeatureNormalization& feature : features) {
+        output << to_string(feature.mode) << ' '
+               << feature.mean << ' '
+               << feature.stddev << ' '
+               << feature.minimum << ' '
+               << feature.maximum << ' '
+               << feature.normalized_min << ' '
+               << feature.normalized_max << ' '
+               << (feature.clamp ? 1 : 0) << ' '
+               << feature.clamp_min << ' '
+               << feature.clamp_max << '\n';
+    }
+}
+
+void write_normalization(std::ostream& output, const NormalizationSpec& normalization) {
+    output << "NORMALIZATION_V1\n";
+    write_normalization_features(output, normalization.input_features);
+    write_normalization_features(output, normalization.output_features);
+}
+
+[[nodiscard]] std::vector<FeatureNormalization> read_normalization_features(std::istream& input,
+                                                                            const std::string& name) {
+    const std::size_t count = read_value<std::size_t>(input, name + "_feature_count");
+    std::vector<FeatureNormalization> features;
+    features.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        FeatureNormalization feature;
+        feature.mode = normalization_mode_from_string(read_token(input, name + "_mode"));
+        feature.mean = read_value<Scalar>(input, name + "_mean");
+        feature.stddev = read_value<Scalar>(input, name + "_stddev");
+        feature.minimum = read_value<Scalar>(input, name + "_minimum");
+        feature.maximum = read_value<Scalar>(input, name + "_maximum");
+        feature.normalized_min = read_value<Scalar>(input, name + "_normalized_min");
+        feature.normalized_max = read_value<Scalar>(input, name + "_normalized_max");
+        feature.clamp = read_value<int>(input, name + "_clamp") != 0;
+        feature.clamp_min = read_value<Scalar>(input, name + "_clamp_min");
+        feature.clamp_max = read_value<Scalar>(input, name + "_clamp_max");
+        validate_feature_normalization(feature);
+        features.push_back(feature);
+    }
+    return features;
+}
+
+[[nodiscard]] NormalizationSpec read_normalization(std::istream& input) {
+    const std::string magic = read_token(input, "normalization_magic");
+    if (magic != "NORMALIZATION_V1") {
+        throw std::runtime_error("unsupported normalization format");
+    }
+
+    NormalizationSpec normalization;
+    normalization.input_features = read_normalization_features(input, "input_normalization");
+    normalization.output_features = read_normalization_features(input, "output_normalization");
+    return normalization;
+}
+
+void write_loss_config(std::ostream& output, const LossConfig& loss) {
+    if (loss.type == Loss::custom) {
+        throw std::runtime_error("custom loss cannot be serialized");
+    }
+
+    output << "LOSS_CONFIG_V1\n";
+    output << to_string(loss.type) << '\n';
+    output << loss.huber_delta << ' '
+           << loss.relative_epsilon << ' '
+           << loss.weights.size();
+    for (Scalar weight : loss.weights) {
+        output << ' ' << weight;
+    }
+    output << '\n';
+}
+
+[[nodiscard]] LossConfig read_loss_config(std::istream& input) {
+    const std::string magic = read_token(input, "loss_config_magic");
+    if (magic != "LOSS_CONFIG_V1") {
+        throw std::runtime_error("unsupported loss config format");
+    }
+
+    LossConfig loss;
+    loss.type = loss_from_string(read_token(input, "loss"));
+    loss.huber_delta = read_value<Scalar>(input, "huber_delta");
+    loss.relative_epsilon = read_value<Scalar>(input, "relative_epsilon");
+    const std::size_t weight_count = read_value<std::size_t>(input, "loss_weight_count");
+    loss.weights.resize(weight_count);
+    for (Scalar& weight : loss.weights) {
+        weight = read_value<Scalar>(input, "loss_weight");
+    }
+    return loss;
+}
+
 } // namespace
 
 std::string to_string(Activation activation) {
@@ -304,10 +572,22 @@ std::string to_string(Loss loss) {
     switch (loss) {
     case Loss::mean_squared_error:
         return "mean_squared_error";
+    case Loss::mean_absolute_error:
+        return "mean_absolute_error";
+    case Loss::huber:
+        return "huber";
+    case Loss::relative_mean_squared_error:
+        return "relative_mean_squared_error";
+    case Loss::log_cosh:
+        return "log_cosh";
+    case Loss::weighted_mean_squared_error:
+        return "weighted_mean_squared_error";
     case Loss::binary_cross_entropy:
         return "binary_cross_entropy";
     case Loss::categorical_cross_entropy:
         return "categorical_cross_entropy";
+    case Loss::custom:
+        return "custom";
     }
 
     throw std::invalid_argument("unknown loss");
@@ -322,6 +602,19 @@ std::string to_string(OptimizerType optimizer) {
     }
 
     throw std::invalid_argument("unknown optimizer");
+}
+
+std::string to_string(NormalizationMode mode) {
+    switch (mode) {
+    case NormalizationMode::none:
+        return "none";
+    case NormalizationMode::standard_score:
+        return "standard_score";
+    case NormalizationMode::min_max:
+        return "min_max";
+    }
+
+    throw std::invalid_argument("unknown normalization mode");
 }
 
 std::string to_string(InferenceStatus status) {
@@ -372,11 +665,29 @@ Loss loss_from_string(std::string_view value) {
     if (value == "mean_squared_error") {
         return Loss::mean_squared_error;
     }
+    if (value == "mean_absolute_error") {
+        return Loss::mean_absolute_error;
+    }
+    if (value == "huber") {
+        return Loss::huber;
+    }
+    if (value == "relative_mean_squared_error") {
+        return Loss::relative_mean_squared_error;
+    }
+    if (value == "log_cosh") {
+        return Loss::log_cosh;
+    }
+    if (value == "weighted_mean_squared_error") {
+        return Loss::weighted_mean_squared_error;
+    }
     if (value == "binary_cross_entropy") {
         return Loss::binary_cross_entropy;
     }
     if (value == "categorical_cross_entropy") {
         return Loss::categorical_cross_entropy;
+    }
+    if (value == "custom") {
+        return Loss::custom;
     }
     throw std::invalid_argument("unknown loss: " + std::string(value));
 }
@@ -389,6 +700,110 @@ OptimizerType optimizer_type_from_string(std::string_view value) {
         return OptimizerType::adam;
     }
     throw std::invalid_argument("unknown optimizer: " + std::string(value));
+}
+
+NormalizationMode normalization_mode_from_string(std::string_view value) {
+    if (value == "none") {
+        return NormalizationMode::none;
+    }
+    if (value == "standard_score") {
+        return NormalizationMode::standard_score;
+    }
+    if (value == "min_max") {
+        return NormalizationMode::min_max;
+    }
+    throw std::invalid_argument("unknown normalization mode: " + std::string(value));
+}
+
+LossConfig LossConfig::from_loss(Loss loss) {
+    switch (loss) {
+    case Loss::mean_squared_error:
+        return mean_squared_error();
+    case Loss::mean_absolute_error:
+        return mean_absolute_error();
+    case Loss::huber:
+        return huber();
+    case Loss::relative_mean_squared_error:
+        return relative_mean_squared_error();
+    case Loss::log_cosh:
+        return log_cosh();
+    case Loss::weighted_mean_squared_error:
+        throw std::invalid_argument("weighted_mean_squared_error requires explicit weights");
+    case Loss::binary_cross_entropy:
+        return binary_cross_entropy();
+    case Loss::categorical_cross_entropy:
+        return categorical_cross_entropy();
+    case Loss::custom:
+        throw std::invalid_argument("custom loss requires callbacks");
+    }
+
+    throw std::invalid_argument("unknown loss");
+}
+
+LossConfig LossConfig::mean_squared_error() {
+    LossConfig config;
+    config.type = Loss::mean_squared_error;
+    return config;
+}
+
+LossConfig LossConfig::mean_absolute_error() {
+    LossConfig config;
+    config.type = Loss::mean_absolute_error;
+    return config;
+}
+
+LossConfig LossConfig::huber(Scalar delta) {
+    LossConfig config;
+    config.type = Loss::huber;
+    config.huber_delta = delta;
+    validate_loss_config(config, 0);
+    return config;
+}
+
+LossConfig LossConfig::relative_mean_squared_error(Scalar epsilon) {
+    LossConfig config;
+    config.type = Loss::relative_mean_squared_error;
+    config.relative_epsilon = epsilon;
+    validate_loss_config(config, 0);
+    return config;
+}
+
+LossConfig LossConfig::log_cosh() {
+    LossConfig config;
+    config.type = Loss::log_cosh;
+    return config;
+}
+
+LossConfig LossConfig::weighted_mean_squared_error(const Vector& weights) {
+    LossConfig config;
+    config.type = Loss::weighted_mean_squared_error;
+    config.weights = weights;
+    validate_loss_config(config, weights.size());
+    return config;
+}
+
+LossConfig LossConfig::binary_cross_entropy() {
+    LossConfig config;
+    config.type = Loss::binary_cross_entropy;
+    return config;
+}
+
+LossConfig LossConfig::categorical_cross_entropy() {
+    LossConfig config;
+    config.type = Loss::categorical_cross_entropy;
+    return config;
+}
+
+LossConfig LossConfig::custom(CustomLossValueFunction value,
+                              CustomLossGradientFunction gradient,
+                              void* context) {
+    LossConfig config;
+    config.type = Loss::custom;
+    config.custom_loss.value = value;
+    config.custom_loss.gradient = gradient;
+    config.custom_loss.context = context;
+    validate_loss_config(config, 0);
+    return config;
 }
 
 OptimizerConfig OptimizerConfig::adam(Scalar learning_rate) {
@@ -406,6 +821,101 @@ OptimizerConfig OptimizerConfig::sgd(Scalar learning_rate, Scalar momentum) {
     return config;
 }
 
+FeatureNormalization FeatureNormalization::none() {
+    return FeatureNormalization{};
+}
+
+FeatureNormalization FeatureNormalization::standard_score(Scalar mean,
+                                                          Scalar stddev,
+                                                          bool clamp,
+                                                          Scalar clamp_min,
+                                                          Scalar clamp_max) {
+    FeatureNormalization feature;
+    feature.mode = NormalizationMode::standard_score;
+    feature.mean = mean;
+    feature.stddev = stddev;
+    feature.clamp = clamp;
+    feature.clamp_min = clamp_min;
+    feature.clamp_max = clamp_max;
+    validate_feature_normalization(feature);
+    return feature;
+}
+
+FeatureNormalization FeatureNormalization::min_max(Scalar minimum,
+                                                   Scalar maximum,
+                                                   Scalar normalized_min,
+                                                   Scalar normalized_max,
+                                                   bool clamp) {
+    FeatureNormalization feature;
+    feature.mode = NormalizationMode::min_max;
+    feature.minimum = minimum;
+    feature.maximum = maximum;
+    feature.normalized_min = normalized_min;
+    feature.normalized_max = normalized_max;
+    feature.clamp = clamp;
+    feature.clamp_min = std::min(normalized_min, normalized_max);
+    feature.clamp_max = std::max(normalized_min, normalized_max);
+    validate_feature_normalization(feature);
+    return feature;
+}
+
+NormalizationSpec NormalizationSpec::none() {
+    return NormalizationSpec{};
+}
+
+NormalizationSpec NormalizationSpec::standard_score(const Vector& input_means,
+                                                    const Vector& input_stddevs,
+                                                    const Vector& output_means,
+                                                    const Vector& output_stddevs) {
+    require(input_means.size() == input_stddevs.size(), "input standard_score vector size mismatch");
+    require(output_means.size() == output_stddevs.size(), "output standard_score vector size mismatch");
+
+    NormalizationSpec spec;
+    spec.input_features.reserve(input_means.size());
+    for (std::size_t i = 0; i < input_means.size(); ++i) {
+        spec.input_features.push_back(FeatureNormalization::standard_score(input_means[i], input_stddevs[i]));
+    }
+
+    spec.output_features.reserve(output_means.size());
+    for (std::size_t i = 0; i < output_means.size(); ++i) {
+        spec.output_features.push_back(FeatureNormalization::standard_score(output_means[i], output_stddevs[i]));
+    }
+    return spec;
+}
+
+NormalizationSpec NormalizationSpec::min_max(const Vector& input_minimums,
+                                             const Vector& input_maximums,
+                                             const Vector& output_minimums,
+                                             const Vector& output_maximums,
+                                             Scalar normalized_min,
+                                             Scalar normalized_max,
+                                             bool clamp) {
+    require(input_minimums.size() == input_maximums.size(), "input min_max vector size mismatch");
+    require(output_minimums.size() == output_maximums.size(), "output min_max vector size mismatch");
+
+    NormalizationSpec spec;
+    spec.input_features.reserve(input_minimums.size());
+    for (std::size_t i = 0; i < input_minimums.size(); ++i) {
+        spec.input_features.push_back(
+            FeatureNormalization::min_max(input_minimums[i], input_maximums[i], normalized_min, normalized_max, clamp));
+    }
+
+    spec.output_features.reserve(output_minimums.size());
+    for (std::size_t i = 0; i < output_minimums.size(); ++i) {
+        spec.output_features.push_back(FeatureNormalization::min_max(
+            output_minimums[i], output_maximums[i], normalized_min, normalized_max, clamp));
+    }
+    return spec;
+}
+
+bool NormalizationSpec::has_input_normalization() const noexcept {
+    return has_feature_normalization(input_features);
+}
+
+bool NormalizationSpec::has_output_normalization() const noexcept {
+    return has_feature_normalization(output_features);
+}
+
 struct InferenceModel::Impl {
     struct Layer {
         std::size_t input_size{0};
@@ -418,12 +928,14 @@ struct InferenceModel::Impl {
     std::size_t input_size{0};
     std::size_t output_size{0};
     std::size_t scratch_stride{0};
+    std::size_t input_scratch_size{0};
+    NormalizationSpec normalization{};
     std::vector<Layer> layers;
     Vector weights;
     Vector biases;
 
     [[nodiscard]] std::size_t scratch_size() const noexcept {
-        return scratch_stride == 0 ? 0 : scratch_stride * 2;
+        return input_scratch_size + (scratch_stride == 0 ? 0 : scratch_stride * 2);
     }
 };
 
@@ -446,12 +958,15 @@ InferenceModel& InferenceModel::operator=(InferenceModel&& other) noexcept = def
 
 InferenceModel::~InferenceModel() = default;
 
-InferenceModel InferenceModel::from_parameters(const std::vector<LayerParameters>& parameters) {
+InferenceModel InferenceModel::from_parameters(const std::vector<LayerParameters>& parameters,
+                                               const NormalizationSpec& normalization) {
     validate_layer_parameters(parameters);
+    validate_normalization_spec(normalization, parameters.front().input_size, parameters.back().output_size);
 
     auto impl = std::make_unique<Impl>();
     impl->input_size = parameters.front().input_size;
     impl->output_size = parameters.back().output_size;
+    impl->normalization = normalization;
     impl->layers.reserve(parameters.size());
 
     std::size_t weight_count = 0;
@@ -468,6 +983,7 @@ InferenceModel InferenceModel::from_parameters(const std::vector<LayerParameters
 
     impl->weights.reserve(weight_count);
     impl->biases.reserve(bias_count);
+    impl->input_scratch_size = normalization.has_input_normalization() ? impl->input_size : 0;
     impl->scratch_stride = max_hidden_width;
 
     for (const LayerParameters& source : parameters) {
@@ -523,6 +1039,10 @@ const Scalar* InferenceModel::biases_data() const noexcept {
     return empty() ? nullptr : impl_->biases.data();
 }
 
+NormalizationSpec InferenceModel::normalization() const {
+    return empty() ? NormalizationSpec{} : impl_->normalization;
+}
+
 InferenceStatus InferenceModel::predict_to(const Scalar* input,
                                            std::size_t provided_input_size,
                                            Scalar* output,
@@ -548,9 +1068,21 @@ InferenceStatus InferenceModel::predict_to(const Scalar* input,
         return InferenceStatus::insufficient_scratch;
     }
 
+    Scalar* scratch_cursor = scratch;
     const Scalar* previous = input;
-    Scalar* scratch_a = scratch;
+    if (impl_->normalization.has_input_normalization()) {
+        for (std::size_t i = 0; i < impl_->input_size; ++i) {
+            scratch_cursor[i] = normalize_value(input[i], impl_->normalization.input_features[i]);
+        }
+        previous = scratch_cursor;
+        scratch_cursor += impl_->input_scratch_size;
+    }
+
+    Scalar* scratch_a = scratch_cursor;
     Scalar* scratch_b = scratch ? scratch + impl_->scratch_stride : nullptr;
+    if (scratch_b && impl_->input_scratch_size > 0) {
+        scratch_b += impl_->input_scratch_size;
+    }
     bool write_a = true;
 
     for (std::size_t layer_index = 0; layer_index < impl_->layers.size(); ++layer_index) {
@@ -570,6 +1102,12 @@ InferenceStatus InferenceModel::predict_to(const Scalar* input,
         apply_activation_in_place(target, layer.output_size, layer.activation);
         previous = target;
         write_a = !write_a;
+    }
+
+    if (impl_->normalization.has_output_normalization()) {
+        for (std::size_t i = 0; i < impl_->output_size; ++i) {
+            output[i] = denormalize_value(output[i], impl_->normalization.output_features[i]);
+        }
     }
 
     return InferenceStatus::ok;
@@ -737,8 +1275,9 @@ void InferenceModel::save(const std::filesystem::path& path) const {
     }
 
     output << std::setprecision(17);
-    output << "BRUTAL_MLP_INFERENCE_V1\n";
+    output << "BRUTAL_MLP_INFERENCE_V2\n";
     output << impl_->input_size << '\n';
+    write_normalization(output, impl_->normalization);
     output << impl_->layers.size() << '\n';
 
     for (const Impl::Layer& layer : impl_->layers) {
@@ -770,11 +1309,16 @@ InferenceModel InferenceModel::load(const std::filesystem::path& path) {
     }
 
     const std::string magic = read_token(input, "magic");
-    if (magic != "BRUTAL_MLP_INFERENCE_V1") {
+    const bool has_normalization = magic == "BRUTAL_MLP_INFERENCE_V2";
+    if (!has_normalization && magic != "BRUTAL_MLP_INFERENCE_V1") {
         throw std::runtime_error("unsupported inference model file format");
     }
 
     const std::size_t input_size = read_value<std::size_t>(input, "input_size");
+    NormalizationSpec normalization;
+    if (has_normalization) {
+        normalization = read_normalization(input);
+    }
     const std::size_t layer_count = read_value<std::size_t>(input, "layer_count");
     std::vector<LayerParameters> parameters;
     parameters.reserve(layer_count);
@@ -803,7 +1347,7 @@ InferenceModel InferenceModel::load(const std::filesystem::path& path) {
         parameters.push_back(std::move(layer));
     }
 
-    return InferenceModel::from_parameters(parameters);
+    return InferenceModel::from_parameters(parameters, normalization);
 }
 
 struct TrainingModel::Impl {
@@ -824,8 +1368,9 @@ struct TrainingModel::Impl {
     };
 
     std::size_t input_size{0};
-    Loss loss{Loss::mean_squared_error};
+    LossConfig loss{};
     OptimizerConfig optimizer{OptimizerConfig::adam()};
+    NormalizationSpec normalization{};
     std::uint64_t seed{5489u};
     std::uint64_t optimizer_step{0};
     std::vector<Layer> layers;
@@ -849,6 +1394,11 @@ struct TrainingModel::Impl {
             activations = apply_activation(z, layer.activation);
         }
         return activations;
+    }
+
+    [[nodiscard]] Vector predict_raw(const Vector& input) const {
+        return denormalize_vector(forward(normalize_vector(input, normalization.input_features)),
+                                  normalization.output_features);
     }
 
     [[nodiscard]] Vector forward_cached(const Vector& input,
@@ -881,13 +1431,51 @@ struct TrainingModel::Impl {
     [[nodiscard]] Scalar sample_loss(const Vector& prediction, const Vector& target) const {
         Scalar total = Scalar{0};
 
-        switch (loss) {
+        switch (loss.type) {
         case Loss::mean_squared_error:
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 const Scalar delta = prediction[i] - target[i];
                 total += delta * delta;
             }
             return total / static_cast<Scalar>(prediction.size());
+        case Loss::mean_absolute_error:
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                total += static_cast<Scalar>(std::abs(prediction[i] - target[i]));
+            }
+            return total / static_cast<Scalar>(prediction.size());
+        case Loss::huber:
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                const Scalar abs_delta = static_cast<Scalar>(std::abs(prediction[i] - target[i]));
+                if (abs_delta <= loss.huber_delta) {
+                    total += Scalar{0.5} * abs_delta * abs_delta;
+                } else {
+                    total += loss.huber_delta * (abs_delta - Scalar{0.5} * loss.huber_delta);
+                }
+            }
+            return total / static_cast<Scalar>(prediction.size());
+        case Loss::relative_mean_squared_error:
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                const Scalar delta = prediction[i] - target[i];
+                const Scalar denominator = std::max(static_cast<Scalar>(std::abs(target[i])), loss.relative_epsilon);
+                total += (delta * delta) / (denominator * denominator);
+            }
+            return total / static_cast<Scalar>(prediction.size());
+        case Loss::log_cosh:
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                const Scalar abs_delta = static_cast<Scalar>(std::abs(prediction[i] - target[i]));
+                total += abs_delta +
+                         static_cast<Scalar>(std::log1p(std::exp(-Scalar{2} * abs_delta))) -
+                         static_cast<Scalar>(std::log(Scalar{2}));
+            }
+            return total / static_cast<Scalar>(prediction.size());
+        case Loss::weighted_mean_squared_error: {
+            const Scalar total_weight = std::accumulate(loss.weights.begin(), loss.weights.end(), Scalar{0});
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                const Scalar delta = prediction[i] - target[i];
+                total += loss.weights[i] * delta * delta;
+            }
+            return total / total_weight;
+        }
         case Loss::binary_cross_entropy:
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 const Scalar p = clamp_probability(prediction[i]);
@@ -900,6 +1488,14 @@ struct TrainingModel::Impl {
                 total += static_cast<Scalar>(-target[i] * std::log(clamp_probability(prediction[i])));
             }
             return total;
+        case Loss::custom: {
+            const Scalar value = loss.custom_loss.value(prediction.data(),
+                                                        target.data(),
+                                                        prediction.size(),
+                                                        loss.custom_loss.context);
+            require_finite(value, "custom loss");
+            return value;
+        }
         }
 
         throw std::invalid_argument("unknown loss");
@@ -911,14 +1507,14 @@ struct TrainingModel::Impl {
         const Layer& output_layer = layers.back();
         Vector delta(prediction.size(), Scalar{0});
 
-        if (loss == Loss::categorical_cross_entropy && output_layer.activation == Activation::softmax) {
+        if (loss.type == Loss::categorical_cross_entropy && output_layer.activation == Activation::softmax) {
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 delta[i] = prediction[i] - target[i];
             }
             return delta;
         }
 
-        if (loss == Loss::binary_cross_entropy && output_layer.activation == Activation::sigmoid) {
+        if (loss.type == Loss::binary_cross_entropy && output_layer.activation == Activation::sigmoid) {
             const Scalar scale = Scalar{1} / static_cast<Scalar>(prediction.size());
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 delta[i] = (prediction[i] - target[i]) * scale;
@@ -927,11 +1523,60 @@ struct TrainingModel::Impl {
         }
 
         Vector activation_gradient(prediction.size(), Scalar{0});
-        switch (loss) {
+        switch (loss.type) {
         case Loss::mean_squared_error: {
             const Scalar scale = Scalar{2} / static_cast<Scalar>(prediction.size());
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 activation_gradient[i] = (prediction[i] - target[i]) * scale;
+            }
+            break;
+        }
+        case Loss::mean_absolute_error: {
+            const Scalar scale = Scalar{1} / static_cast<Scalar>(prediction.size());
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                const Scalar delta_value = prediction[i] - target[i];
+                if (delta_value > Scalar{0}) {
+                    activation_gradient[i] = scale;
+                } else if (delta_value < Scalar{0}) {
+                    activation_gradient[i] = -scale;
+                }
+            }
+            break;
+        }
+        case Loss::huber: {
+            const Scalar scale = Scalar{1} / static_cast<Scalar>(prediction.size());
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                const Scalar delta_value = prediction[i] - target[i];
+                const Scalar abs_delta = static_cast<Scalar>(std::abs(delta_value));
+                if (abs_delta <= loss.huber_delta) {
+                    activation_gradient[i] = delta_value * scale;
+                } else {
+                    activation_gradient[i] = (delta_value > Scalar{0} ? loss.huber_delta : -loss.huber_delta) * scale;
+                }
+            }
+            break;
+        }
+        case Loss::relative_mean_squared_error: {
+            const Scalar scale = Scalar{2} / static_cast<Scalar>(prediction.size());
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                const Scalar denominator = std::max(static_cast<Scalar>(std::abs(target[i])), loss.relative_epsilon);
+                activation_gradient[i] =
+                    (prediction[i] - target[i]) * scale / (denominator * denominator);
+            }
+            break;
+        }
+        case Loss::log_cosh: {
+            const Scalar scale = Scalar{1} / static_cast<Scalar>(prediction.size());
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                activation_gradient[i] = static_cast<Scalar>(std::tanh(prediction[i] - target[i])) * scale;
+            }
+            break;
+        }
+        case Loss::weighted_mean_squared_error: {
+            const Scalar total_weight = std::accumulate(loss.weights.begin(), loss.weights.end(), Scalar{0});
+            for (std::size_t i = 0; i < prediction.size(); ++i) {
+                activation_gradient[i] =
+                    Scalar{2} * loss.weights[i] * (prediction[i] - target[i]) / total_weight;
             }
             break;
         }
@@ -946,6 +1591,16 @@ struct TrainingModel::Impl {
         case Loss::categorical_cross_entropy:
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 activation_gradient[i] = -target[i] / clamp_probability(prediction[i]);
+            }
+            break;
+        case Loss::custom:
+            loss.custom_loss.gradient(prediction.data(),
+                                      target.data(),
+                                      prediction.size(),
+                                      activation_gradient.data(),
+                                      loss.custom_loss.context);
+            for (Scalar value : activation_gradient) {
+                require_finite(value, "custom loss gradient");
             }
             break;
         }
@@ -1171,12 +1826,22 @@ TrainingModel::Builder& TrainingModel::Builder::add_layer(std::size_t neurons, A
 }
 
 TrainingModel::Builder& TrainingModel::Builder::loss(Loss loss_value) {
-    loss_ = loss_value;
+    loss_ = LossConfig::from_loss(loss_value);
+    return *this;
+}
+
+TrainingModel::Builder& TrainingModel::Builder::loss(LossConfig loss_value) {
+    loss_ = std::move(loss_value);
     return *this;
 }
 
 TrainingModel::Builder& TrainingModel::Builder::optimizer(OptimizerConfig optimizer_value) {
     optimizer_ = optimizer_value;
+    return *this;
+}
+
+TrainingModel::Builder& TrainingModel::Builder::normalization(NormalizationSpec normalization_value) {
+    normalization_ = std::move(normalization_value);
     return *this;
 }
 
@@ -1189,6 +1854,9 @@ TrainingModel TrainingModel::Builder::build() const {
     require(input_size_ > 0, "input_size must be positive");
     require(!layers_.empty(), "model must contain at least one layer");
     validate_optimizer(optimizer_);
+    validate_loss_config(loss_, layers_.back().neurons);
+    validate_normalization_spec(normalization_, input_size_, layers_.back().neurons);
+    validate_normalization_for_loss(normalization_, loss_);
 
     for (std::size_t i = 0; i < layers_.size(); ++i) {
         require(layers_[i].neurons > 0, "layer neurons must be positive");
@@ -1199,11 +1867,11 @@ TrainingModel TrainingModel::Builder::build() const {
     }
 
     const Activation output_activation = layers_.back().activation;
-    if (loss_ == Loss::binary_cross_entropy) {
+    if (loss_.type == Loss::binary_cross_entropy) {
         require(output_activation == Activation::sigmoid,
                 "binary_cross_entropy requires a sigmoid output layer");
     }
-    if (loss_ == Loss::categorical_cross_entropy) {
+    if (loss_.type == Loss::categorical_cross_entropy) {
         require(output_activation == Activation::softmax,
                 "categorical_cross_entropy requires a softmax output layer");
     }
@@ -1212,6 +1880,7 @@ TrainingModel TrainingModel::Builder::build() const {
     impl->input_size = input_size_;
     impl->loss = loss_;
     impl->optimizer = optimizer_;
+    impl->normalization = normalization_;
     impl->seed = seed_;
 
     std::mt19937_64 rng(seed_);
@@ -1289,6 +1958,10 @@ std::size_t TrainingModel::layer_count() const {
 }
 
 Loss TrainingModel::loss() const {
+    return impl_->loss.type;
+}
+
+LossConfig TrainingModel::loss_config() const {
     return impl_->loss;
 }
 
@@ -1296,12 +1969,16 @@ OptimizerConfig TrainingModel::optimizer() const {
     return impl_->optimizer;
 }
 
+NormalizationSpec TrainingModel::normalization() const {
+    return impl_->normalization;
+}
+
 Vector TrainingModel::predict(const Vector& input) const {
     require(input.size() == input_size(), "input has an invalid size");
     for (Scalar value : input) {
         require_finite(value, "input value");
     }
-    return impl_->forward(input);
+    return impl_->predict_raw(input);
 }
 
 Matrix TrainingModel::predict_batch(const Matrix& inputs) const {
@@ -1309,7 +1986,7 @@ Matrix TrainingModel::predict_batch(const Matrix& inputs) const {
     Matrix result;
     result.reserve(inputs.size());
     for (const Vector& input : inputs) {
-        result.push_back(impl_->forward(input));
+        result.push_back(impl_->predict_raw(input));
     }
     return result;
 }
@@ -1318,7 +1995,7 @@ Scalar TrainingModel::evaluate_loss(const Matrix& inputs, const Matrix& targets)
     validate_training_data(inputs, targets, input_size(), output_size(), impl_->loss);
     Scalar total = Scalar{0};
     for (std::size_t i = 0; i < inputs.size(); ++i) {
-        total += impl_->sample_loss(impl_->forward(inputs[i]), targets[i]);
+        total += impl_->sample_loss(impl_->predict_raw(inputs[i]), targets[i]);
     }
     return total / static_cast<Scalar>(inputs.size());
 }
@@ -1326,6 +2003,9 @@ Scalar TrainingModel::evaluate_loss(const Matrix& inputs, const Matrix& targets)
 TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options) {
     validate_training_options(options);
     validate_training_data(inputs, targets, input_size(), output_size(), impl_->loss);
+
+    const Matrix normalized_inputs = normalize_matrix(inputs, impl_->normalization.input_features);
+    const Matrix normalized_targets = normalize_matrix(targets, impl_->normalization.output_features);
 
     std::vector<std::size_t> indices = make_indices(inputs.size());
     std::mt19937_64 split_rng(non_zero_seed(options.seed, impl_->seed));
@@ -1361,17 +2041,17 @@ TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, 
             impl_->zero_gradients();
             for (std::size_t position = begin; position < end; ++position) {
                 const std::size_t row = training_indices[position];
-                impl_->accumulate_gradients(inputs[row], targets[row]);
+                impl_->accumulate_gradients(normalized_inputs[row], normalized_targets[row]);
             }
             impl_->apply_gradients(end - begin);
         }
 
-        const Scalar training_loss = impl_->loss_for_indices(inputs, targets, training_indices);
+        const Scalar training_loss = impl_->loss_for_indices(normalized_inputs, normalized_targets, training_indices);
         history.training_loss.push_back(training_loss);
 
         Scalar monitored_metric = training_loss;
         if (!validation_indices.empty()) {
-            const Scalar validation_loss = impl_->loss_for_indices(inputs, targets, validation_indices);
+            const Scalar validation_loss = impl_->loss_for_indices(normalized_inputs, normalized_targets, validation_indices);
             history.validation_loss.push_back(validation_loss);
             monitored_metric = validation_loss;
         }
@@ -1407,19 +2087,23 @@ void TrainingModel::set_parameters(const std::vector<LayerParameters>& parameter
 }
 
 InferenceModel TrainingModel::to_inference_model() const {
-    return InferenceModel::from_parameters(impl_->parameters());
+    return InferenceModel::from_parameters(impl_->parameters(), impl_->normalization);
 }
 
 void TrainingModel::save(const std::filesystem::path& path) const {
+    if (impl_->loss.type == Loss::custom) {
+        throw std::runtime_error("custom loss cannot be serialized");
+    }
+
     std::ofstream output(path);
     if (!output) {
         throw std::runtime_error("failed to open model file for writing: " + path.string());
     }
 
     output << std::setprecision(17);
-    output << "BRUTAL_MLP_TRAINING_V1\n";
+    output << "BRUTAL_MLP_TRAINING_V3\n";
     output << impl_->input_size << '\n';
-    output << to_string(impl_->loss) << '\n';
+    write_loss_config(output, impl_->loss);
     output << to_string(impl_->optimizer.type) << ' '
            << impl_->optimizer.learning_rate << ' '
            << impl_->optimizer.beta1 << ' '
@@ -1429,6 +2113,7 @@ void TrainingModel::save(const std::filesystem::path& path) const {
            << impl_->optimizer.l2 << ' '
            << impl_->optimizer.gradient_clip_norm << '\n';
     output << impl_->seed << '\n';
+    write_normalization(output, impl_->normalization);
     output << impl_->layers.size() << '\n';
 
     for (const Impl::Layer& layer : impl_->layers) {
@@ -1457,12 +2142,16 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
     }
 
     const std::string magic = read_token(input, "magic");
-    if (magic != "BRUTAL_MLP_TRAINING_V1" && magic != "BRUTAL_MLP_V1") {
+    const bool has_loss_config = magic == "BRUTAL_MLP_TRAINING_V3";
+    const bool has_normalization = has_loss_config || magic == "BRUTAL_MLP_TRAINING_V2";
+    if (!has_normalization && magic != "BRUTAL_MLP_TRAINING_V1" && magic != "BRUTAL_MLP_V1") {
         throw std::runtime_error("unsupported model file format");
     }
 
     const std::size_t input_size = read_value<std::size_t>(input, "input_size");
-    const Loss loss = loss_from_string(read_token(input, "loss"));
+    const LossConfig loss = has_loss_config
+                                ? read_loss_config(input)
+                                : LossConfig::from_loss(loss_from_string(read_token(input, "loss")));
 
     OptimizerConfig optimizer;
     optimizer.type = optimizer_type_from_string(read_token(input, "optimizer"));
@@ -1475,12 +2164,17 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
     optimizer.gradient_clip_norm = read_value<Scalar>(input, "gradient_clip_norm");
 
     const std::uint64_t seed = read_value<std::uint64_t>(input, "seed");
+    NormalizationSpec normalization;
+    if (has_normalization) {
+        normalization = read_normalization(input);
+    }
     const std::size_t layer_count = read_value<std::size_t>(input, "layer_count");
 
     Builder builder = TrainingModel::builder()
                           .input_size(input_size)
                           .loss(loss)
                           .optimizer(optimizer)
+                          .normalization(normalization)
                           .seed(seed);
     std::vector<LayerParameters> parameters;
     parameters.reserve(layer_count);

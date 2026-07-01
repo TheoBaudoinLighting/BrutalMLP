@@ -19,6 +19,98 @@ When using the CMake target `brutal_mlp::brutal_mlp`, the precision macro is pro
 - `brutal_mlp::InferenceWorkspace`: reusable output + scratch storage for single-sample inference. Allocate one per thread, worker, renderer tile, or calling context, then reuse it.
 - `brutal_mlp::Model`: legacy alias for `TrainingModel`.
 
+## Normalization
+
+Input and output normalization are part of the model, not an external convention. The same normalization spec is saved with training and inference files, and `TrainingModel::to_inference_model()` carries it into the frozen runtime model.
+
+Supported per-feature transforms:
+
+- none
+- mean / standard deviation
+- min / max into a configurable normalized range
+- optional clamp in normalized space
+- output denormalization after network inference
+
+```cpp
+auto normalization = brutal_mlp::NormalizationSpec::standard_score(
+    {0.5f, 2.0f},   // input means
+    {0.25f, 4.0f},  // input standard deviations
+    {10.0f},        // output means
+    {5.0f}          // output standard deviations
+);
+
+auto training = brutal_mlp::TrainingModel::builder()
+    .input_size(2)
+    .add_layer(16, brutal_mlp::Activation::relu)
+    .add_layer(1, brutal_mlp::Activation::linear)
+    .loss(brutal_mlp::Loss::mean_squared_error)
+    .normalization(normalization)
+    .build();
+```
+
+Output normalization is intended for regression losses and is rejected for classification losses.
+
+## Losses
+
+Built-in training losses:
+
+- `mean_squared_error`
+- `mean_absolute_error`
+- `huber`
+- `relative_mean_squared_error`
+- `log_cosh`
+- `weighted_mean_squared_error`
+- `binary_cross_entropy`
+- `categorical_cross_entropy`
+
+Simple losses remain source-compatible:
+
+```cpp
+.loss(brutal_mlp::Loss::mean_squared_error)
+```
+
+Configured losses use `LossConfig`:
+
+```cpp
+auto training = brutal_mlp::TrainingModel::builder()
+    .input_size(8)
+    .add_layer(32, brutal_mlp::Activation::relu)
+    .add_layer(3, brutal_mlp::Activation::linear)
+    .loss(brutal_mlp::LossConfig::weighted_mean_squared_error({1.0f, 0.25f, 4.0f}))
+    .build();
+```
+
+Useful factory examples:
+
+```cpp
+brutal_mlp::LossConfig::mean_absolute_error();
+brutal_mlp::LossConfig::huber(1.0f);
+brutal_mlp::LossConfig::relative_mean_squared_error(1e-4f);
+brutal_mlp::LossConfig::log_cosh();
+brutal_mlp::LossConfig::weighted_mean_squared_error({1.0f, 2.0f});
+```
+
+`relative_mean_squared_error` divides each squared error by `max(abs(target), epsilon)^2`. `weighted_mean_squared_error` requires one non-negative weight per output and divides the weighted squared error by the sum of weights.
+
+Custom losses are supported on the training side with raw function pointers and an optional context pointer:
+
+```cpp
+brutal_mlp::Scalar value(const brutal_mlp::Scalar* prediction,
+                         const brutal_mlp::Scalar* target,
+                         std::size_t size,
+                         void* context);
+
+void gradient(const brutal_mlp::Scalar* prediction,
+              const brutal_mlp::Scalar* target,
+              std::size_t size,
+              brutal_mlp::Scalar* output_gradient,
+              void* context);
+
+.loss(brutal_mlp::LossConfig::custom(value, gradient, context))
+```
+
+Custom loss callbacks are not serialized. Convert trained weights to `InferenceModel` for production, or use a built-in loss when the training model itself must be saved.
+
 ## Integration
 
 ```cmake

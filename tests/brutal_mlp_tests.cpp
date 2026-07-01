@@ -73,6 +73,43 @@ bm::TrainingModel make_known_two_layer_model() {
     return model;
 }
 
+bm::TrainingModel make_known_two_output_model(bm::LossConfig loss = bm::LossConfig::mean_squared_error()) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(2, bm::Activation::linear)
+                     .loss(std::move(loss))
+                     .seed(13)
+                     .build();
+
+    model.set_parameters({
+        bm::LayerParameters{1, 2, bm::Activation::linear, {bm::Scalar{1}, bm::Scalar{2}}, {bm::Scalar{0}, bm::Scalar{0}}},
+    });
+    return model;
+}
+
+bm::Scalar custom_mse_value(const bm::Scalar* prediction,
+                            const bm::Scalar* target,
+                            std::size_t size,
+                            void*) {
+    bm::Scalar total{0};
+    for (std::size_t i = 0; i < size; ++i) {
+        const bm::Scalar delta = prediction[i] - target[i];
+        total += delta * delta;
+    }
+    return total / static_cast<bm::Scalar>(size);
+}
+
+void custom_mse_gradient(const bm::Scalar* prediction,
+                         const bm::Scalar* target,
+                         std::size_t size,
+                         bm::Scalar* gradient,
+                         void*) {
+    const bm::Scalar scale = bm::Scalar{2} / static_cast<bm::Scalar>(size);
+    for (std::size_t i = 0; i < size; ++i) {
+        gradient[i] = (prediction[i] - target[i]) * scale;
+    }
+}
+
 bm::TrainingOptions quick_options(std::size_t epochs, std::size_t batch_size) {
     bm::TrainingOptions options;
     options.epochs = epochs;
@@ -191,6 +228,29 @@ void expect_backprop_matches_finite_difference(const bm::TrainingModel& model,
     expect_gradients_match(analytic, numerical);
 }
 
+void expect_output_loss_backprop_matches_finite_difference(const bm::LossConfig& loss) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(2, bm::Activation::linear)
+                     .loss(loss)
+                     .optimizer(bm::OptimizerConfig::sgd(kGradientLearningRate, bm::Scalar{0}))
+                     .seed(105)
+                     .build();
+
+    const std::vector<bm::LayerParameters> parameters{
+        bm::LayerParameters{2, 2, bm::Activation::linear,
+                            {bm::Scalar{0.5}, bm::Scalar{-0.25},
+                             bm::Scalar{-0.3}, bm::Scalar{0.4}},
+                            {bm::Scalar{0.1}, bm::Scalar{-0.2}}},
+    };
+    const bm::Matrix inputs{{bm::Scalar{0.2}, bm::Scalar{-0.4}},
+                            {bm::Scalar{-0.3}, bm::Scalar{0.7}}};
+    const bm::Matrix targets{{bm::Scalar{-0.5}, bm::Scalar{0.8}},
+                             {bm::Scalar{0.6}, bm::Scalar{-0.9}}};
+
+    expect_backprop_matches_finite_difference(model, parameters, inputs, targets, kGradientLearningRate);
+}
+
 } // namespace
 
 void* operator new(std::size_t size) {
@@ -256,10 +316,19 @@ TEST(StringConversions, RoundTripSupportedEnums) {
 
     EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::mean_squared_error)),
               bm::Loss::mean_squared_error);
+    EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::mean_absolute_error)),
+              bm::Loss::mean_absolute_error);
+    EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::huber)), bm::Loss::huber);
+    EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::relative_mean_squared_error)),
+              bm::Loss::relative_mean_squared_error);
+    EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::log_cosh)), bm::Loss::log_cosh);
+    EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::weighted_mean_squared_error)),
+              bm::Loss::weighted_mean_squared_error);
     EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::binary_cross_entropy)),
               bm::Loss::binary_cross_entropy);
     EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::categorical_cross_entropy)),
               bm::Loss::categorical_cross_entropy);
+    EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::custom)), bm::Loss::custom);
 
     EXPECT_EQ(bm::optimizer_type_from_string(bm::to_string(bm::OptimizerType::sgd)), bm::OptimizerType::sgd);
     EXPECT_EQ(bm::optimizer_type_from_string(bm::to_string(bm::OptimizerType::adam)), bm::OptimizerType::adam);
@@ -406,6 +475,93 @@ TEST(Losses, MeanSquaredErrorMatchesKnownValue) {
     EXPECT_NEAR(model.evaluate_loss({{3.0, 1.0}}, {{4.5}}), 1.0, kTightTolerance);
 }
 
+TEST(Losses, MeanAbsoluteErrorMatchesKnownValue) {
+    auto model = make_known_linear_model();
+    model = bm::TrainingModel::builder()
+                .input_size(2)
+                .add_layer(1, bm::Activation::linear)
+                .loss(bm::LossConfig::mean_absolute_error())
+                .seed(7)
+                .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{2}, bm::Scalar{-1}}, {bm::Scalar{0.5}}},
+    });
+
+    EXPECT_NEAR(model.evaluate_loss({{bm::Scalar{3}, bm::Scalar{1}}}, {{bm::Scalar{4.5}}}), 1.0, kTightTolerance);
+}
+
+TEST(Losses, HuberMatchesKnownValue) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::huber(bm::Scalar{0.5}))
+                     .seed(7)
+                     .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{2}, bm::Scalar{-1}}, {bm::Scalar{0.5}}},
+    });
+
+    EXPECT_NEAR(model.evaluate_loss({{bm::Scalar{3}, bm::Scalar{1}}}, {{bm::Scalar{4.5}}}), 0.375, kTightTolerance);
+}
+
+TEST(Losses, RelativeMeanSquaredErrorMatchesKnownValue) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::relative_mean_squared_error(bm::Scalar{0.01}))
+                     .seed(7)
+                     .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{2}, bm::Scalar{-1}}, {bm::Scalar{0.5}}},
+    });
+
+    EXPECT_NEAR(model.evaluate_loss({{bm::Scalar{3}, bm::Scalar{1}}}, {{bm::Scalar{4.5}}}),
+                1.0 / (4.5 * 4.5),
+                kTightTolerance);
+}
+
+TEST(Losses, LogCoshMatchesKnownValue) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::log_cosh())
+                     .seed(7)
+                     .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{2}, bm::Scalar{-1}}, {bm::Scalar{0.5}}},
+    });
+
+    EXPECT_NEAR(model.evaluate_loss({{bm::Scalar{3}, bm::Scalar{1}}}, {{bm::Scalar{4.5}}}),
+                std::log(std::cosh(1.0)),
+                kTightTolerance);
+}
+
+TEST(Losses, WeightedMeanSquaredErrorMatchesKnownValue) {
+    const auto model = make_known_two_output_model(
+        bm::LossConfig::weighted_mean_squared_error({bm::Scalar{1}, bm::Scalar{3}}));
+
+    EXPECT_NEAR(model.evaluate_loss({{bm::Scalar{3}}}, {{bm::Scalar{1}, bm::Scalar{10}}}),
+                13.0,
+                kTightTolerance);
+}
+
+TEST(Losses, CustomLossCanMatchMeanSquaredError) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::custom(custom_mse_value, custom_mse_gradient))
+                     .seed(7)
+                     .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{2}, bm::Scalar{-1}}, {bm::Scalar{0.5}}},
+    });
+
+    EXPECT_EQ(model.loss(), bm::Loss::custom);
+    EXPECT_NEAR(model.evaluate_loss({{bm::Scalar{3}, bm::Scalar{1}}}, {{bm::Scalar{4.5}}}),
+                1.0,
+                kTightTolerance);
+}
+
 TEST(Losses, BinaryCrossEntropyMatchesKnownValue) {
     auto model = bm::Model::builder()
                      .input_size(1)
@@ -447,6 +603,211 @@ TEST(Losses, RejectsInvalidTargetsForLossContracts) {
                            .build();
     EXPECT_THROW((void)categorical.evaluate_loss({{0.0}}, {{0.0, 0.5, 0.0}}), std::invalid_argument);
     EXPECT_THROW((void)categorical.evaluate_loss({{0.0}}, {{0.0, -1.0, 2.0}}), std::invalid_argument);
+}
+
+TEST(Losses, RejectsInvalidLossConfigurations) {
+    EXPECT_THROW((void)bm::LossConfig::huber(bm::Scalar{0}), std::invalid_argument);
+    EXPECT_THROW((void)bm::LossConfig::relative_mean_squared_error(bm::Scalar{0}), std::invalid_argument);
+    EXPECT_THROW((void)bm::LossConfig::weighted_mean_squared_error({}), std::invalid_argument);
+    EXPECT_THROW((void)bm::LossConfig::weighted_mean_squared_error({bm::Scalar{0}, bm::Scalar{0}}),
+                 std::invalid_argument);
+    EXPECT_THROW((void)bm::LossConfig::weighted_mean_squared_error({bm::Scalar{1}, bm::Scalar{-1}}),
+                 std::invalid_argument);
+    EXPECT_THROW((void)bm::LossConfig::custom(nullptr, custom_mse_gradient), std::invalid_argument);
+    EXPECT_THROW((void)bm::LossConfig::custom(custom_mse_value, nullptr), std::invalid_argument);
+    EXPECT_THROW((void)bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::Loss::weighted_mean_squared_error),
+                 std::invalid_argument);
+    EXPECT_THROW((void)bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::weighted_mean_squared_error({bm::Scalar{1}, bm::Scalar{1}}))
+                     .build(),
+                 std::invalid_argument);
+}
+
+TEST(Normalization, StringConversionsAndFactoryValidation) {
+    EXPECT_EQ(bm::normalization_mode_from_string(bm::to_string(bm::NormalizationMode::none)),
+              bm::NormalizationMode::none);
+    EXPECT_EQ(bm::normalization_mode_from_string(bm::to_string(bm::NormalizationMode::standard_score)),
+              bm::NormalizationMode::standard_score);
+    EXPECT_EQ(bm::normalization_mode_from_string(bm::to_string(bm::NormalizationMode::min_max)),
+              bm::NormalizationMode::min_max);
+    EXPECT_THROW((void)bm::normalization_mode_from_string("median_mad"), std::invalid_argument);
+
+    EXPECT_THROW((void)bm::FeatureNormalization::standard_score(bm::Scalar{0}, bm::Scalar{0}),
+                 std::invalid_argument);
+    EXPECT_THROW((void)bm::FeatureNormalization::min_max(bm::Scalar{1}, bm::Scalar{1}),
+                 std::invalid_argument);
+    EXPECT_THROW((void)bm::NormalizationSpec::standard_score({bm::Scalar{0}}, {}), std::invalid_argument);
+    EXPECT_THROW((void)bm::NormalizationSpec::min_max({bm::Scalar{0}}, {}), std::invalid_argument);
+}
+
+TEST(Normalization, StandardScoreInputAndOutputAreAppliedToPrediction) {
+    const auto normalization = bm::NormalizationSpec::standard_score(
+        {bm::Scalar{10}, bm::Scalar{20}},
+        {bm::Scalar{2}, bm::Scalar{4}},
+        {bm::Scalar{100}},
+        {bm::Scalar{10}});
+
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::Loss::mean_squared_error)
+                     .normalization(normalization)
+                     .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{1}, bm::Scalar{2}}, {bm::Scalar{0.5}}},
+    });
+
+    EXPECT_TRUE(model.normalization().has_input_normalization());
+    EXPECT_TRUE(model.normalization().has_output_normalization());
+    EXPECT_NEAR(model.predict({bm::Scalar{12}, bm::Scalar{28}})[0], 155.0, 1e-3);
+    EXPECT_NEAR(model.evaluate_loss({{bm::Scalar{12}, bm::Scalar{28}}}, {{bm::Scalar{165}}}), 100.0, 1e-2);
+
+    const auto inference = model.to_inference_model();
+    EXPECT_EQ(inference.scratch_size(), 2U);
+
+    bm::Vector output(inference.output_size(), bm::Scalar{0});
+    bm::Vector scratch(inference.scratch_size(), bm::Scalar{0});
+    bm::Vector input{bm::Scalar{12}, bm::Scalar{28}};
+    g_allocation_count.store(0, std::memory_order_relaxed);
+    g_count_allocations.store(true, std::memory_order_relaxed);
+    const auto status = inference.predict_to(input.data(),
+                                             input.size(),
+                                             output.data(),
+                                             output.size(),
+                                             scratch.data(),
+                                             scratch.size());
+    g_count_allocations.store(false, std::memory_order_relaxed);
+
+    EXPECT_EQ(status, bm::InferenceStatus::ok);
+    EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0U);
+    EXPECT_NEAR(output[0], 155.0, 1e-3);
+}
+
+TEST(Normalization, MinMaxClampIsControlledPerFeature) {
+    bm::NormalizationSpec clamped;
+    clamped.input_features = {bm::FeatureNormalization::min_max(bm::Scalar{0}, bm::Scalar{10})};
+
+    auto clamped_model = bm::TrainingModel::builder()
+                             .input_size(1)
+                             .add_layer(1, bm::Activation::linear)
+                             .normalization(clamped)
+                             .build();
+    clamped_model.set_parameters({
+        bm::LayerParameters{1, 1, bm::Activation::linear, {bm::Scalar{1}}, {bm::Scalar{0}}},
+    });
+
+    EXPECT_NEAR(clamped_model.predict({bm::Scalar{15}})[0], 1.0, kTightTolerance);
+    EXPECT_NEAR(clamped_model.predict({bm::Scalar{-5}})[0], -1.0, kTightTolerance);
+
+    bm::NormalizationSpec unclamped;
+    unclamped.input_features = {
+        bm::FeatureNormalization::min_max(bm::Scalar{0}, bm::Scalar{10}, bm::Scalar{-1}, bm::Scalar{1}, false)};
+
+    auto unclamped_model = bm::TrainingModel::builder()
+                               .input_size(1)
+                               .add_layer(1, bm::Activation::linear)
+                               .normalization(unclamped)
+                               .build();
+    unclamped_model.set_parameters({
+        bm::LayerParameters{1, 1, bm::Activation::linear, {bm::Scalar{1}}, {bm::Scalar{0}}},
+    });
+
+    EXPECT_NEAR(unclamped_model.predict({bm::Scalar{15}})[0], 2.0, kTightTolerance);
+}
+
+TEST(Normalization, FitUsesNormalizedTargetsAndPredictDenormalizesOutputs) {
+    const auto normalization = bm::NormalizationSpec::standard_score(
+        {bm::Scalar{0}},
+        {bm::Scalar{2}},
+        {bm::Scalar{10}},
+        {bm::Scalar{5}});
+
+    auto model = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::Loss::mean_squared_error)
+                     .optimizer(bm::OptimizerConfig::adam(bm::Scalar{0.05}))
+                     .normalization(normalization)
+                     .seed(77)
+                     .build();
+
+    const bm::Matrix inputs{{bm::Scalar{-4}}, {bm::Scalar{-2}}, {bm::Scalar{0}}, {bm::Scalar{2}}, {bm::Scalar{4}}};
+    const bm::Matrix targets{{bm::Scalar{-10}}, {bm::Scalar{0}}, {bm::Scalar{10}}, {bm::Scalar{20}}, {bm::Scalar{30}}};
+
+    auto options = quick_options(600, inputs.size());
+    options.shuffle = false;
+    model.fit(inputs, targets, options);
+
+    EXPECT_NEAR(model.predict({bm::Scalar{6}})[0], 40.0, 0.75);
+}
+
+TEST(Normalization, SerializationPreservesTrainingAndInferenceNormalization) {
+    const auto training_path = std::filesystem::temp_directory_path() / "brutal_mlp_training_norm.model";
+    const auto inference_path = std::filesystem::temp_directory_path() / "brutal_mlp_inference_norm.model";
+
+    const auto normalization = bm::NormalizationSpec::standard_score(
+        {bm::Scalar{10}, bm::Scalar{20}},
+        {bm::Scalar{2}, bm::Scalar{4}},
+        {bm::Scalar{100}},
+        {bm::Scalar{10}});
+
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::Loss::mean_squared_error)
+                     .normalization(normalization)
+                     .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{1}, bm::Scalar{2}}, {bm::Scalar{0.5}}},
+    });
+
+    model.save(training_path);
+    const auto loaded_training = bm::TrainingModel::load(training_path);
+    std::filesystem::remove(training_path);
+    EXPECT_TRUE(loaded_training.normalization().has_input_normalization());
+    EXPECT_TRUE(loaded_training.normalization().has_output_normalization());
+    EXPECT_NEAR(loaded_training.predict({bm::Scalar{12}, bm::Scalar{28}})[0], 155.0, 1e-3);
+
+    const auto inference = model.to_inference_model();
+    inference.save(inference_path);
+    const auto loaded_inference = bm::InferenceModel::load(inference_path);
+    std::filesystem::remove(inference_path);
+    EXPECT_TRUE(loaded_inference.normalization().has_input_normalization());
+    EXPECT_TRUE(loaded_inference.normalization().has_output_normalization());
+    EXPECT_NEAR(loaded_inference.predict({bm::Scalar{12}, bm::Scalar{28}})[0], 155.0, 1e-3);
+}
+
+TEST(Normalization, RejectsShapeMismatchAndOutputNormalizationForClassificationLosses) {
+    bm::NormalizationSpec bad_input_shape;
+    bad_input_shape.input_features = {bm::FeatureNormalization::standard_score(bm::Scalar{0}, bm::Scalar{1})};
+    EXPECT_THROW((void)bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .normalization(bad_input_shape)
+                     .build(),
+                 std::invalid_argument);
+
+    bm::NormalizationSpec bad_output_loss;
+    bad_output_loss.output_features = {bm::FeatureNormalization::standard_score(bm::Scalar{0}, bm::Scalar{1})};
+    EXPECT_THROW((void)bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::sigmoid)
+                     .loss(bm::Loss::binary_cross_entropy)
+                     .normalization(bad_output_loss)
+                     .build(),
+                 std::invalid_argument);
+
+    EXPECT_NO_THROW((void)bm::TrainingModel::builder()
+                        .input_size(1)
+                        .add_layer(1, bm::Activation::linear)
+                        .loss(bm::LossConfig::huber(bm::Scalar{1}))
+                        .normalization(bad_output_loss)
+                        .build());
 }
 
 TEST(GradientCheck, MeanSquaredErrorTanhLinearNetwork) {
@@ -554,6 +915,33 @@ TEST(GradientCheck, ReluNetworkAwayFromKinks) {
     const bm::Matrix targets{{bm::Scalar{0.35}}, {bm::Scalar{-0.15}}};
 
     expect_backprop_matches_finite_difference(model, parameters, inputs, targets, kGradientLearningRate);
+}
+
+TEST(GradientCheck, MeanAbsoluteErrorAwayFromKinks) {
+    expect_output_loss_backprop_matches_finite_difference(bm::LossConfig::mean_absolute_error());
+}
+
+TEST(GradientCheck, HuberAwayFromKinks) {
+    expect_output_loss_backprop_matches_finite_difference(bm::LossConfig::huber(bm::Scalar{0.5}));
+}
+
+TEST(GradientCheck, RelativeMeanSquaredError) {
+    expect_output_loss_backprop_matches_finite_difference(
+        bm::LossConfig::relative_mean_squared_error(bm::Scalar{0.1}));
+}
+
+TEST(GradientCheck, LogCosh) {
+    expect_output_loss_backprop_matches_finite_difference(bm::LossConfig::log_cosh());
+}
+
+TEST(GradientCheck, WeightedMeanSquaredError) {
+    expect_output_loss_backprop_matches_finite_difference(
+        bm::LossConfig::weighted_mean_squared_error({bm::Scalar{1}, bm::Scalar{3}}));
+}
+
+TEST(GradientCheck, CustomLoss) {
+    expect_output_loss_backprop_matches_finite_difference(
+        bm::LossConfig::custom(custom_mse_value, custom_mse_gradient));
 }
 
 TEST(Training, LinearRegressionConvergesWithAdam) {
@@ -936,6 +1324,46 @@ TEST(Serialization, SaveLoadRoundTripsPredictionsAndMetadata) {
     EXPECT_EQ(loaded.layer_count(), model.layer_count());
     EXPECT_EQ(loaded.loss(), model.loss());
     expect_vector_near(loaded.predict({3.0, 1.0}), model.predict({3.0, 1.0}), kTightTolerance);
+}
+
+TEST(Serialization, SaveLoadRoundTripsLossConfig) {
+    const auto huber_path = std::filesystem::temp_directory_path() / "brutal_mlp_huber_roundtrip.model";
+    auto huber = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::huber(bm::Scalar{0.25}))
+                     .build();
+
+    huber.save(huber_path);
+    const auto loaded_huber = bm::TrainingModel::load(huber_path);
+    std::filesystem::remove(huber_path);
+    EXPECT_EQ(loaded_huber.loss(), bm::Loss::huber);
+    EXPECT_NEAR(loaded_huber.loss_config().huber_delta, 0.25, kTightTolerance);
+
+    const auto weighted_path = std::filesystem::temp_directory_path() / "brutal_mlp_weighted_roundtrip.model";
+    auto weighted = make_known_two_output_model(
+        bm::LossConfig::weighted_mean_squared_error({bm::Scalar{1}, bm::Scalar{3}}));
+
+    weighted.save(weighted_path);
+    const auto loaded_weighted = bm::TrainingModel::load(weighted_path);
+    std::filesystem::remove(weighted_path);
+    EXPECT_EQ(loaded_weighted.loss(), bm::Loss::weighted_mean_squared_error);
+    expect_vector_near(loaded_weighted.loss_config().weights, {bm::Scalar{1}, bm::Scalar{3}}, kTightTolerance);
+    EXPECT_NEAR(loaded_weighted.evaluate_loss({{bm::Scalar{3}}}, {{bm::Scalar{1}, bm::Scalar{10}}}),
+                13.0,
+                kTightTolerance);
+}
+
+TEST(Serialization, RejectsCustomLossSave) {
+    const auto path = std::filesystem::temp_directory_path() / "brutal_mlp_custom_loss.model";
+    auto model = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::custom(custom_mse_value, custom_mse_gradient))
+                     .build();
+
+    EXPECT_THROW(model.save(path), std::runtime_error);
+    std::filesystem::remove(path);
 }
 
 TEST(Serialization, LoadRejectsMissingOrInvalidFiles) {

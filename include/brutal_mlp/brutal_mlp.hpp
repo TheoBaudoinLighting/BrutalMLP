@@ -29,13 +29,25 @@ enum class Activation {
 
 enum class Loss {
     mean_squared_error,
+    mean_absolute_error,
+    huber,
+    relative_mean_squared_error,
+    log_cosh,
+    weighted_mean_squared_error,
     binary_cross_entropy,
-    categorical_cross_entropy
+    categorical_cross_entropy,
+    custom
 };
 
 enum class OptimizerType {
     sgd,
     adam
+};
+
+enum class NormalizationMode {
+    none,
+    standard_score,
+    min_max
 };
 
 enum class InferenceStatus {
@@ -53,11 +65,50 @@ enum class InferenceStatus {
 [[nodiscard]] std::string to_string(Activation activation);
 [[nodiscard]] std::string to_string(Loss loss);
 [[nodiscard]] std::string to_string(OptimizerType optimizer);
+[[nodiscard]] std::string to_string(NormalizationMode mode);
 [[nodiscard]] std::string to_string(InferenceStatus status);
 
 [[nodiscard]] Activation activation_from_string(std::string_view value);
 [[nodiscard]] Loss loss_from_string(std::string_view value);
 [[nodiscard]] OptimizerType optimizer_type_from_string(std::string_view value);
+[[nodiscard]] NormalizationMode normalization_mode_from_string(std::string_view value);
+
+using CustomLossValueFunction = Scalar (*)(const Scalar* prediction,
+                                           const Scalar* target,
+                                           std::size_t size,
+                                           void* context);
+using CustomLossGradientFunction = void (*)(const Scalar* prediction,
+                                            const Scalar* target,
+                                            std::size_t size,
+                                            Scalar* gradient,
+                                            void* context);
+
+struct CustomLoss {
+    CustomLossValueFunction value{nullptr};
+    CustomLossGradientFunction gradient{nullptr};
+    void* context{nullptr};
+};
+
+struct LossConfig {
+    Loss type{Loss::mean_squared_error};
+    Scalar huber_delta{static_cast<Scalar>(1)};
+    Scalar relative_epsilon{static_cast<Scalar>(1e-6)};
+    Vector weights;
+    CustomLoss custom_loss{};
+
+    [[nodiscard]] static LossConfig from_loss(Loss loss);
+    [[nodiscard]] static LossConfig mean_squared_error();
+    [[nodiscard]] static LossConfig mean_absolute_error();
+    [[nodiscard]] static LossConfig huber(Scalar delta = static_cast<Scalar>(1));
+    [[nodiscard]] static LossConfig relative_mean_squared_error(Scalar epsilon = static_cast<Scalar>(1e-6));
+    [[nodiscard]] static LossConfig log_cosh();
+    [[nodiscard]] static LossConfig weighted_mean_squared_error(const Vector& weights);
+    [[nodiscard]] static LossConfig binary_cross_entropy();
+    [[nodiscard]] static LossConfig categorical_cross_entropy();
+    [[nodiscard]] static LossConfig custom(CustomLossValueFunction value,
+                                           CustomLossGradientFunction gradient,
+                                           void* context = nullptr);
+};
 
 struct OptimizerConfig {
     OptimizerType type{OptimizerType::adam};
@@ -103,11 +154,58 @@ struct LayerParameters {
     Vector biases;
 };
 
+struct FeatureNormalization {
+    NormalizationMode mode{NormalizationMode::none};
+    Scalar mean{static_cast<Scalar>(0)};
+    Scalar stddev{static_cast<Scalar>(1)};
+    Scalar minimum{static_cast<Scalar>(0)};
+    Scalar maximum{static_cast<Scalar>(1)};
+    Scalar normalized_min{static_cast<Scalar>(-1)};
+    Scalar normalized_max{static_cast<Scalar>(1)};
+    bool clamp{false};
+    Scalar clamp_min{static_cast<Scalar>(-1)};
+    Scalar clamp_max{static_cast<Scalar>(1)};
+
+    [[nodiscard]] static FeatureNormalization none();
+    [[nodiscard]] static FeatureNormalization standard_score(Scalar mean,
+                                                             Scalar stddev,
+                                                             bool clamp = false,
+                                                             Scalar clamp_min = static_cast<Scalar>(-1),
+                                                             Scalar clamp_max = static_cast<Scalar>(1));
+    [[nodiscard]] static FeatureNormalization min_max(Scalar minimum,
+                                                      Scalar maximum,
+                                                      Scalar normalized_min = static_cast<Scalar>(-1),
+                                                      Scalar normalized_max = static_cast<Scalar>(1),
+                                                      bool clamp = true);
+};
+
+struct NormalizationSpec {
+    std::vector<FeatureNormalization> input_features;
+    std::vector<FeatureNormalization> output_features;
+
+    [[nodiscard]] static NormalizationSpec none();
+    [[nodiscard]] static NormalizationSpec standard_score(const Vector& input_means,
+                                                          const Vector& input_stddevs,
+                                                          const Vector& output_means = {},
+                                                          const Vector& output_stddevs = {});
+    [[nodiscard]] static NormalizationSpec min_max(const Vector& input_minimums,
+                                                   const Vector& input_maximums,
+                                                   const Vector& output_minimums = {},
+                                                   const Vector& output_maximums = {},
+                                                   Scalar normalized_min = static_cast<Scalar>(-1),
+                                                   Scalar normalized_max = static_cast<Scalar>(1),
+                                                   bool clamp = true);
+
+    [[nodiscard]] bool has_input_normalization() const noexcept;
+    [[nodiscard]] bool has_output_normalization() const noexcept;
+};
+
 class InferenceWorkspace;
 
 class InferenceModel {
 public:
-    [[nodiscard]] static InferenceModel from_parameters(const std::vector<LayerParameters>& parameters);
+    [[nodiscard]] static InferenceModel from_parameters(const std::vector<LayerParameters>& parameters,
+                                                        const NormalizationSpec& normalization = {});
     [[nodiscard]] static InferenceModel load(const std::filesystem::path& path);
 
     InferenceModel(const InferenceModel& other);
@@ -125,6 +223,7 @@ public:
     [[nodiscard]] std::size_t bias_count() const noexcept;
     [[nodiscard]] const Scalar* weights_data() const noexcept;
     [[nodiscard]] const Scalar* biases_data() const noexcept;
+    [[nodiscard]] NormalizationSpec normalization() const;
 
     [[nodiscard]] InferenceStatus predict_to(const Scalar* input,
                                              std::size_t input_size,
@@ -185,7 +284,9 @@ public:
         Builder& input_size(std::size_t input_size);
         Builder& add_layer(std::size_t neurons, Activation activation);
         Builder& loss(Loss loss);
+        Builder& loss(LossConfig loss);
         Builder& optimizer(OptimizerConfig optimizer);
+        Builder& normalization(NormalizationSpec normalization);
         Builder& seed(std::uint64_t seed);
 
         [[nodiscard]] TrainingModel build() const;
@@ -195,8 +296,9 @@ public:
 
         std::size_t input_size_{0};
         std::vector<LayerSpec> layers_{};
-        Loss loss_{Loss::mean_squared_error};
+        LossConfig loss_{};
         OptimizerConfig optimizer_{OptimizerConfig::adam()};
+        NormalizationSpec normalization_{};
         std::uint64_t seed_{5489u};
     };
 
@@ -213,7 +315,9 @@ public:
     [[nodiscard]] std::size_t output_size() const;
     [[nodiscard]] std::size_t layer_count() const;
     [[nodiscard]] Loss loss() const;
+    [[nodiscard]] LossConfig loss_config() const;
     [[nodiscard]] OptimizerConfig optimizer() const;
+    [[nodiscard]] NormalizationSpec normalization() const;
 
     [[nodiscard]] Vector predict(const Vector& input) const;
     [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
