@@ -1,7 +1,10 @@
 #include "brutal_mlp/brutal_mlp.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <ctime>
+#include <cstring>
 #include <fstream>
 #include <iomanip>
 #include <limits>
@@ -9,6 +12,7 @@
 #include <random>
 #include <sstream>
 #include <stdexcept>
+#include <thread>
 #include <utility>
 
 namespace brutal_mlp {
@@ -108,6 +112,27 @@ void require_finite(Scalar value, const std::string& name) {
     throw std::invalid_argument("unknown activation");
 }
 
+[[nodiscard]] Scalar activation_derivative_from_pre_activation(Activation activation, Scalar pre_activation) {
+    switch (activation) {
+    case Activation::linear:
+        return Scalar{1};
+    case Activation::relu:
+        return pre_activation > Scalar{0} ? Scalar{1} : Scalar{0};
+    case Activation::sigmoid: {
+        const Scalar value = sigmoid(pre_activation);
+        return value * (Scalar{1} - value);
+    }
+    case Activation::tanh: {
+        const Scalar value = static_cast<Scalar>(std::tanh(pre_activation));
+        return Scalar{1} - value * value;
+    }
+    case Activation::softmax:
+        throw std::invalid_argument("softmax derivative requires the full Jacobian");
+    }
+
+    throw std::invalid_argument("unknown activation");
+}
+
 void validate_optimizer(const OptimizerConfig& optimizer) {
     require_finite(optimizer.learning_rate, "learning_rate");
     require(optimizer.learning_rate > Scalar{0}, "learning_rate must be positive");
@@ -121,8 +146,94 @@ void validate_optimizer(const OptimizerConfig& optimizer) {
     require(optimizer.momentum >= Scalar{0} && optimizer.momentum < Scalar{1}, "momentum must be in [0, 1)");
     require_finite(optimizer.l2, "l2");
     require(optimizer.l2 >= Scalar{0}, "l2 must be non-negative");
+    require_finite(optimizer.l1, "l1");
+    require(optimizer.l1 >= Scalar{0}, "l1 must be non-negative");
+    require_finite(optimizer.decoupled_weight_decay, "decoupled_weight_decay");
+    require(optimizer.decoupled_weight_decay >= Scalar{0}, "decoupled_weight_decay must be non-negative");
+    require_finite(optimizer.max_norm, "max_norm");
+    require(optimizer.max_norm >= Scalar{0}, "max_norm must be non-negative");
     require_finite(optimizer.gradient_clip_norm, "gradient_clip_norm");
     require(optimizer.gradient_clip_norm >= Scalar{0}, "gradient_clip_norm must be non-negative");
+    require_finite(optimizer.gradient_clip_value, "gradient_clip_value");
+    require(optimizer.gradient_clip_value >= Scalar{0}, "gradient_clip_value must be non-negative");
+    require_finite(optimizer.layer_gradient_clip_norm, "layer_gradient_clip_norm");
+    require(optimizer.layer_gradient_clip_norm >= Scalar{0},
+            "layer_gradient_clip_norm must be non-negative");
+}
+
+void validate_learning_rate_schedule_config(const LearningRateScheduleConfig& schedule) {
+    require_finite(schedule.base_learning_rate, "base_learning_rate");
+    require(schedule.base_learning_rate >= Scalar{0}, "base_learning_rate must be non-negative");
+    require_finite(schedule.minimum_learning_rate, "minimum_learning_rate");
+    require(schedule.minimum_learning_rate >= Scalar{0}, "minimum_learning_rate must be non-negative");
+    require_finite(schedule.warmup_start_learning_rate, "warmup_start_learning_rate");
+    require(schedule.warmup_start_learning_rate >= Scalar{0},
+            "warmup_start_learning_rate must be non-negative");
+    require(schedule.step_size > 0, "step_size must be positive");
+    require_finite(schedule.step_decay_factor, "step_decay_factor");
+    require(schedule.step_decay_factor > Scalar{0} && schedule.step_decay_factor <= Scalar{1},
+            "step_decay_factor must be in (0, 1]");
+    require_finite(schedule.exponential_decay_rate, "exponential_decay_rate");
+    require(schedule.exponential_decay_rate > Scalar{0} && schedule.exponential_decay_rate <= Scalar{1},
+            "exponential_decay_rate must be in (0, 1]");
+    require_finite(schedule.reduce_on_plateau_factor, "reduce_on_plateau_factor");
+    require(schedule.reduce_on_plateau_factor > Scalar{0} && schedule.reduce_on_plateau_factor < Scalar{1},
+            "reduce_on_plateau_factor must be in (0, 1)");
+    require_finite(schedule.reduce_on_plateau_min_delta, "reduce_on_plateau_min_delta");
+    require(schedule.reduce_on_plateau_min_delta >= Scalar{0},
+            "reduce_on_plateau_min_delta must be non-negative");
+}
+
+void validate_initialization_config(const InitializationConfig& initialization) {
+    require_finite(initialization.bias, "initialization bias");
+}
+
+[[nodiscard]] std::size_t resolve_parallel_worker_count(const ParallelOptions& options,
+                                                        std::size_t sample_count) noexcept {
+    if (sample_count == 0 || options.execution != ParallelExecution::worker_threads) {
+        return sample_count == 0 ? 0 : 1;
+    }
+    if (options.minimum_parallel_samples > 0 && sample_count < options.minimum_parallel_samples) {
+        return 1;
+    }
+
+    std::size_t worker_count = options.thread_count;
+    if (worker_count == 0) {
+        worker_count = static_cast<std::size_t>(std::thread::hardware_concurrency());
+    }
+    if (worker_count == 0) {
+        worker_count = 1;
+    }
+    return std::min(worker_count, sample_count);
+}
+
+[[nodiscard]] std::size_t required_batch_scratch_size(std::size_t single_sample_scratch,
+                                                      std::size_t sample_count,
+                                                      const ParallelOptions& options) noexcept {
+    const std::size_t worker_count = resolve_parallel_worker_count(options, sample_count);
+    if (single_sample_scratch != 0 &&
+        worker_count > std::numeric_limits<std::size_t>::max() / single_sample_scratch) {
+        return std::numeric_limits<std::size_t>::max();
+    }
+    return single_sample_scratch * worker_count;
+}
+
+void join_workers_noexcept(std::vector<std::thread>& workers) noexcept {
+    for (std::thread& worker : workers) {
+        if (!worker.joinable()) {
+            continue;
+        }
+        try {
+            worker.join();
+        } catch (...) {
+            if (worker.joinable()) {
+                try {
+                    worker.detach();
+                } catch (...) {
+                }
+            }
+        }
+    }
 }
 
 void validate_training_options(const TrainingOptions& options) {
@@ -137,6 +248,323 @@ void validate_training_options(const TrainingOptions& options) {
             "validation_split + test_split must be less than 1");
     require_finite(options.min_delta, "min_delta");
     require(options.min_delta >= Scalar{0}, "min_delta must be non-negative");
+    validate_learning_rate_schedule_config(options.learning_rate_schedule);
+    require_finite(options.gradient_noise_stddev, "gradient_noise_stddev");
+    require(options.gradient_noise_stddev >= Scalar{0}, "gradient_noise_stddev must be non-negative");
+}
+
+void validate_dropout_probability(Scalar probability, const std::string& name) {
+    require_finite(probability, name);
+    require(probability >= Scalar{0} && probability < Scalar{1}, name + " must be in [0, 1)");
+}
+
+[[nodiscard]] TrainingMonitor resolve_training_monitor(TrainingMonitor monitor,
+                                                       bool has_validation_loss,
+                                                       bool has_test_loss) {
+    if (monitor == TrainingMonitor::automatic) {
+        return has_validation_loss ? TrainingMonitor::validation_loss : TrainingMonitor::training_loss;
+    }
+    if (monitor == TrainingMonitor::validation_loss) {
+        require(has_validation_loss, "validation_loss monitor requires a non-empty validation split");
+    }
+    if (monitor == TrainingMonitor::test_loss) {
+        require(has_test_loss, "test_loss monitor requires a non-empty test split");
+    }
+    return monitor;
+}
+
+[[nodiscard]] Scalar select_monitored_metric(TrainingMonitor monitor,
+                                             Scalar training_loss,
+                                             bool has_validation_loss,
+                                             Scalar validation_loss,
+                                             bool has_test_loss,
+                                             Scalar test_loss) {
+    switch (monitor) {
+    case TrainingMonitor::automatic:
+        return select_monitored_metric(resolve_training_monitor(monitor, has_validation_loss, has_test_loss),
+                                       training_loss,
+                                       has_validation_loss,
+                                       validation_loss,
+                                       has_test_loss,
+                                       test_loss);
+    case TrainingMonitor::training_loss:
+        return training_loss;
+    case TrainingMonitor::validation_loss:
+        require(has_validation_loss, "validation_loss monitor requires a non-empty validation split");
+        return validation_loss;
+    case TrainingMonitor::test_loss:
+        require(has_test_loss, "test_loss monitor requires a non-empty test split");
+        return test_loss;
+    }
+
+    throw std::invalid_argument("unknown training monitor");
+}
+
+[[nodiscard]] Scalar initial_best_metric(TrainingMonitorMode mode) {
+    switch (mode) {
+    case TrainingMonitorMode::minimize:
+        return std::numeric_limits<Scalar>::infinity();
+    case TrainingMonitorMode::maximize:
+        return -std::numeric_limits<Scalar>::infinity();
+    }
+
+    throw std::invalid_argument("unknown training monitor mode");
+}
+
+[[nodiscard]] bool metric_improved(Scalar current,
+                                   Scalar best,
+                                   TrainingMonitorMode mode,
+                                   Scalar min_delta) {
+    switch (mode) {
+    case TrainingMonitorMode::minimize:
+        return current + min_delta < best;
+    case TrainingMonitorMode::maximize:
+        return current > best + min_delta;
+    }
+
+    throw std::invalid_argument("unknown training monitor mode");
+}
+
+[[nodiscard]] WeightInitialization resolve_weight_initialization(WeightInitialization initialization,
+                                                                 Activation activation) {
+    if (initialization != WeightInitialization::automatic) {
+        return initialization;
+    }
+    return activation == Activation::relu ? WeightInitialization::he_uniform
+                                          : WeightInitialization::xavier_uniform;
+}
+
+struct WeightInitializationParameters {
+    bool normal{false};
+    Scalar scale{static_cast<Scalar>(0)};
+};
+
+[[nodiscard]] WeightInitializationParameters weight_initialization_parameters(
+    WeightInitialization initialization,
+    std::size_t fan_in,
+    std::size_t fan_out) {
+    require(fan_in > 0, "fan_in must be positive");
+    require(fan_out > 0, "fan_out must be positive");
+
+    const Scalar fan_in_scalar = static_cast<Scalar>(fan_in);
+    const Scalar fan_sum = static_cast<Scalar>(fan_in + fan_out);
+    switch (initialization) {
+    case WeightInitialization::automatic:
+        throw std::invalid_argument("automatic initialization must be resolved before use");
+    case WeightInitialization::he_normal:
+        return WeightInitializationParameters{true,
+                                              static_cast<Scalar>(std::sqrt(Scalar{2} / fan_in_scalar))};
+    case WeightInitialization::he_uniform:
+        return WeightInitializationParameters{false,
+                                              static_cast<Scalar>(std::sqrt(Scalar{6} / fan_in_scalar))};
+    case WeightInitialization::xavier_normal:
+        return WeightInitializationParameters{true,
+                                              static_cast<Scalar>(std::sqrt(Scalar{2} / fan_sum))};
+    case WeightInitialization::xavier_uniform:
+        return WeightInitializationParameters{false,
+                                              static_cast<Scalar>(std::sqrt(Scalar{6} / fan_sum))};
+    case WeightInitialization::lecun_normal:
+        return WeightInitializationParameters{true,
+                                              static_cast<Scalar>(std::sqrt(Scalar{1} / fan_in_scalar))};
+    case WeightInitialization::lecun_uniform:
+        return WeightInitializationParameters{false,
+                                              static_cast<Scalar>(std::sqrt(Scalar{3} / fan_in_scalar))};
+    }
+
+    throw std::invalid_argument("unknown weight initialization");
+}
+
+[[nodiscard]] Scalar sign_or_zero(Scalar value) noexcept {
+    if (value > Scalar{0}) {
+        return Scalar{1};
+    }
+    if (value < Scalar{0}) {
+        return -Scalar{1};
+    }
+    return Scalar{0};
+}
+
+void merge_gradient_clipping(GradientClippingDiagnostics& total,
+                             const GradientClippingDiagnostics& batch) noexcept {
+    total.batch_count += batch.batch_count;
+    total.global_clip_count += batch.global_clip_count;
+    total.layer_count += batch.layer_count;
+    total.layer_clip_count += batch.layer_clip_count;
+    total.gradient_value_count += batch.gradient_value_count;
+    total.gradient_value_clip_count += batch.gradient_value_clip_count;
+    total.minimum_clip_scale = std::min(total.minimum_clip_scale, batch.minimum_clip_scale);
+}
+
+void finalize_gradient_clipping(GradientClippingDiagnostics& diagnostics) noexcept {
+    if (diagnostics.batch_count > 0) {
+        diagnostics.global_clip_rate =
+            static_cast<Scalar>(diagnostics.global_clip_count) /
+            static_cast<Scalar>(diagnostics.batch_count);
+    }
+    if (diagnostics.layer_count > 0) {
+        diagnostics.layer_clip_rate =
+            static_cast<Scalar>(diagnostics.layer_clip_count) /
+            static_cast<Scalar>(diagnostics.layer_count);
+    }
+    if (diagnostics.gradient_value_count > 0) {
+        diagnostics.value_clip_rate =
+            static_cast<Scalar>(diagnostics.gradient_value_clip_count) /
+            static_cast<Scalar>(diagnostics.gradient_value_count);
+    }
+}
+
+void initialize_weights(Vector& weights,
+                        WeightInitialization initialization,
+                        std::size_t fan_in,
+                        std::size_t fan_out,
+                        std::mt19937_64& rng) {
+    const WeightInitializationParameters parameters =
+        weight_initialization_parameters(initialization, fan_in, fan_out);
+    if (parameters.normal) {
+        std::normal_distribution<Scalar> distribution(Scalar{0}, parameters.scale);
+        for (Scalar& weight : weights) {
+            weight = distribution(rng);
+        }
+        return;
+    }
+
+    std::uniform_real_distribution<Scalar> distribution(-parameters.scale, parameters.scale);
+    for (Scalar& weight : weights) {
+        weight = distribution(rng);
+    }
+}
+
+[[nodiscard]] LearningRateScheduleConfig resolve_learning_rate_schedule(
+    const LearningRateScheduleConfig& schedule,
+    Scalar optimizer_learning_rate) {
+    LearningRateScheduleConfig resolved = schedule;
+    if (resolved.base_learning_rate == Scalar{0}) {
+        resolved.base_learning_rate = optimizer_learning_rate;
+    }
+    require_finite(resolved.base_learning_rate, "resolved base_learning_rate");
+    require(resolved.base_learning_rate > Scalar{0}, "resolved base_learning_rate must be positive");
+    require(resolved.minimum_learning_rate <= resolved.base_learning_rate,
+            "minimum_learning_rate must be less than or equal to base_learning_rate");
+    require(resolved.warmup_start_learning_rate <= resolved.base_learning_rate,
+            "warmup_start_learning_rate must be less than or equal to base_learning_rate");
+    return resolved;
+}
+
+[[nodiscard]] Scalar warmup_learning_rate(const LearningRateScheduleConfig& schedule,
+                                          std::size_t epoch) {
+    const Scalar progress = static_cast<Scalar>(epoch + 1) / static_cast<Scalar>(schedule.warmup_epochs);
+    return schedule.warmup_start_learning_rate +
+           (schedule.base_learning_rate - schedule.warmup_start_learning_rate) * progress;
+}
+
+[[nodiscard]] Scalar floor_learning_rate(const LearningRateScheduleConfig& schedule,
+                                         Scalar learning_rate) {
+    return std::max(schedule.minimum_learning_rate, learning_rate);
+}
+
+[[nodiscard]] Scalar deterministic_learning_rate_for_epoch(const LearningRateScheduleConfig& schedule,
+                                                           std::size_t epoch,
+                                                           std::size_t total_epochs) {
+    if (schedule.warmup_epochs > 0 && epoch < schedule.warmup_epochs) {
+        return warmup_learning_rate(schedule, epoch);
+    }
+
+    const std::size_t main_epoch = epoch >= schedule.warmup_epochs ? epoch - schedule.warmup_epochs : 0;
+    switch (schedule.type) {
+    case LearningRateSchedule::constant:
+    case LearningRateSchedule::reduce_on_plateau:
+        return floor_learning_rate(schedule, schedule.base_learning_rate);
+    case LearningRateSchedule::step_decay: {
+        const std::size_t steps = main_epoch / schedule.step_size;
+        const Scalar factor =
+            static_cast<Scalar>(std::pow(schedule.step_decay_factor, static_cast<Scalar>(steps)));
+        return floor_learning_rate(schedule, schedule.base_learning_rate * factor);
+    }
+    case LearningRateSchedule::exponential_decay: {
+        const Scalar factor =
+            static_cast<Scalar>(std::pow(schedule.exponential_decay_rate, static_cast<Scalar>(main_epoch)));
+        return floor_learning_rate(schedule, schedule.base_learning_rate * factor);
+    }
+    case LearningRateSchedule::cosine_annealing: {
+        constexpr double pi = 3.141592653589793238462643383279502884;
+        const std::size_t remaining_epochs =
+            total_epochs > schedule.warmup_epochs ? total_epochs - schedule.warmup_epochs : 1;
+        const std::size_t cosine_epochs =
+            schedule.cosine_epochs > 0 ? schedule.cosine_epochs : remaining_epochs;
+        const std::size_t clamped_epoch = std::min(main_epoch, cosine_epochs);
+        const Scalar progress = static_cast<Scalar>(clamped_epoch) / static_cast<Scalar>(cosine_epochs);
+        const Scalar cosine = static_cast<Scalar>(std::cos(pi * static_cast<double>(progress)));
+        return schedule.minimum_learning_rate +
+               (schedule.base_learning_rate - schedule.minimum_learning_rate) *
+                   (Scalar{0.5} * (Scalar{1} + cosine));
+    }
+    }
+
+    throw std::invalid_argument("unknown learning rate schedule");
+}
+
+[[nodiscard]] Scalar learning_rate_for_epoch(const LearningRateScheduleConfig& schedule,
+                                             const LearningRateSchedulerState& state,
+                                             std::size_t epoch,
+                                             std::size_t total_epochs) {
+    if (schedule.type == LearningRateSchedule::reduce_on_plateau) {
+        if (schedule.warmup_epochs > 0 && epoch < schedule.warmup_epochs) {
+            return warmup_learning_rate(schedule, epoch);
+        }
+        return floor_learning_rate(schedule, state.current_learning_rate);
+    }
+    return deterministic_learning_rate_for_epoch(schedule, epoch, total_epochs);
+}
+
+[[nodiscard]] LearningRateSchedulerState initial_learning_rate_state(
+    const LearningRateScheduleConfig& schedule) {
+    LearningRateSchedulerState state;
+    state.initialized = true;
+    state.base_learning_rate = schedule.base_learning_rate;
+    state.current_learning_rate = floor_learning_rate(schedule, schedule.base_learning_rate);
+    return state;
+}
+
+bool update_reduce_on_plateau_learning_rate(const LearningRateScheduleConfig& schedule,
+                                            LearningRateSchedulerState& state,
+                                            std::size_t epoch,
+                                            Scalar metric,
+                                            bool finite_epoch) {
+    if (schedule.type != LearningRateSchedule::reduce_on_plateau || !finite_epoch) {
+        return false;
+    }
+    if (schedule.warmup_epochs > 0 && epoch < schedule.warmup_epochs) {
+        return false;
+    }
+
+    if (!state.has_best_metric ||
+        metric_improved(metric,
+                        state.best_metric,
+                        schedule.reduce_on_plateau_mode,
+                        schedule.reduce_on_plateau_min_delta)) {
+        state.best_metric = metric;
+        state.has_best_metric = true;
+        state.stale_epochs = 0;
+        state.cooldown_remaining = schedule.reduce_on_plateau_cooldown;
+        return false;
+    }
+
+    if (state.cooldown_remaining > 0) {
+        --state.cooldown_remaining;
+        return false;
+    }
+
+    ++state.stale_epochs;
+    if (state.stale_epochs < schedule.reduce_on_plateau_patience) {
+        return false;
+    }
+
+    const Scalar previous = state.current_learning_rate;
+    state.current_learning_rate =
+        floor_learning_rate(schedule, state.current_learning_rate * schedule.reduce_on_plateau_factor);
+    state.stale_epochs = 0;
+    state.cooldown_remaining = schedule.reduce_on_plateau_cooldown;
+    return state.current_learning_rate < previous;
 }
 
 [[nodiscard]] bool is_classification_loss(Loss loss) noexcept {
@@ -610,6 +1038,10 @@ void validate_layer_parameters(const std::vector<LayerParameters>& parameters) {
         require(layer.weights.size() == layer.input_size * layer.output_size,
                 "parameter weights size mismatch");
         require(layer.biases.size() == layer.output_size, "parameter biases size mismatch");
+        validate_dropout_probability(layer.dropout_probability, "layer dropout_probability");
+        if (i + 1 == parameters.size()) {
+            require(layer.dropout_probability == Scalar{0}, "output layer dropout must be zero");
+        }
         if (layer.activation == Activation::softmax) {
             require(i + 1 == parameters.size(), "softmax is only supported on the output layer");
             require(layer.output_size >= 2, "softmax output layer must contain at least two neurons");
@@ -871,7 +1303,1050 @@ void write_loss_config(std::ostream& output, const LossConfig& loss) {
     return loss;
 }
 
+constexpr unsigned char kBinaryMagic[8] = {'B', 'M', 'L', 'P', 'B', 'I', 'N', '\0'};
+constexpr std::uint32_t kBinaryVersion = 6;
+
+[[nodiscard]] BinaryScalarType current_binary_scalar_type() noexcept {
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
+    return BinaryScalarType::float64;
+#else
+    return BinaryScalarType::float32;
+#endif
+}
+
+[[nodiscard]] std::uint32_t scalar_type_code(BinaryScalarType type) {
+    switch (type) {
+    case BinaryScalarType::float32:
+        return 1;
+    case BinaryScalarType::float64:
+        return 2;
+    }
+    throw std::invalid_argument("unknown binary scalar type");
+}
+
+[[nodiscard]] BinaryScalarType scalar_type_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return BinaryScalarType::float32;
+    case 2:
+        return BinaryScalarType::float64;
+    }
+    throw std::runtime_error("unsupported binary scalar type");
+}
+
+[[nodiscard]] std::uint32_t model_kind_code(BinaryModelKind kind) {
+    switch (kind) {
+    case BinaryModelKind::training:
+        return 1;
+    case BinaryModelKind::inference:
+        return 2;
+    case BinaryModelKind::checkpoint:
+        return 3;
+    }
+    throw std::invalid_argument("unknown binary model kind");
+}
+
+[[nodiscard]] BinaryModelKind model_kind_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return BinaryModelKind::training;
+    case 2:
+        return BinaryModelKind::inference;
+    case 3:
+        return BinaryModelKind::checkpoint;
+    }
+    throw std::runtime_error("unsupported binary model kind");
+}
+
+[[nodiscard]] std::uint32_t activation_code(Activation activation) {
+    switch (activation) {
+    case Activation::linear:
+        return 1;
+    case Activation::relu:
+        return 2;
+    case Activation::sigmoid:
+        return 3;
+    case Activation::tanh:
+        return 4;
+    case Activation::softmax:
+        return 5;
+    }
+    throw std::invalid_argument("unknown activation");
+}
+
+[[nodiscard]] Activation activation_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return Activation::linear;
+    case 2:
+        return Activation::relu;
+    case 3:
+        return Activation::sigmoid;
+    case 4:
+        return Activation::tanh;
+    case 5:
+        return Activation::softmax;
+    }
+    throw std::runtime_error("unsupported activation code");
+}
+
+[[nodiscard]] std::uint32_t loss_code(Loss loss) {
+    switch (loss) {
+    case Loss::mean_squared_error:
+        return 1;
+    case Loss::mean_absolute_error:
+        return 2;
+    case Loss::huber:
+        return 3;
+    case Loss::relative_mean_squared_error:
+        return 4;
+    case Loss::log_cosh:
+        return 5;
+    case Loss::weighted_mean_squared_error:
+        return 6;
+    case Loss::binary_cross_entropy:
+        return 7;
+    case Loss::categorical_cross_entropy:
+        return 8;
+    case Loss::custom:
+        return 9;
+    }
+    throw std::invalid_argument("unknown loss");
+}
+
+[[nodiscard]] Loss loss_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return Loss::mean_squared_error;
+    case 2:
+        return Loss::mean_absolute_error;
+    case 3:
+        return Loss::huber;
+    case 4:
+        return Loss::relative_mean_squared_error;
+    case 5:
+        return Loss::log_cosh;
+    case 6:
+        return Loss::weighted_mean_squared_error;
+    case 7:
+        return Loss::binary_cross_entropy;
+    case 8:
+        return Loss::categorical_cross_entropy;
+    case 9:
+        return Loss::custom;
+    }
+    throw std::runtime_error("unsupported loss code");
+}
+
+[[nodiscard]] std::uint32_t optimizer_code(OptimizerType optimizer) {
+    switch (optimizer) {
+    case OptimizerType::sgd:
+        return 1;
+    case OptimizerType::adam:
+        return 2;
+    case OptimizerType::adamw:
+        return 3;
+    }
+    throw std::invalid_argument("unknown optimizer");
+}
+
+[[nodiscard]] OptimizerType optimizer_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return OptimizerType::sgd;
+    case 2:
+        return OptimizerType::adam;
+    case 3:
+        return OptimizerType::adamw;
+    }
+    throw std::runtime_error("unsupported optimizer code");
+}
+
+[[nodiscard]] std::uint32_t learning_rate_schedule_code(LearningRateSchedule schedule) {
+    switch (schedule) {
+    case LearningRateSchedule::constant:
+        return 1;
+    case LearningRateSchedule::step_decay:
+        return 2;
+    case LearningRateSchedule::exponential_decay:
+        return 3;
+    case LearningRateSchedule::cosine_annealing:
+        return 4;
+    case LearningRateSchedule::reduce_on_plateau:
+        return 5;
+    }
+    throw std::invalid_argument("unknown learning rate schedule");
+}
+
+[[nodiscard]] LearningRateSchedule learning_rate_schedule_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return LearningRateSchedule::constant;
+    case 2:
+        return LearningRateSchedule::step_decay;
+    case 3:
+        return LearningRateSchedule::exponential_decay;
+    case 4:
+        return LearningRateSchedule::cosine_annealing;
+    case 5:
+        return LearningRateSchedule::reduce_on_plateau;
+    }
+    throw std::runtime_error("unsupported learning rate schedule code");
+}
+
+[[nodiscard]] std::uint32_t normalization_mode_code(NormalizationMode mode) {
+    switch (mode) {
+    case NormalizationMode::none:
+        return 1;
+    case NormalizationMode::standard_score:
+        return 2;
+    case NormalizationMode::min_max:
+        return 3;
+    }
+    throw std::invalid_argument("unknown normalization mode");
+}
+
+[[nodiscard]] NormalizationMode normalization_mode_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return NormalizationMode::none;
+    case 2:
+        return NormalizationMode::standard_score;
+    case 3:
+        return NormalizationMode::min_max;
+    }
+    throw std::runtime_error("unsupported normalization mode code");
+}
+
+[[nodiscard]] std::uint32_t training_monitor_code(TrainingMonitor monitor) {
+    switch (monitor) {
+    case TrainingMonitor::automatic:
+        return 1;
+    case TrainingMonitor::training_loss:
+        return 2;
+    case TrainingMonitor::validation_loss:
+        return 3;
+    case TrainingMonitor::test_loss:
+        return 4;
+    }
+    throw std::invalid_argument("unknown training monitor");
+}
+
+[[nodiscard]] TrainingMonitor training_monitor_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return TrainingMonitor::automatic;
+    case 2:
+        return TrainingMonitor::training_loss;
+    case 3:
+        return TrainingMonitor::validation_loss;
+    case 4:
+        return TrainingMonitor::test_loss;
+    }
+    throw std::runtime_error("unsupported training monitor code");
+}
+
+[[nodiscard]] std::uint32_t training_monitor_mode_code(TrainingMonitorMode mode) {
+    switch (mode) {
+    case TrainingMonitorMode::minimize:
+        return 1;
+    case TrainingMonitorMode::maximize:
+        return 2;
+    }
+    throw std::invalid_argument("unknown training monitor mode");
+}
+
+[[nodiscard]] TrainingMonitorMode training_monitor_mode_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return TrainingMonitorMode::minimize;
+    case 2:
+        return TrainingMonitorMode::maximize;
+    }
+    throw std::runtime_error("unsupported training monitor mode code");
+}
+
+[[nodiscard]] std::uint32_t parallel_execution_code(ParallelExecution execution) {
+    switch (execution) {
+    case ParallelExecution::serial:
+        return 1;
+    case ParallelExecution::worker_threads:
+        return 2;
+    }
+    throw std::invalid_argument("unknown parallel execution");
+}
+
+[[nodiscard]] ParallelExecution parallel_execution_from_code(std::uint32_t code) {
+    switch (code) {
+    case 1:
+        return ParallelExecution::serial;
+    case 2:
+        return ParallelExecution::worker_threads;
+    }
+    throw std::runtime_error("unsupported parallel execution code");
+}
+
+[[nodiscard]] std::uint64_t current_unix_time() noexcept {
+    const std::time_t now = std::time(nullptr);
+    return now < static_cast<std::time_t>(0) ? 0 : static_cast<std::uint64_t>(now);
+}
+
+[[nodiscard]] std::size_t checked_size(std::uint64_t value, const std::string& name) {
+    require(value <= static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max()),
+            name + " is too large for this platform");
+    return static_cast<std::size_t>(value);
+}
+
+[[nodiscard]] std::uint32_t crc32(const unsigned char* data, std::size_t size) noexcept {
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < size; ++i) {
+        crc ^= static_cast<std::uint32_t>(data[i]);
+        for (int bit = 0; bit < 8; ++bit) {
+            const std::uint32_t mask = static_cast<std::uint32_t>(-(static_cast<int>(crc & 1u)));
+            crc = (crc >> 1u) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+struct BinaryWriter {
+    std::vector<unsigned char> bytes;
+
+    void write_u8(std::uint8_t value) {
+        bytes.push_back(value);
+    }
+
+    void write_bool(bool value) {
+        write_u8(value ? 1u : 0u);
+    }
+
+    void write_u32(std::uint32_t value) {
+        for (int shift = 0; shift < 32; shift += 8) {
+            bytes.push_back(static_cast<unsigned char>((value >> shift) & 0xFFu));
+        }
+    }
+
+    void write_u64(std::uint64_t value) {
+        for (int shift = 0; shift < 64; shift += 8) {
+            bytes.push_back(static_cast<unsigned char>((value >> shift) & 0xFFu));
+        }
+    }
+
+    void write_size(std::size_t value) {
+        write_u64(static_cast<std::uint64_t>(value));
+    }
+
+    void write_scalar(Scalar value) {
+        require_finite(value, "binary scalar");
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
+        static_assert(sizeof(Scalar) == sizeof(std::uint64_t), "double binary scalar size mismatch");
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        write_u64(bits);
+#else
+        static_assert(sizeof(Scalar) == sizeof(std::uint32_t), "float binary scalar size mismatch");
+        std::uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        write_u32(bits);
+#endif
+    }
+
+    void write_string(const std::string& value) {
+        write_size(value.size());
+        bytes.insert(bytes.end(), value.begin(), value.end());
+    }
+
+    void write_scalars(const Vector& values) {
+        write_size(values.size());
+        for (Scalar value : values) {
+            write_scalar(value);
+        }
+    }
+};
+
+struct BinaryReader {
+    const std::vector<unsigned char>* bytes{nullptr};
+    std::size_t cursor{0};
+
+    explicit BinaryReader(const std::vector<unsigned char>& data)
+        : bytes(&data) {}
+
+    void require_available(std::size_t count, const std::string& name) const {
+        require(bytes != nullptr, "binary reader is not initialized");
+        if (count > bytes->size() || cursor > bytes->size() - count) {
+            throw std::runtime_error("truncated binary model while reading " + name);
+        }
+    }
+
+    [[nodiscard]] std::uint8_t read_u8(const std::string& name) {
+        require_available(1, name);
+        return (*bytes)[cursor++];
+    }
+
+    [[nodiscard]] bool read_bool(const std::string& name) {
+        const std::uint8_t value = read_u8(name);
+        if (value > 1u) {
+            throw std::runtime_error("invalid binary boolean: " + name);
+        }
+        return value != 0u;
+    }
+
+    [[nodiscard]] std::uint32_t read_u32(const std::string& name) {
+        require_available(4, name);
+        std::uint32_t value = 0;
+        for (int shift = 0; shift < 32; shift += 8) {
+            value |= static_cast<std::uint32_t>((*bytes)[cursor++]) << shift;
+        }
+        return value;
+    }
+
+    [[nodiscard]] std::uint64_t read_u64(const std::string& name) {
+        require_available(8, name);
+        std::uint64_t value = 0;
+        for (int shift = 0; shift < 64; shift += 8) {
+            value |= static_cast<std::uint64_t>((*bytes)[cursor++]) << shift;
+        }
+        return value;
+    }
+
+    [[nodiscard]] std::size_t read_size(const std::string& name) {
+        return checked_size(read_u64(name), name);
+    }
+
+    [[nodiscard]] Scalar read_scalar(const std::string& name) {
+        Scalar value{};
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
+        static_assert(sizeof(Scalar) == sizeof(std::uint64_t), "double binary scalar size mismatch");
+        const std::uint64_t bits = read_u64(name);
+        std::memcpy(&value, &bits, sizeof(value));
+#else
+        static_assert(sizeof(Scalar) == sizeof(std::uint32_t), "float binary scalar size mismatch");
+        const std::uint32_t bits = read_u32(name);
+        std::memcpy(&value, &bits, sizeof(value));
+#endif
+        require_finite(value, name);
+        return value;
+    }
+
+    [[nodiscard]] std::string read_string(const std::string& name) {
+        const std::size_t size = read_size(name + "_size");
+        require_available(size, name);
+        std::string value;
+        value.assign(reinterpret_cast<const char*>(bytes->data() + cursor), size);
+        cursor += size;
+        return value;
+    }
+
+    [[nodiscard]] Vector read_scalars(const std::string& name) {
+        const std::size_t count = read_size(name + "_count");
+        Vector values(count);
+        for (Scalar& value : values) {
+            value = read_scalar(name);
+        }
+        return values;
+    }
+
+    [[nodiscard]] bool at_end() const noexcept {
+        return bytes != nullptr && cursor == bytes->size();
+    }
+};
+
+void write_binary_metadata(BinaryWriter& writer, BinaryMetadata metadata) {
+    if (metadata.created_unix_time == 0) {
+        metadata.created_unix_time = current_unix_time();
+    }
+    writer.write_u64(metadata.created_unix_time);
+    writer.write_string(metadata.description);
+    writer.write_size(metadata.entries.size());
+    for (const BinaryMetadataEntry& entry : metadata.entries) {
+        writer.write_string(entry.key);
+        writer.write_string(entry.value);
+    }
+}
+
+[[nodiscard]] BinaryMetadata read_binary_metadata(BinaryReader& reader) {
+    BinaryMetadata metadata;
+    metadata.created_unix_time = reader.read_u64("created_unix_time");
+    metadata.description = reader.read_string("metadata_description");
+    const std::size_t entry_count = reader.read_size("metadata_entry_count");
+    metadata.entries.reserve(entry_count);
+    for (std::size_t i = 0; i < entry_count; ++i) {
+        BinaryMetadataEntry entry;
+        entry.key = reader.read_string("metadata_key");
+        entry.value = reader.read_string("metadata_value");
+        metadata.entries.push_back(std::move(entry));
+    }
+    return metadata;
+}
+
+void write_binary_training_options(BinaryWriter& writer, const TrainingOptions& options) {
+    writer.write_size(options.epochs);
+    writer.write_size(options.batch_size);
+    writer.write_bool(options.shuffle);
+    writer.write_u64(options.seed);
+    writer.write_scalar(options.validation_split);
+    writer.write_scalar(options.test_split);
+    writer.write_size(options.streaming_shuffle_buffer_size);
+    writer.write_size(options.early_stopping_patience);
+    writer.write_scalar(options.min_delta);
+    writer.write_u32(training_monitor_code(options.early_stopping_monitor));
+    writer.write_u32(training_monitor_mode_code(options.early_stopping_mode));
+    writer.write_size(options.early_stopping_cooldown);
+    writer.write_u32(learning_rate_schedule_code(options.learning_rate_schedule.type));
+    writer.write_scalar(options.learning_rate_schedule.base_learning_rate);
+    writer.write_scalar(options.learning_rate_schedule.minimum_learning_rate);
+    writer.write_size(options.learning_rate_schedule.warmup_epochs);
+    writer.write_scalar(options.learning_rate_schedule.warmup_start_learning_rate);
+    writer.write_size(options.learning_rate_schedule.step_size);
+    writer.write_scalar(options.learning_rate_schedule.step_decay_factor);
+    writer.write_scalar(options.learning_rate_schedule.exponential_decay_rate);
+    writer.write_size(options.learning_rate_schedule.cosine_epochs);
+    writer.write_u32(training_monitor_code(options.learning_rate_schedule.reduce_on_plateau_monitor));
+    writer.write_u32(training_monitor_mode_code(options.learning_rate_schedule.reduce_on_plateau_mode));
+    writer.write_size(options.learning_rate_schedule.reduce_on_plateau_patience);
+    writer.write_scalar(options.learning_rate_schedule.reduce_on_plateau_factor);
+    writer.write_scalar(options.learning_rate_schedule.reduce_on_plateau_min_delta);
+    writer.write_size(options.learning_rate_schedule.reduce_on_plateau_cooldown);
+    writer.write_scalar(options.gradient_noise_stddev);
+    writer.write_u32(parallel_execution_code(options.parallelism.execution));
+    writer.write_size(options.parallelism.thread_count);
+    writer.write_size(options.parallelism.minimum_parallel_samples);
+    writer.write_bool(options.restore_best_weights);
+    writer.write_string(options.best_checkpoint_path.string());
+    writer.write_string(options.latest_checkpoint_path.string());
+}
+
+[[nodiscard]] TrainingOptions read_binary_training_options(BinaryReader& reader) {
+    TrainingOptions options;
+    options.epochs = reader.read_size("training_epochs");
+    options.batch_size = reader.read_size("training_batch_size");
+    options.shuffle = reader.read_bool("training_shuffle");
+    options.seed = reader.read_u64("training_seed");
+    options.validation_split = reader.read_scalar("training_validation_split");
+    options.test_split = reader.read_scalar("training_test_split");
+    options.streaming_shuffle_buffer_size = reader.read_size("training_streaming_shuffle_buffer_size");
+    options.early_stopping_patience = reader.read_size("training_early_stopping_patience");
+    options.min_delta = reader.read_scalar("training_min_delta");
+    options.early_stopping_monitor = training_monitor_from_code(reader.read_u32("training_monitor"));
+    options.early_stopping_mode = training_monitor_mode_from_code(reader.read_u32("training_monitor_mode"));
+    options.early_stopping_cooldown = reader.read_size("training_early_stopping_cooldown");
+    options.learning_rate_schedule.type =
+        learning_rate_schedule_from_code(reader.read_u32("learning_rate_schedule"));
+    options.learning_rate_schedule.base_learning_rate = reader.read_scalar("base_learning_rate");
+    options.learning_rate_schedule.minimum_learning_rate = reader.read_scalar("minimum_learning_rate");
+    options.learning_rate_schedule.warmup_epochs = reader.read_size("warmup_epochs");
+    options.learning_rate_schedule.warmup_start_learning_rate =
+        reader.read_scalar("warmup_start_learning_rate");
+    options.learning_rate_schedule.step_size = reader.read_size("step_size");
+    options.learning_rate_schedule.step_decay_factor = reader.read_scalar("step_decay_factor");
+    options.learning_rate_schedule.exponential_decay_rate = reader.read_scalar("exponential_decay_rate");
+    options.learning_rate_schedule.cosine_epochs = reader.read_size("cosine_epochs");
+    options.learning_rate_schedule.reduce_on_plateau_monitor =
+        training_monitor_from_code(reader.read_u32("reduce_on_plateau_monitor"));
+    options.learning_rate_schedule.reduce_on_plateau_mode =
+        training_monitor_mode_from_code(reader.read_u32("reduce_on_plateau_mode"));
+    options.learning_rate_schedule.reduce_on_plateau_patience =
+        reader.read_size("reduce_on_plateau_patience");
+    options.learning_rate_schedule.reduce_on_plateau_factor =
+        reader.read_scalar("reduce_on_plateau_factor");
+    options.learning_rate_schedule.reduce_on_plateau_min_delta =
+        reader.read_scalar("reduce_on_plateau_min_delta");
+    options.learning_rate_schedule.reduce_on_plateau_cooldown =
+        reader.read_size("reduce_on_plateau_cooldown");
+    options.gradient_noise_stddev = reader.read_scalar("gradient_noise_stddev");
+    options.parallelism.execution =
+        parallel_execution_from_code(reader.read_u32("parallel_execution"));
+    options.parallelism.thread_count = reader.read_size("parallel_thread_count");
+    options.parallelism.minimum_parallel_samples = reader.read_size("parallel_minimum_samples");
+    options.restore_best_weights = reader.read_bool("training_restore_best_weights");
+    options.best_checkpoint_path = reader.read_string("training_best_checkpoint_path");
+    options.latest_checkpoint_path = reader.read_string("training_latest_checkpoint_path");
+    validate_training_options(options);
+    return options;
+}
+
+void write_binary_learning_rate_scheduler_state(BinaryWriter& writer,
+                                                const LearningRateSchedulerState& state) {
+    writer.write_bool(state.initialized);
+    writer.write_scalar(state.base_learning_rate);
+    writer.write_scalar(state.current_learning_rate);
+    writer.write_bool(state.has_best_metric);
+    if (state.has_best_metric) {
+        writer.write_scalar(state.best_metric);
+    }
+    writer.write_size(state.stale_epochs);
+    writer.write_size(state.cooldown_remaining);
+}
+
+[[nodiscard]] LearningRateSchedulerState read_binary_learning_rate_scheduler_state(BinaryReader& reader) {
+    LearningRateSchedulerState state;
+    state.initialized = reader.read_bool("learning_rate_state_initialized");
+    state.base_learning_rate = reader.read_scalar("learning_rate_state_base");
+    state.current_learning_rate = reader.read_scalar("learning_rate_state_current");
+    state.has_best_metric = reader.read_bool("learning_rate_state_has_best_metric");
+    if (state.has_best_metric) {
+        state.best_metric = reader.read_scalar("learning_rate_state_best_metric");
+    }
+    state.stale_epochs = reader.read_size("learning_rate_state_stale_epochs");
+    state.cooldown_remaining = reader.read_size("learning_rate_state_cooldown_remaining");
+    require(state.base_learning_rate >= Scalar{0}, "learning_rate_state_base must be non-negative");
+    require(state.current_learning_rate >= Scalar{0}, "learning_rate_state_current must be non-negative");
+    return state;
+}
+
+void write_binary_optimizer(BinaryWriter& writer, const OptimizerConfig& optimizer) {
+    writer.write_u32(optimizer_code(optimizer.type));
+    writer.write_scalar(optimizer.learning_rate);
+    writer.write_scalar(optimizer.beta1);
+    writer.write_scalar(optimizer.beta2);
+    writer.write_scalar(optimizer.epsilon);
+    writer.write_scalar(optimizer.momentum);
+    writer.write_scalar(optimizer.l2);
+    writer.write_scalar(optimizer.l1);
+    writer.write_scalar(optimizer.decoupled_weight_decay);
+    writer.write_scalar(optimizer.max_norm);
+    writer.write_scalar(optimizer.gradient_clip_norm);
+    writer.write_scalar(optimizer.gradient_clip_value);
+    writer.write_scalar(optimizer.layer_gradient_clip_norm);
+}
+
+[[nodiscard]] OptimizerConfig read_binary_optimizer(BinaryReader& reader) {
+    OptimizerConfig optimizer;
+    optimizer.type = optimizer_from_code(reader.read_u32("optimizer"));
+    optimizer.learning_rate = reader.read_scalar("learning_rate");
+    optimizer.beta1 = reader.read_scalar("beta1");
+    optimizer.beta2 = reader.read_scalar("beta2");
+    optimizer.epsilon = reader.read_scalar("epsilon");
+    optimizer.momentum = reader.read_scalar("momentum");
+    optimizer.l2 = reader.read_scalar("l2");
+    optimizer.l1 = reader.read_scalar("l1");
+    optimizer.decoupled_weight_decay = reader.read_scalar("decoupled_weight_decay");
+    optimizer.max_norm = reader.read_scalar("max_norm");
+    optimizer.gradient_clip_norm = reader.read_scalar("gradient_clip_norm");
+    optimizer.gradient_clip_value = reader.read_scalar("gradient_clip_value");
+    optimizer.layer_gradient_clip_norm = reader.read_scalar("layer_gradient_clip_norm");
+    validate_optimizer(optimizer);
+    return optimizer;
+}
+
+void write_binary_loss_config(BinaryWriter& writer, const LossConfig& loss) {
+    if (loss.type == Loss::custom) {
+        throw std::runtime_error("custom loss cannot be serialized");
+    }
+    writer.write_u32(loss_code(loss.type));
+    writer.write_scalar(loss.huber_delta);
+    writer.write_scalar(loss.relative_epsilon);
+    writer.write_scalars(loss.weights);
+}
+
+[[nodiscard]] LossConfig read_binary_loss_config(BinaryReader& reader, std::size_t output_size) {
+    LossConfig loss;
+    loss.type = loss_from_code(reader.read_u32("loss"));
+    if (loss.type == Loss::custom) {
+        throw std::runtime_error("custom loss cannot be loaded from binary");
+    }
+    loss.huber_delta = reader.read_scalar("huber_delta");
+    loss.relative_epsilon = reader.read_scalar("relative_epsilon");
+    loss.weights = reader.read_scalars("loss_weights");
+    validate_loss_config(loss, output_size);
+    return loss;
+}
+
+void write_binary_normalization_feature(BinaryWriter& writer, const FeatureNormalization& feature) {
+    writer.write_u32(normalization_mode_code(feature.mode));
+    writer.write_scalar(feature.mean);
+    writer.write_scalar(feature.stddev);
+    writer.write_scalar(feature.minimum);
+    writer.write_scalar(feature.maximum);
+    writer.write_scalar(feature.normalized_min);
+    writer.write_scalar(feature.normalized_max);
+    writer.write_bool(feature.clamp);
+    writer.write_scalar(feature.clamp_min);
+    writer.write_scalar(feature.clamp_max);
+}
+
+[[nodiscard]] FeatureNormalization read_binary_normalization_feature(BinaryReader& reader) {
+    FeatureNormalization feature;
+    feature.mode = normalization_mode_from_code(reader.read_u32("normalization_mode"));
+    feature.mean = reader.read_scalar("normalization_mean");
+    feature.stddev = reader.read_scalar("normalization_stddev");
+    feature.minimum = reader.read_scalar("normalization_minimum");
+    feature.maximum = reader.read_scalar("normalization_maximum");
+    feature.normalized_min = reader.read_scalar("normalization_normalized_min");
+    feature.normalized_max = reader.read_scalar("normalization_normalized_max");
+    feature.clamp = reader.read_bool("normalization_clamp");
+    feature.clamp_min = reader.read_scalar("normalization_clamp_min");
+    feature.clamp_max = reader.read_scalar("normalization_clamp_max");
+    validate_feature_normalization(feature);
+    return feature;
+}
+
+void write_binary_normalization_features(BinaryWriter& writer, const std::vector<FeatureNormalization>& features) {
+    writer.write_size(features.size());
+    for (const FeatureNormalization& feature : features) {
+        write_binary_normalization_feature(writer, feature);
+    }
+}
+
+[[nodiscard]] std::vector<FeatureNormalization> read_binary_normalization_features(BinaryReader& reader,
+                                                                                   const std::string& name) {
+    const std::size_t count = reader.read_size(name + "_count");
+    std::vector<FeatureNormalization> features;
+    features.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        features.push_back(read_binary_normalization_feature(reader));
+    }
+    return features;
+}
+
+void write_binary_normalization(BinaryWriter& writer, const NormalizationSpec& normalization) {
+    write_binary_normalization_features(writer, normalization.input_features);
+    write_binary_normalization_features(writer, normalization.output_features);
+}
+
+[[nodiscard]] NormalizationSpec read_binary_normalization(BinaryReader& reader,
+                                                          std::size_t input_size,
+                                                          std::size_t output_size) {
+    NormalizationSpec normalization;
+    normalization.input_features = read_binary_normalization_features(reader, "input_normalization");
+    normalization.output_features = read_binary_normalization_features(reader, "output_normalization");
+    validate_normalization_spec(normalization, input_size, output_size);
+    return normalization;
+}
+
+void write_binary_layer(BinaryWriter& writer, const LayerParameters& layer) {
+    writer.write_size(layer.input_size);
+    writer.write_size(layer.output_size);
+    writer.write_u32(activation_code(layer.activation));
+    writer.write_scalar(layer.dropout_probability);
+    writer.write_scalars(layer.weights);
+    writer.write_scalars(layer.biases);
+}
+
+[[nodiscard]] LayerParameters read_binary_layer(BinaryReader& reader, std::size_t expected_input_size) {
+    LayerParameters layer;
+    layer.input_size = reader.read_size("layer_input_size");
+    layer.output_size = reader.read_size("layer_output_size");
+    layer.activation = activation_from_code(reader.read_u32("layer_activation"));
+    layer.dropout_probability = reader.read_scalar("layer_dropout_probability");
+    require(layer.input_size == expected_input_size, "binary topology is inconsistent");
+    layer.weights = reader.read_scalars("weights");
+    layer.biases = reader.read_scalars("biases");
+    require(layer.weights.size() == layer.input_size * layer.output_size,
+            "binary weight count does not match layer dimensions");
+    require(layer.biases.size() == layer.output_size, "binary bias count does not match layer dimensions");
+    return layer;
+}
+
+struct LayerTrainingState {
+    Vector grad_weights;
+    Vector grad_biases;
+    Vector velocity_weights;
+    Vector velocity_biases;
+    Vector first_moment_weights;
+    Vector first_moment_biases;
+    Vector second_moment_weights;
+    Vector second_moment_biases;
+};
+
+void validate_layer_training_state(const LayerTrainingState& state, const LayerParameters& layer) {
+    const std::size_t weight_count = layer.input_size * layer.output_size;
+    const std::size_t bias_count = layer.output_size;
+    require(state.grad_weights.size() == weight_count, "checkpoint grad weight count mismatch");
+    require(state.velocity_weights.size() == weight_count, "checkpoint velocity weight count mismatch");
+    require(state.first_moment_weights.size() == weight_count, "checkpoint first moment weight count mismatch");
+    require(state.second_moment_weights.size() == weight_count, "checkpoint second moment weight count mismatch");
+    require(state.grad_biases.size() == bias_count, "checkpoint grad bias count mismatch");
+    require(state.velocity_biases.size() == bias_count, "checkpoint velocity bias count mismatch");
+    require(state.first_moment_biases.size() == bias_count, "checkpoint first moment bias count mismatch");
+    require(state.second_moment_biases.size() == bias_count, "checkpoint second moment bias count mismatch");
+}
+
+void write_binary_layer_training_state(BinaryWriter& writer, const LayerTrainingState& state) {
+    writer.write_scalars(state.grad_weights);
+    writer.write_scalars(state.grad_biases);
+    writer.write_scalars(state.velocity_weights);
+    writer.write_scalars(state.velocity_biases);
+    writer.write_scalars(state.first_moment_weights);
+    writer.write_scalars(state.first_moment_biases);
+    writer.write_scalars(state.second_moment_weights);
+    writer.write_scalars(state.second_moment_biases);
+}
+
+[[nodiscard]] LayerTrainingState read_binary_layer_training_state(BinaryReader& reader,
+                                                                  const LayerParameters& layer) {
+    LayerTrainingState state;
+    state.grad_weights = reader.read_scalars("grad_weights");
+    state.grad_biases = reader.read_scalars("grad_biases");
+    state.velocity_weights = reader.read_scalars("velocity_weights");
+    state.velocity_biases = reader.read_scalars("velocity_biases");
+    state.first_moment_weights = reader.read_scalars("first_moment_weights");
+    state.first_moment_biases = reader.read_scalars("first_moment_biases");
+    state.second_moment_weights = reader.read_scalars("second_moment_weights");
+    state.second_moment_biases = reader.read_scalars("second_moment_biases");
+    validate_layer_training_state(state, layer);
+    return state;
+}
+
+[[nodiscard]] std::vector<unsigned char> read_binary_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("failed to open binary model file for reading: " + path.string());
+    }
+    input.seekg(0, std::ios::end);
+    const std::streamoff size = input.tellg();
+    if (size < 0) {
+        throw std::runtime_error("failed to read binary model file size: " + path.string());
+    }
+    input.seekg(0, std::ios::beg);
+
+    std::vector<unsigned char> bytes(static_cast<std::size_t>(size));
+    if (!bytes.empty()) {
+        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    if (!input && !bytes.empty()) {
+        throw std::runtime_error("failed while reading binary model file: " + path.string());
+    }
+    return bytes;
+}
+
+void write_binary_file(const std::filesystem::path& path, const std::vector<unsigned char>& bytes) {
+    std::ofstream output(path, std::ios::binary);
+    if (!output) {
+        throw std::runtime_error("failed to open binary model file for writing: " + path.string());
+    }
+    if (!bytes.empty()) {
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    if (!output) {
+        throw std::runtime_error("failed while writing binary model file: " + path.string());
+    }
+}
+
+struct BinaryEnvelope {
+    std::uint32_t version{0};
+    BinaryScalarType scalar_type{BinaryScalarType::float32};
+    BinaryModelKind kind{BinaryModelKind::training};
+    std::vector<unsigned char> payload;
+    std::uint32_t checksum{0};
+};
+
+[[nodiscard]] std::vector<unsigned char> build_binary_envelope(BinaryModelKind kind,
+                                                               const std::vector<unsigned char>& payload) {
+    BinaryWriter writer;
+    writer.bytes.insert(writer.bytes.end(), kBinaryMagic, kBinaryMagic + 8);
+    writer.write_u32(kBinaryVersion);
+    writer.write_u32(scalar_type_code(current_binary_scalar_type()));
+    writer.write_u32(model_kind_code(kind));
+    writer.write_size(payload.size());
+    writer.bytes.insert(writer.bytes.end(), payload.begin(), payload.end());
+
+    const std::uint32_t checksum = crc32(writer.bytes.data(), writer.bytes.size());
+    writer.write_u32(checksum);
+    return writer.bytes;
+}
+
+[[nodiscard]] BinaryEnvelope parse_binary_envelope(const std::vector<unsigned char>& bytes) {
+    constexpr std::size_t header_size = 8 + 4 + 4 + 4 + 8;
+    constexpr std::size_t checksum_size = 4;
+    if (bytes.size() < header_size + checksum_size) {
+        throw std::runtime_error("binary model file is too small");
+    }
+
+    for (std::size_t i = 0; i < 8; ++i) {
+        if (bytes[i] != kBinaryMagic[i]) {
+            throw std::runtime_error("unsupported binary model magic");
+        }
+    }
+
+    std::vector<unsigned char> header_and_payload(bytes.begin(), bytes.end() - checksum_size);
+    BinaryReader file_reader(bytes);
+    file_reader.cursor = 8;
+
+    BinaryEnvelope envelope;
+    envelope.version = file_reader.read_u32("binary_version");
+    if (envelope.version != kBinaryVersion) {
+        throw std::runtime_error("unsupported binary model version");
+    }
+    envelope.scalar_type = scalar_type_from_code(file_reader.read_u32("binary_scalar_type"));
+    if (envelope.scalar_type != current_binary_scalar_type()) {
+        throw std::runtime_error("binary model scalar type does not match this build");
+    }
+    envelope.kind = model_kind_from_code(file_reader.read_u32("binary_model_kind"));
+    const std::size_t payload_size = file_reader.read_size("binary_payload_size");
+    if (payload_size != bytes.size() - header_size - checksum_size) {
+        throw std::runtime_error("binary model payload size mismatch");
+    }
+
+    envelope.payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(header_size),
+                            bytes.end() - static_cast<std::ptrdiff_t>(checksum_size));
+
+    BinaryReader checksum_reader(bytes);
+    checksum_reader.cursor = bytes.size() - checksum_size;
+    envelope.checksum = checksum_reader.read_u32("binary_checksum");
+    const std::uint32_t actual_checksum = crc32(header_and_payload.data(), header_and_payload.size());
+    if (envelope.checksum != actual_checksum) {
+        throw std::runtime_error("binary model checksum mismatch");
+    }
+    return envelope;
+}
+
+struct ParsedBinaryModel {
+    BinaryModelInfo info;
+    LossConfig loss{};
+    OptimizerConfig optimizer{OptimizerConfig::adam()};
+    NormalizationSpec normalization{};
+    std::uint64_t optimizer_step{0};
+    std::vector<LayerParameters> parameters;
+    std::vector<LayerTrainingState> training_states;
+};
+
+void finalize_binary_info(ParsedBinaryModel& parsed) {
+    parsed.info.layer_count = parsed.parameters.size();
+    parsed.info.output_size = parsed.parameters.empty() ? 0 : parsed.parameters.back().output_size;
+    parsed.info.optimizer_step = parsed.optimizer_step;
+    parsed.info.weight_count = 0;
+    parsed.info.bias_count = 0;
+    for (const LayerParameters& layer : parsed.parameters) {
+        parsed.info.weight_count += layer.weights.size();
+        parsed.info.bias_count += layer.biases.size();
+    }
+}
+
+[[nodiscard]] ParsedBinaryModel parse_binary_payload(const BinaryEnvelope& envelope) {
+    BinaryReader reader(envelope.payload);
+    ParsedBinaryModel parsed;
+    parsed.info.version = envelope.version;
+    parsed.info.scalar_type = envelope.scalar_type;
+    parsed.info.model_kind = envelope.kind;
+    parsed.info.checksum = envelope.checksum;
+    parsed.info.metadata = read_binary_metadata(reader);
+    parsed.info.input_size = reader.read_size("input_size");
+
+    if (envelope.kind == BinaryModelKind::training) {
+        const std::size_t declared_output_size = reader.read_size("declared_output_size");
+        parsed.loss = read_binary_loss_config(reader, declared_output_size);
+        parsed.optimizer = read_binary_optimizer(reader);
+        parsed.info.seed = reader.read_u64("seed");
+        parsed.optimizer_step = reader.read_u64("optimizer_step");
+        parsed.info.has_training_options = reader.read_bool("has_training_options");
+        if (parsed.info.has_training_options) {
+            parsed.info.training_options = read_binary_training_options(reader);
+        }
+        parsed.normalization = read_binary_normalization(reader, parsed.info.input_size, declared_output_size);
+
+        const std::size_t layer_count = reader.read_size("layer_count");
+        parsed.parameters.reserve(layer_count);
+        std::size_t expected_input_size = parsed.info.input_size;
+        for (std::size_t i = 0; i < layer_count; ++i) {
+            LayerParameters layer = read_binary_layer(reader, expected_input_size);
+            expected_input_size = layer.output_size;
+            parsed.parameters.push_back(std::move(layer));
+        }
+        require(!parsed.parameters.empty(), "binary training model has no layers");
+        require(parsed.parameters.back().output_size == declared_output_size,
+                "binary training output size does not match topology");
+        validate_loss_config(parsed.loss, declared_output_size);
+        validate_normalization_for_loss(parsed.normalization, parsed.loss);
+    } else if (envelope.kind == BinaryModelKind::inference) {
+        const std::size_t declared_output_size = reader.read_size("declared_output_size");
+        parsed.info.seed = reader.read_u64("seed");
+        parsed.info.has_training_options = reader.read_bool("has_training_options");
+        if (parsed.info.has_training_options) {
+            parsed.info.training_options = read_binary_training_options(reader);
+        }
+        parsed.normalization = read_binary_normalization(reader, parsed.info.input_size, declared_output_size);
+
+        const std::size_t layer_count = reader.read_size("layer_count");
+        parsed.parameters.reserve(layer_count);
+        std::size_t expected_input_size = parsed.info.input_size;
+        for (std::size_t i = 0; i < layer_count; ++i) {
+            LayerParameters layer = read_binary_layer(reader, expected_input_size);
+            expected_input_size = layer.output_size;
+            parsed.parameters.push_back(std::move(layer));
+        }
+        require(!parsed.parameters.empty(), "binary inference model has no layers");
+        require(parsed.parameters.back().output_size == declared_output_size,
+                "binary inference output size does not match topology");
+    } else if (envelope.kind == BinaryModelKind::checkpoint) {
+        const std::size_t declared_output_size = reader.read_size("declared_output_size");
+        parsed.loss = read_binary_loss_config(reader, declared_output_size);
+        parsed.optimizer = read_binary_optimizer(reader);
+        parsed.info.seed = reader.read_u64("seed");
+        parsed.optimizer_step = reader.read_u64("optimizer_step");
+        parsed.info.completed_epochs = reader.read_size("completed_epochs");
+        parsed.info.checkpoint_best = reader.read_bool("checkpoint_best");
+        parsed.info.has_checkpoint_metric = reader.read_bool("has_checkpoint_metric");
+        if (parsed.info.has_checkpoint_metric) {
+            parsed.info.checkpoint_metric = reader.read_scalar("checkpoint_metric");
+        }
+        parsed.info.has_learning_rate_state = reader.read_bool("has_learning_rate_state");
+        require(parsed.info.has_learning_rate_state, "checkpoint requires learning rate scheduler state");
+        parsed.info.learning_rate_state = read_binary_learning_rate_scheduler_state(reader);
+        parsed.info.has_training_options = reader.read_bool("has_training_options");
+        require(parsed.info.has_training_options, "checkpoint requires training options");
+        parsed.info.training_options = read_binary_training_options(reader);
+        parsed.normalization = read_binary_normalization(reader, parsed.info.input_size, declared_output_size);
+
+        const std::size_t layer_count = reader.read_size("layer_count");
+        parsed.parameters.reserve(layer_count);
+        parsed.training_states.reserve(layer_count);
+        std::size_t expected_input_size = parsed.info.input_size;
+        for (std::size_t i = 0; i < layer_count; ++i) {
+            LayerParameters layer = read_binary_layer(reader, expected_input_size);
+            expected_input_size = layer.output_size;
+            LayerTrainingState state = read_binary_layer_training_state(reader, layer);
+            parsed.parameters.push_back(std::move(layer));
+            parsed.training_states.push_back(std::move(state));
+        }
+        require(!parsed.parameters.empty(), "checkpoint has no layers");
+        require(parsed.parameters.back().output_size == declared_output_size,
+                "checkpoint output size does not match topology");
+        validate_loss_config(parsed.loss, declared_output_size);
+        validate_normalization_for_loss(parsed.normalization, parsed.loss);
+    }
+
+    if (!reader.at_end()) {
+        throw std::runtime_error("binary model payload has trailing bytes");
+    }
+    validate_layer_parameters(parsed.parameters);
+    finalize_binary_info(parsed);
+    return parsed;
+}
+
+[[nodiscard]] ParsedBinaryModel parse_binary_model_file(const std::filesystem::path& path) {
+    return parse_binary_payload(parse_binary_envelope(read_binary_file(path)));
+}
+
+void write_common_binary_model_payload(BinaryWriter& writer,
+                                       const BinaryMetadata& metadata,
+                                       std::size_t input_size,
+                                       std::size_t output_size,
+                                       std::uint64_t seed,
+                                       bool has_training_options,
+                                       const TrainingOptions& training_options,
+                                       const NormalizationSpec& normalization,
+                                       const std::vector<LayerParameters>& parameters) {
+    write_binary_metadata(writer, metadata);
+    writer.write_size(input_size);
+    writer.write_size(output_size);
+    writer.write_u64(seed);
+    writer.write_bool(has_training_options);
+    if (has_training_options) {
+        write_binary_training_options(writer, training_options);
+    }
+    write_binary_normalization(writer, normalization);
+    writer.write_size(parameters.size());
+    for (const LayerParameters& layer : parameters) {
+        write_binary_layer(writer, layer);
+    }
+}
+
 } // namespace
+
+BinaryModelInfo inspect_binary_model(const std::filesystem::path& path) {
+    return parse_binary_model_file(path).info;
+}
 
 std::string to_string(Activation activation) {
     switch (activation) {
@@ -961,6 +2436,8 @@ std::string to_string(OptimizerType optimizer) {
         return "sgd";
     case OptimizerType::adam:
         return "adam";
+    case OptimizerType::adamw:
+        return "adamw";
     }
 
     throw std::invalid_argument("unknown optimizer");
@@ -1002,6 +2479,98 @@ std::string to_string(InferenceStatus status) {
     }
 
     throw std::invalid_argument("unknown inference status");
+}
+
+std::string to_string(TrainingStopReason reason) {
+    switch (reason) {
+    case TrainingStopReason::completed_epochs:
+        return "completed_epochs";
+    case TrainingStopReason::early_stopping:
+        return "early_stopping";
+    case TrainingStopReason::non_finite_loss:
+        return "non_finite_loss";
+    case TrainingStopReason::non_finite_gradient:
+        return "non_finite_gradient";
+    case TrainingStopReason::non_finite_weights:
+        return "non_finite_weights";
+    }
+
+    throw std::invalid_argument("unknown training stop reason");
+}
+
+std::string to_string(TrainingMonitor monitor) {
+    switch (monitor) {
+    case TrainingMonitor::automatic:
+        return "automatic";
+    case TrainingMonitor::training_loss:
+        return "training_loss";
+    case TrainingMonitor::validation_loss:
+        return "validation_loss";
+    case TrainingMonitor::test_loss:
+        return "test_loss";
+    }
+
+    throw std::invalid_argument("unknown training monitor");
+}
+
+std::string to_string(TrainingMonitorMode mode) {
+    switch (mode) {
+    case TrainingMonitorMode::minimize:
+        return "minimize";
+    case TrainingMonitorMode::maximize:
+        return "maximize";
+    }
+
+    throw std::invalid_argument("unknown training monitor mode");
+}
+
+std::string to_string(LearningRateSchedule schedule) {
+    switch (schedule) {
+    case LearningRateSchedule::constant:
+        return "constant";
+    case LearningRateSchedule::step_decay:
+        return "step_decay";
+    case LearningRateSchedule::exponential_decay:
+        return "exponential_decay";
+    case LearningRateSchedule::cosine_annealing:
+        return "cosine_annealing";
+    case LearningRateSchedule::reduce_on_plateau:
+        return "reduce_on_plateau";
+    }
+
+    throw std::invalid_argument("unknown learning rate schedule");
+}
+
+std::string to_string(WeightInitialization initialization) {
+    switch (initialization) {
+    case WeightInitialization::automatic:
+        return "automatic";
+    case WeightInitialization::he_normal:
+        return "he_normal";
+    case WeightInitialization::he_uniform:
+        return "he_uniform";
+    case WeightInitialization::xavier_normal:
+        return "xavier_normal";
+    case WeightInitialization::xavier_uniform:
+        return "xavier_uniform";
+    case WeightInitialization::lecun_normal:
+        return "lecun_normal";
+    case WeightInitialization::lecun_uniform:
+        return "lecun_uniform";
+    }
+
+    throw std::invalid_argument("unknown weight initialization");
+}
+
+std::string to_string(ParallelExecution execution) {
+    switch (execution) {
+    case ParallelExecution::serial:
+        return "serial";
+    case ParallelExecution::worker_threads:
+        return "worker_threads";
+    }
+
+    throw std::invalid_argument("unknown parallel execution");
 }
 
 Activation activation_from_string(std::string_view value) {
@@ -1108,6 +2677,9 @@ OptimizerType optimizer_type_from_string(std::string_view value) {
     if (value == "adam") {
         return OptimizerType::adam;
     }
+    if (value == "adamw") {
+        return OptimizerType::adamw;
+    }
     throw std::invalid_argument("unknown optimizer: " + std::string(value));
 }
 
@@ -1122,6 +2694,16 @@ NormalizationMode normalization_mode_from_string(std::string_view value) {
         return NormalizationMode::min_max;
     }
     throw std::invalid_argument("unknown normalization mode: " + std::string(value));
+}
+
+ParallelExecution parallel_execution_from_string(std::string_view value) {
+    if (value == "serial") {
+        return ParallelExecution::serial;
+    }
+    if (value == "worker_threads") {
+        return ParallelExecution::worker_threads;
+    }
+    throw std::invalid_argument("unknown parallel execution: " + std::string(value));
 }
 
 LossConfig LossConfig::from_loss(Loss loss) {
@@ -1887,11 +3469,106 @@ OptimizerConfig OptimizerConfig::adam(Scalar learning_rate) {
     return config;
 }
 
+OptimizerConfig OptimizerConfig::adamw(Scalar learning_rate, Scalar weight_decay) {
+    OptimizerConfig config;
+    config.type = OptimizerType::adamw;
+    config.learning_rate = learning_rate;
+    config.decoupled_weight_decay = weight_decay;
+    return config;
+}
+
 OptimizerConfig OptimizerConfig::sgd(Scalar learning_rate, Scalar momentum) {
     OptimizerConfig config;
     config.type = OptimizerType::sgd;
     config.learning_rate = learning_rate;
     config.momentum = momentum;
+    return config;
+}
+
+LearningRateScheduleConfig LearningRateScheduleConfig::constant() {
+    return LearningRateScheduleConfig{};
+}
+
+LearningRateScheduleConfig LearningRateScheduleConfig::step_decay(std::size_t step_size,
+                                                                  Scalar decay_factor) {
+    LearningRateScheduleConfig config;
+    config.type = LearningRateSchedule::step_decay;
+    config.step_size = step_size;
+    config.step_decay_factor = decay_factor;
+    return config;
+}
+
+LearningRateScheduleConfig LearningRateScheduleConfig::exponential_decay(Scalar decay_rate) {
+    LearningRateScheduleConfig config;
+    config.type = LearningRateSchedule::exponential_decay;
+    config.exponential_decay_rate = decay_rate;
+    return config;
+}
+
+LearningRateScheduleConfig LearningRateScheduleConfig::cosine_annealing(std::size_t cosine_epochs,
+                                                                        Scalar minimum_learning_rate) {
+    LearningRateScheduleConfig config;
+    config.type = LearningRateSchedule::cosine_annealing;
+    config.cosine_epochs = cosine_epochs;
+    config.minimum_learning_rate = minimum_learning_rate;
+    return config;
+}
+
+LearningRateScheduleConfig LearningRateScheduleConfig::reduce_on_plateau(std::size_t patience,
+                                                                         Scalar factor) {
+    LearningRateScheduleConfig config;
+    config.type = LearningRateSchedule::reduce_on_plateau;
+    config.reduce_on_plateau_patience = patience;
+    config.reduce_on_plateau_factor = factor;
+    return config;
+}
+
+InitializationConfig InitializationConfig::automatic(Scalar bias) {
+    InitializationConfig config;
+    config.weights = WeightInitialization::automatic;
+    config.bias = bias;
+    return config;
+}
+
+InitializationConfig InitializationConfig::he_normal(Scalar bias) {
+    InitializationConfig config;
+    config.weights = WeightInitialization::he_normal;
+    config.bias = bias;
+    return config;
+}
+
+InitializationConfig InitializationConfig::he_uniform(Scalar bias) {
+    InitializationConfig config;
+    config.weights = WeightInitialization::he_uniform;
+    config.bias = bias;
+    return config;
+}
+
+InitializationConfig InitializationConfig::xavier_normal(Scalar bias) {
+    InitializationConfig config;
+    config.weights = WeightInitialization::xavier_normal;
+    config.bias = bias;
+    return config;
+}
+
+InitializationConfig InitializationConfig::xavier_uniform(Scalar bias) {
+    InitializationConfig config;
+    config.weights = WeightInitialization::xavier_uniform;
+    config.bias = bias;
+    return config;
+}
+
+InitializationConfig InitializationConfig::lecun_normal(Scalar bias) {
+    InitializationConfig config;
+    config.weights = WeightInitialization::lecun_normal;
+    config.bias = bias;
+    return config;
+}
+
+InitializationConfig InitializationConfig::lecun_uniform(Scalar bias) {
+    InitializationConfig config;
+    config.weights = WeightInitialization::lecun_uniform;
+    config.bias = bias;
     return config;
 }
 
@@ -2011,10 +3688,93 @@ struct InferenceModel::Impl {
     [[nodiscard]] std::size_t scratch_size() const noexcept {
         return input_scratch_size + (scratch_stride == 0 ? 0 : scratch_stride * 2);
     }
+
+    void predict_unchecked_to(const Scalar* input, Scalar* output, Scalar* scratch) const noexcept {
+        Scalar* scratch_cursor = scratch;
+        const Scalar* previous = input;
+        if (normalization.has_input_normalization()) {
+            for (std::size_t i = 0; i < input_size; ++i) {
+                scratch_cursor[i] = normalize_value(input[i], normalization.input_features[i]);
+            }
+            previous = scratch_cursor;
+            scratch_cursor += input_scratch_size;
+        }
+
+        Scalar* scratch_a = scratch_cursor;
+        Scalar* scratch_b = scratch ? scratch + scratch_stride : nullptr;
+        if (scratch_b && input_scratch_size > 0) {
+            scratch_b += input_scratch_size;
+        }
+        bool write_a = true;
+
+        for (std::size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+            const Layer& layer = layers[layer_index];
+            const bool output_layer = layer_index + 1 == layers.size();
+            Scalar* target = output_layer ? output : (write_a ? scratch_a : scratch_b);
+
+            for (std::size_t out = 0; out < layer.output_size; ++out) {
+                Scalar value = biases[layer.bias_offset + out];
+                const std::size_t weight_offset = layer.weight_offset + out * layer.input_size;
+                for (std::size_t in = 0; in < layer.input_size; ++in) {
+                    value += weights[weight_offset + in] * previous[in];
+                }
+                target[out] = value;
+            }
+
+            apply_activation_in_place(target, layer.output_size, layer.activation);
+            previous = target;
+            write_a = !write_a;
+        }
+
+        if (normalization.has_output_normalization()) {
+            for (std::size_t i = 0; i < output_size; ++i) {
+                output[i] = denormalize_value(output[i], normalization.output_features[i]);
+            }
+        }
+    }
+
+    void predict_batch_range_unchecked_to(const Scalar* inputs,
+                                          std::size_t sample_begin,
+                                          std::size_t sample_end,
+                                          std::size_t input_stride,
+                                          Scalar* outputs,
+                                          std::size_t output_stride,
+                                          Scalar* scratch) const noexcept {
+        for (std::size_t sample = sample_begin; sample < sample_end; ++sample) {
+            predict_unchecked_to(inputs + sample * input_stride,
+                                 outputs + sample * output_stride,
+                                 scratch);
+        }
+    }
+
+    void predict_batch_unchecked_to(const Scalar* inputs,
+                                    std::size_t sample_count,
+                                    std::size_t input_stride,
+                                    Scalar* outputs,
+                                    std::size_t output_stride,
+                                    Scalar* scratch) const noexcept {
+        predict_batch_range_unchecked_to(inputs, 0, sample_count, input_stride, outputs, output_stride, scratch);
+    }
 };
 
 InferenceModel::InferenceModel(std::unique_ptr<Impl> impl)
     : impl_(std::move(impl)) {}
+
+CompiledModel::CompiledModel(InferenceModel model)
+    : InferenceModel(std::move(model)) {}
+
+CompiledModel CompiledModel::from_parameters(const std::vector<LayerParameters>& parameters,
+                                             const NormalizationSpec& normalization) {
+    return CompiledModel(InferenceModel::from_parameters(parameters, normalization));
+}
+
+CompiledModel CompiledModel::load(const std::filesystem::path& path) {
+    return CompiledModel(InferenceModel::load(path));
+}
+
+CompiledModel CompiledModel::load_binary(const std::filesystem::path& path) {
+    return CompiledModel(InferenceModel::load_binary(path));
+}
 
 InferenceModel::InferenceModel(const InferenceModel& other)
     : impl_(other.impl_ ? std::make_unique<Impl>(*other.impl_) : nullptr) {}
@@ -2097,6 +3857,11 @@ std::size_t InferenceModel::scratch_size() const noexcept {
     return empty() ? 0 : impl_->scratch_size();
 }
 
+std::size_t InferenceModel::batch_scratch_size(std::size_t sample_count,
+                                               const ParallelOptions& parallelism) const noexcept {
+    return empty() ? 0 : required_batch_scratch_size(impl_->scratch_size(), sample_count, parallelism);
+}
+
 std::size_t InferenceModel::weight_count() const noexcept {
     return empty() ? 0 : impl_->weights.size();
 }
@@ -2142,48 +3907,7 @@ InferenceStatus InferenceModel::predict_to(const Scalar* input,
         return InferenceStatus::insufficient_scratch;
     }
 
-    Scalar* scratch_cursor = scratch;
-    const Scalar* previous = input;
-    if (impl_->normalization.has_input_normalization()) {
-        for (std::size_t i = 0; i < impl_->input_size; ++i) {
-            scratch_cursor[i] = normalize_value(input[i], impl_->normalization.input_features[i]);
-        }
-        previous = scratch_cursor;
-        scratch_cursor += impl_->input_scratch_size;
-    }
-
-    Scalar* scratch_a = scratch_cursor;
-    Scalar* scratch_b = scratch ? scratch + impl_->scratch_stride : nullptr;
-    if (scratch_b && impl_->input_scratch_size > 0) {
-        scratch_b += impl_->input_scratch_size;
-    }
-    bool write_a = true;
-
-    for (std::size_t layer_index = 0; layer_index < impl_->layers.size(); ++layer_index) {
-        const Impl::Layer& layer = impl_->layers[layer_index];
-        const bool output_layer = layer_index + 1 == impl_->layers.size();
-        Scalar* target = output_layer ? output : (write_a ? scratch_a : scratch_b);
-
-        for (std::size_t out = 0; out < layer.output_size; ++out) {
-            Scalar value = impl_->biases[layer.bias_offset + out];
-            const std::size_t weight_offset = layer.weight_offset + out * layer.input_size;
-            for (std::size_t in = 0; in < layer.input_size; ++in) {
-                value += impl_->weights[weight_offset + in] * previous[in];
-            }
-            target[out] = value;
-        }
-
-        apply_activation_in_place(target, layer.output_size, layer.activation);
-        previous = target;
-        write_a = !write_a;
-    }
-
-    if (impl_->normalization.has_output_normalization()) {
-        for (std::size_t i = 0; i < impl_->output_size; ++i) {
-            output[i] = denormalize_value(output[i], impl_->normalization.output_features[i]);
-        }
-    }
-
+    impl_->predict_unchecked_to(input, output, scratch);
     return InferenceStatus::ok;
 }
 
@@ -2230,19 +3954,128 @@ InferenceStatus InferenceModel::predict_batch_to(const Scalar* inputs,
         return InferenceStatus::insufficient_scratch;
     }
 
-    for (std::size_t sample = 0; sample < sample_count; ++sample) {
-        const InferenceStatus status = predict_to(inputs + sample * input_stride,
-                                                  impl_->input_size,
-                                                  outputs + sample * output_stride,
-                                                  impl_->output_size,
-                                                  scratch,
-                                                  provided_scratch_size);
-        if (status != InferenceStatus::ok) {
-            return status;
-        }
+    impl_->predict_batch_unchecked_to(inputs, sample_count, input_stride, outputs, output_stride, scratch);
+    return InferenceStatus::ok;
+}
+
+InferenceStatus InferenceModel::predict_batch_to(const Scalar* inputs,
+                                                 std::size_t sample_count,
+                                                 std::size_t input_stride,
+                                                 Scalar* outputs,
+                                                 std::size_t output_stride,
+                                                 Scalar* scratch,
+                                                 std::size_t provided_scratch_size,
+                                                 const ParallelOptions& parallelism) const noexcept {
+    if (empty()) {
+        return InferenceStatus::invalid_input_size;
+    }
+    if (sample_count == 0) {
+        return InferenceStatus::ok;
+    }
+    if (!inputs) {
+        return InferenceStatus::null_input;
+    }
+    if (!outputs) {
+        return InferenceStatus::null_output;
+    }
+    if (input_stride < impl_->input_size) {
+        return InferenceStatus::invalid_input_stride;
+    }
+    if (output_stride < impl_->output_size) {
+        return InferenceStatus::invalid_output_stride;
     }
 
+    const std::size_t worker_count = resolve_parallel_worker_count(parallelism, sample_count);
+    const std::size_t single_scratch_size = impl_->scratch_size();
+    const std::size_t required_scratch_size = required_batch_scratch_size(single_scratch_size,
+                                                                         sample_count,
+                                                                         parallelism);
+    if (required_scratch_size == std::numeric_limits<std::size_t>::max()) {
+        return InferenceStatus::insufficient_scratch;
+    }
+    if (required_scratch_size > 0 && !scratch) {
+        return InferenceStatus::null_scratch;
+    }
+    if (provided_scratch_size < required_scratch_size) {
+        return InferenceStatus::insufficient_scratch;
+    }
+
+    if (worker_count <= 1) {
+        impl_->predict_batch_unchecked_to(inputs, sample_count, input_stride, outputs, output_stride, scratch);
+        return InferenceStatus::ok;
+    }
+
+    std::vector<std::thread> workers;
+    try {
+        workers.reserve(worker_count - 1);
+        const std::size_t base_count = sample_count / worker_count;
+        const std::size_t remainder = sample_count % worker_count;
+        std::size_t begin = 0;
+        for (std::size_t worker_index = 0; worker_index < worker_count; ++worker_index) {
+            const std::size_t count = base_count + (worker_index < remainder ? 1 : 0);
+            const std::size_t end = begin + count;
+            Scalar* worker_scratch = single_scratch_size == 0
+                                         ? nullptr
+                                         : scratch + worker_index * single_scratch_size;
+            if (worker_index == 0) {
+                begin = end;
+                continue;
+            }
+            workers.emplace_back([impl = impl_.get(),
+                                  inputs,
+                                  begin,
+                                  end,
+                                  input_stride,
+                                  outputs,
+                                  output_stride,
+                                  worker_scratch] {
+                impl->predict_batch_range_unchecked_to(inputs,
+                                                       begin,
+                                                       end,
+                                                       input_stride,
+                                                       outputs,
+                                                       output_stride,
+                                                       worker_scratch);
+            });
+            begin = end;
+        }
+
+        const std::size_t first_end = base_count + (remainder > 0 ? 1 : 0);
+        impl_->predict_batch_range_unchecked_to(inputs,
+                                               0,
+                                               first_end,
+                                               input_stride,
+                                               outputs,
+                                               output_stride,
+                                               scratch);
+    } catch (...) {
+        join_workers_noexcept(workers);
+        impl_->predict_batch_unchecked_to(inputs, sample_count, input_stride, outputs, output_stride, scratch);
+        return InferenceStatus::ok;
+    }
+
+    join_workers_noexcept(workers);
     return InferenceStatus::ok;
+}
+
+void InferenceModel::predict_unchecked_to(const Scalar* input,
+                                          Scalar* output,
+                                          Scalar* scratch) const noexcept {
+    impl_->predict_unchecked_to(input, output, scratch);
+}
+
+void InferenceModel::predict_unchecked_to(const Scalar* input,
+                                          InferenceWorkspace& workspace) const noexcept {
+    predict_unchecked_to(input, workspace.output_data(), workspace.scratch_data());
+}
+
+void InferenceModel::predict_batch_unchecked_to(const Scalar* inputs,
+                                                std::size_t sample_count,
+                                                std::size_t input_stride,
+                                                Scalar* outputs,
+                                                std::size_t output_stride,
+                                                Scalar* scratch) const noexcept {
+    impl_->predict_batch_unchecked_to(inputs, sample_count, input_stride, outputs, output_stride, scratch);
 }
 
 Vector InferenceModel::predict(const Vector& input) const {
@@ -2384,6 +4217,23 @@ void InferenceModel::save(const std::filesystem::path& path) const {
     }
 }
 
+void InferenceModel::save_binary(const std::filesystem::path& path, const BinaryMetadata& metadata) const {
+    require(!empty(), "inference model is empty");
+
+    const std::vector<LayerParameters> model_parameters = parameters();
+    BinaryWriter payload;
+    write_common_binary_model_payload(payload,
+                                      metadata,
+                                      input_size(),
+                                      output_size(),
+                                      0,
+                                      false,
+                                      TrainingOptions{},
+                                      impl_->normalization,
+                                      model_parameters);
+    write_binary_file(path, build_binary_envelope(BinaryModelKind::inference, payload.bytes));
+}
+
 InferenceModel InferenceModel::load(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) {
@@ -2432,11 +4282,20 @@ InferenceModel InferenceModel::load(const std::filesystem::path& path) {
     return InferenceModel::from_parameters(parameters, normalization);
 }
 
+InferenceModel InferenceModel::load_binary(const std::filesystem::path& path) {
+    ParsedBinaryModel parsed = parse_binary_model_file(path);
+    if (parsed.info.model_kind != BinaryModelKind::inference) {
+        throw std::runtime_error("binary model is not an inference model");
+    }
+    return InferenceModel::from_parameters(parsed.parameters, parsed.normalization);
+}
+
 struct TrainingModel::Impl {
     struct Layer {
         std::size_t input_size{0};
         std::size_t output_size{0};
         Activation activation{Activation::linear};
+        Scalar dropout_probability{static_cast<Scalar>(0)};
         Vector weights;
         Vector biases;
         Vector grad_weights;
@@ -2455,6 +4314,12 @@ struct TrainingModel::Impl {
     NormalizationSpec normalization{};
     std::uint64_t seed{5489u};
     std::uint64_t optimizer_step{0};
+    bool has_last_training_options{false};
+    TrainingOptions last_training_options{};
+    LearningRateSchedulerState learning_rate_state{};
+    std::size_t completed_epochs{0};
+    bool has_resume_epoch{false};
+    std::size_t resume_epoch{0};
     std::vector<Layer> layers;
 
     [[nodiscard]] std::size_t output_size() const {
@@ -2517,6 +4382,61 @@ struct TrainingModel::Impl {
                                         std::vector<Vector>& activations,
                                         std::vector<Vector>& pre_activations) const {
         return forward_cached(input.data(), input.size(), activations, pre_activations);
+    }
+
+    [[nodiscard]] Vector forward_cached_training(const Scalar* input,
+                                                 std::size_t input_count,
+                                                 std::vector<Vector>& activations,
+                                                 std::vector<Vector>& pre_activations,
+                                                 std::vector<Vector>& dropout_masks,
+                                                 std::mt19937_64& rng) const {
+        require(input != nullptr, "input buffer must not be null");
+        require(input_count == input_size, "input has an invalid size");
+        activations.clear();
+        pre_activations.clear();
+        dropout_masks.clear();
+        activations.reserve(layers.size() + 1);
+        pre_activations.reserve(layers.size());
+        dropout_masks.reserve(layers.size());
+        activations.emplace_back(input, input + input_count);
+
+        for (std::size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+            const Layer& layer = layers[layer_index];
+            const Vector& previous = activations.back();
+            Vector z(layer.output_size, Scalar{0});
+            for (std::size_t out = 0; out < layer.output_size; ++out) {
+                Scalar value = layer.biases[out];
+                const std::size_t offset = out * layer.input_size;
+                for (std::size_t in = 0; in < layer.input_size; ++in) {
+                    value += layer.weights[offset + in] * previous[in];
+                }
+                z[out] = value;
+            }
+
+            Vector activation = apply_activation(z, layer.activation);
+            Vector dropout_mask(layer.output_size, Scalar{1});
+            const bool output_layer = layer_index + 1 == layers.size();
+            if (!output_layer && layer.dropout_probability > Scalar{0}) {
+                const Scalar keep_probability = Scalar{1} - layer.dropout_probability;
+                const Scalar scale = Scalar{1} / keep_probability;
+                std::bernoulli_distribution keep(static_cast<double>(keep_probability));
+                for (std::size_t i = 0; i < activation.size(); ++i) {
+                    if (keep(rng)) {
+                        dropout_mask[i] = scale;
+                        activation[i] *= scale;
+                    } else {
+                        dropout_mask[i] = Scalar{0};
+                        activation[i] = Scalar{0};
+                    }
+                }
+            }
+
+            pre_activations.push_back(std::move(z));
+            dropout_masks.push_back(std::move(dropout_mask));
+            activations.push_back(std::move(activation));
+        }
+
+        return activations.back();
     }
 
     [[nodiscard]] Scalar sample_loss(const Vector& prediction, const Vector& target) const {
@@ -2730,10 +4650,15 @@ struct TrainingModel::Impl {
     void accumulate_gradients(const Scalar* input,
                               std::size_t input_count,
                               const Scalar* target,
-                              std::size_t target_count) {
+                              std::size_t target_count,
+                              std::mt19937_64* rng = nullptr) {
         std::vector<Vector> activations;
         std::vector<Vector> pre_activations;
-        const Vector prediction = forward_cached(input, input_count, activations, pre_activations);
+        std::vector<Vector> dropout_masks;
+        const Vector prediction =
+            rng == nullptr
+                ? forward_cached(input, input_count, activations, pre_activations)
+                : forward_cached_training(input, input_count, activations, pre_activations, dropout_masks, *rng);
         Vector delta = output_delta(prediction, target, target_count, pre_activations.back());
 
         for (std::size_t layer_offset = layers.size(); layer_offset-- > 0;) {
@@ -2759,23 +4684,32 @@ struct TrainingModel::Impl {
                 for (std::size_t out = 0; out < layer.output_size; ++out) {
                     value += layer.weights[out * layer.input_size + in] * delta[out];
                 }
-                previous_delta[in] =
-                    value * activation_derivative(previous_layer.activation,
-                                                  pre_activations[layer_offset - 1][in],
-                                                  activations[layer_offset][in]);
+                if (rng != nullptr) {
+                    value *= dropout_masks[layer_offset - 1][in];
+                    previous_delta[in] =
+                        value * activation_derivative_from_pre_activation(
+                                    previous_layer.activation,
+                                    pre_activations[layer_offset - 1][in]);
+                } else {
+                    previous_delta[in] =
+                        value * activation_derivative(previous_layer.activation,
+                                                      pre_activations[layer_offset - 1][in],
+                                                      activations[layer_offset][in]);
+                }
             }
             delta = std::move(previous_delta);
         }
     }
 
-    void accumulate_batch_gradients(const MiniBatch& batch) {
+    void accumulate_batch_gradients(const MiniBatch& batch, std::mt19937_64* rng = nullptr) {
         require(batch.input_size == input_size, "mini-batch input width mismatch");
         require(batch.output_size == output_size(), "mini-batch output width mismatch");
         for (std::size_t sample = 0; sample < batch.size(); ++sample) {
             accumulate_gradients(batch.input_data(sample),
                                  batch.input_size,
                                  batch.target_data(sample),
-                                 batch.output_size);
+                                 batch.output_size,
+                                 rng);
         }
     }
 
@@ -2786,14 +4720,14 @@ struct TrainingModel::Impl {
         }
     }
 
-    void apply_gradients(std::size_t batch_size) {
-        ++optimizer_step;
+    [[nodiscard]] Scalar accumulated_gradient_norm(std::size_t batch_size) const {
         const Scalar batch_scale = Scalar{1} / static_cast<Scalar>(batch_size);
         Scalar norm_squared = Scalar{0};
-
         for (const Layer& layer : layers) {
             for (std::size_t i = 0; i < layer.weights.size(); ++i) {
-                const Scalar gradient = layer.grad_weights[i] * batch_scale + optimizer.l2 * layer.weights[i];
+                Scalar gradient = layer.grad_weights[i] * batch_scale;
+                gradient += optimizer.l2 * layer.weights[i];
+                gradient += optimizer.l1 * sign_or_zero(layer.weights[i]);
                 norm_squared += gradient * gradient;
             }
             for (Scalar gradient_value : layer.grad_biases) {
@@ -2802,34 +4736,143 @@ struct TrainingModel::Impl {
             }
         }
 
-        Scalar clip_scale = Scalar{1};
-        if (optimizer.gradient_clip_norm > Scalar{0}) {
-            const Scalar norm = static_cast<Scalar>(std::sqrt(norm_squared));
-            if (norm > optimizer.gradient_clip_norm) {
-                clip_scale = optimizer.gradient_clip_norm / (norm + std::numeric_limits<Scalar>::epsilon());
+        return static_cast<Scalar>(std::sqrt(norm_squared));
+    }
+
+    [[nodiscard]] Scalar layer_gradient_norm(const Layer& layer, Scalar batch_scale) const {
+        Scalar norm_squared = Scalar{0};
+        for (std::size_t i = 0; i < layer.weights.size(); ++i) {
+            Scalar gradient = layer.grad_weights[i] * batch_scale;
+            gradient += optimizer.l2 * layer.weights[i];
+            gradient += optimizer.l1 * sign_or_zero(layer.weights[i]);
+            norm_squared += gradient * gradient;
+        }
+        for (Scalar gradient_value : layer.grad_biases) {
+            const Scalar gradient = gradient_value * batch_scale;
+            norm_squared += gradient * gradient;
+        }
+        return static_cast<Scalar>(std::sqrt(norm_squared));
+    }
+
+    [[nodiscard]] WeightStatistics weight_statistics() const {
+        WeightStatistics statistics;
+        bool has_finite_weight = false;
+        Scalar total = Scalar{0};
+
+        for (const Layer& layer : layers) {
+            for (Scalar weight : layer.weights) {
+                ++statistics.count;
+                if (!is_finite(weight)) {
+                    statistics.finite = false;
+                    ++statistics.non_finite_count;
+                    continue;
+                }
+                if (!has_finite_weight) {
+                    statistics.minimum = weight;
+                    statistics.maximum = weight;
+                    has_finite_weight = true;
+                } else {
+                    statistics.minimum = std::min(statistics.minimum, weight);
+                    statistics.maximum = std::max(statistics.maximum, weight);
+                }
+                total += weight;
             }
         }
 
+        const std::size_t finite_count = statistics.count - statistics.non_finite_count;
+        if (finite_count > 0) {
+            statistics.mean = total / static_cast<Scalar>(finite_count);
+        }
+        return statistics;
+    }
+
+    [[nodiscard]] std::size_t non_finite_parameter_count() const {
+        std::size_t count = 0;
+        for (const Layer& layer : layers) {
+            for (Scalar weight : layer.weights) {
+                if (!is_finite(weight)) {
+                    ++count;
+                }
+            }
+            for (Scalar bias : layer.biases) {
+                if (!is_finite(bias)) {
+                    ++count;
+                }
+            }
+        }
+        return count;
+    }
+
+    struct GradientApplicationResult {
+        Scalar gradient_norm{static_cast<Scalar>(0)};
+        GradientClippingDiagnostics clipping{};
+    };
+
+    [[nodiscard]] GradientApplicationResult apply_gradients(std::size_t batch_size,
+                                                            Scalar gradient_noise_stddev = Scalar{0},
+                                                            std::mt19937_64* rng = nullptr) {
+        GradientApplicationResult result;
+        const Scalar gradient_norm = accumulated_gradient_norm(batch_size);
+        result.gradient_norm = gradient_norm;
+        if (!is_finite(gradient_norm)) {
+            zero_gradients();
+            return result;
+        }
+
+        ++optimizer_step;
+        const Scalar batch_scale = Scalar{1} / static_cast<Scalar>(batch_size);
+        result.clipping.batch_count = 1;
+        Scalar global_clip_scale = Scalar{1};
+        if (optimizer.gradient_clip_norm > Scalar{0}) {
+            if (gradient_norm > optimizer.gradient_clip_norm) {
+                global_clip_scale =
+                    optimizer.gradient_clip_norm / (gradient_norm + std::numeric_limits<Scalar>::epsilon());
+                result.clipping.global_clip_count = 1;
+            }
+        }
+        result.clipping.minimum_clip_scale = std::min(result.clipping.minimum_clip_scale, global_clip_scale);
+
         for (Layer& layer : layers) {
+            Scalar layer_clip_scale = Scalar{1};
+            if (optimizer.layer_gradient_clip_norm > Scalar{0}) {
+                const Scalar layer_norm = layer_gradient_norm(layer, batch_scale);
+                if (layer_norm > optimizer.layer_gradient_clip_norm) {
+                    layer_clip_scale =
+                        optimizer.layer_gradient_clip_norm / (layer_norm + std::numeric_limits<Scalar>::epsilon());
+                    ++result.clipping.layer_clip_count;
+                }
+            }
+            ++result.clipping.layer_count;
+            const Scalar norm_clip_scale = global_clip_scale * layer_clip_scale;
+            result.clipping.minimum_clip_scale = std::min(result.clipping.minimum_clip_scale, norm_clip_scale);
             apply_vector_gradients(layer.weights,
                                    layer.grad_weights,
                                    layer.velocity_weights,
                                    layer.first_moment_weights,
                                    layer.second_moment_weights,
                                    batch_scale,
-                                   clip_scale,
-                                   true);
+                                   norm_clip_scale,
+                                   true,
+                                   gradient_noise_stddev,
+                                   rng,
+                                   result.clipping);
             apply_vector_gradients(layer.biases,
                                    layer.grad_biases,
                                    layer.velocity_biases,
                                    layer.first_moment_biases,
                                    layer.second_moment_biases,
                                    batch_scale,
-                                   clip_scale,
-                                   false);
+                                   norm_clip_scale,
+                                   false,
+                                   gradient_noise_stddev,
+                                   rng,
+                                   result.clipping);
         }
 
+        finalize_gradient_clipping(result.clipping);
+        enforce_max_norm();
         zero_gradients();
+        return result;
     }
 
     void apply_vector_gradients(Vector& values,
@@ -2839,13 +4882,31 @@ struct TrainingModel::Impl {
                                 Vector& second_moments,
                                 Scalar batch_scale,
                                 Scalar clip_scale,
-                                bool regularize) {
+                                bool regularize,
+                                Scalar gradient_noise_stddev,
+                                std::mt19937_64* rng,
+                                GradientClippingDiagnostics& clipping) {
+        std::normal_distribution<Scalar> noise(Scalar{0}, gradient_noise_stddev);
         for (std::size_t i = 0; i < values.size(); ++i) {
             Scalar gradient = accumulated_gradients[i] * batch_scale;
             if (regularize) {
                 gradient += optimizer.l2 * values[i];
+                gradient += optimizer.l1 * sign_or_zero(values[i]);
+            }
+            if (gradient_noise_stddev > Scalar{0} && rng != nullptr) {
+                gradient += noise(*rng);
             }
             gradient *= clip_scale;
+            ++clipping.gradient_value_count;
+            if (optimizer.gradient_clip_value > Scalar{0}) {
+                if (gradient > optimizer.gradient_clip_value) {
+                    gradient = optimizer.gradient_clip_value;
+                    ++clipping.gradient_value_clip_count;
+                } else if (gradient < -optimizer.gradient_clip_value) {
+                    gradient = -optimizer.gradient_clip_value;
+                    ++clipping.gradient_value_clip_count;
+                }
+            }
 
             switch (optimizer.type) {
             case OptimizerType::sgd:
@@ -2856,7 +4917,12 @@ struct TrainingModel::Impl {
                     values[i] -= optimizer.learning_rate * gradient;
                 }
                 break;
-            case OptimizerType::adam: {
+            case OptimizerType::adam:
+            case OptimizerType::adamw: {
+                if (regularize && optimizer.type == OptimizerType::adamw &&
+                    optimizer.decoupled_weight_decay > Scalar{0}) {
+                    values[i] *= Scalar{1} - optimizer.learning_rate * optimizer.decoupled_weight_decay;
+                }
                 first_moments[i] = optimizer.beta1 * first_moments[i] + (Scalar{1} - optimizer.beta1) * gradient;
                 second_moments[i] =
                     optimizer.beta2 * second_moments[i] + (Scalar{1} - optimizer.beta2) * gradient * gradient;
@@ -2871,6 +4937,29 @@ struct TrainingModel::Impl {
                              (static_cast<Scalar>(std::sqrt(v_hat)) + optimizer.epsilon);
                 break;
             }
+            }
+        }
+    }
+
+    void enforce_max_norm() {
+        if (optimizer.max_norm <= Scalar{0}) {
+            return;
+        }
+        for (Layer& layer : layers) {
+            for (std::size_t out = 0; out < layer.output_size; ++out) {
+                const std::size_t offset = out * layer.input_size;
+                Scalar norm_squared = Scalar{0};
+                for (std::size_t in = 0; in < layer.input_size; ++in) {
+                    const Scalar weight = layer.weights[offset + in];
+                    norm_squared += weight * weight;
+                }
+                const Scalar norm = static_cast<Scalar>(std::sqrt(norm_squared));
+                if (norm > optimizer.max_norm && norm > Scalar{0}) {
+                    const Scalar scale = optimizer.max_norm / norm;
+                    for (std::size_t in = 0; in < layer.input_size; ++in) {
+                        layer.weights[offset + in] *= scale;
+                    }
+                }
             }
         }
     }
@@ -2982,6 +5071,25 @@ struct TrainingModel::Impl {
                 layer.activation,
                 layer.weights,
                 layer.biases,
+                layer.dropout_probability,
+            });
+        }
+        return result;
+    }
+
+    [[nodiscard]] std::vector<LayerTrainingState> training_states() const {
+        std::vector<LayerTrainingState> result;
+        result.reserve(layers.size());
+        for (const Layer& layer : layers) {
+            result.push_back(LayerTrainingState{
+                layer.grad_weights,
+                layer.grad_biases,
+                layer.velocity_weights,
+                layer.velocity_biases,
+                layer.first_moment_weights,
+                layer.first_moment_biases,
+                layer.second_moment_weights,
+                layer.second_moment_biases,
             });
         }
         return result;
@@ -2997,6 +5105,10 @@ struct TrainingModel::Impl {
             require(source.activation == layer.activation, "parameter activation mismatch");
             require(source.weights.size() == layer.weights.size(), "parameter weights size mismatch");
             require(source.biases.size() == layer.biases.size(), "parameter biases size mismatch");
+            validate_dropout_probability(source.dropout_probability, "parameter dropout_probability");
+            if (i + 1 == layers.size()) {
+                require(source.dropout_probability == Scalar{0}, "output layer dropout must be zero");
+            }
             for (Scalar value : source.weights) {
                 require_finite(value, "weight");
             }
@@ -3005,9 +5117,28 @@ struct TrainingModel::Impl {
             }
             layer.weights = source.weights;
             layer.biases = source.biases;
+            layer.dropout_probability = source.dropout_probability;
             reset_optimizer_state(layer);
         }
         optimizer_step = 0;
+    }
+
+    void set_training_states(const std::vector<LayerTrainingState>& states, std::uint64_t step) {
+        require(states.size() == layers.size(), "checkpoint optimizer state layer count mismatch");
+        const std::vector<LayerParameters> current_parameters = parameters();
+        for (std::size_t i = 0; i < layers.size(); ++i) {
+            validate_layer_training_state(states[i], current_parameters[i]);
+            Layer& layer = layers[i];
+            layer.grad_weights = states[i].grad_weights;
+            layer.grad_biases = states[i].grad_biases;
+            layer.velocity_weights = states[i].velocity_weights;
+            layer.velocity_biases = states[i].velocity_biases;
+            layer.first_moment_weights = states[i].first_moment_weights;
+            layer.first_moment_biases = states[i].first_moment_biases;
+            layer.second_moment_weights = states[i].second_moment_weights;
+            layer.second_moment_biases = states[i].second_moment_biases;
+        }
+        optimizer_step = step;
     }
 
     static void reset_optimizer_state(Layer& layer) {
@@ -3025,8 +5156,10 @@ TrainingModel::Builder& TrainingModel::Builder::input_size(std::size_t input_siz
     return *this;
 }
 
-TrainingModel::Builder& TrainingModel::Builder::add_layer(std::size_t neurons, Activation activation) {
-    layers_.push_back(LayerSpec{neurons, activation});
+TrainingModel::Builder& TrainingModel::Builder::add_layer(std::size_t neurons,
+                                                          Activation activation,
+                                                          Scalar dropout_probability) {
+    layers_.push_back(LayerSpec{neurons, activation, dropout_probability});
     return *this;
 }
 
@@ -3050,6 +5183,11 @@ TrainingModel::Builder& TrainingModel::Builder::normalization(NormalizationSpec 
     return *this;
 }
 
+TrainingModel::Builder& TrainingModel::Builder::initialization(InitializationConfig initialization_value) {
+    initialization_ = initialization_value;
+    return *this;
+}
+
 TrainingModel::Builder& TrainingModel::Builder::seed(std::uint64_t seed_value) {
     seed_ = seed_value;
     return *this;
@@ -3062,9 +5200,14 @@ TrainingModel TrainingModel::Builder::build() const {
     validate_loss_config(loss_, layers_.back().neurons);
     validate_normalization_spec(normalization_, input_size_, layers_.back().neurons);
     validate_normalization_for_loss(normalization_, loss_);
+    validate_initialization_config(initialization_);
 
     for (std::size_t i = 0; i < layers_.size(); ++i) {
         require(layers_[i].neurons > 0, "layer neurons must be positive");
+        validate_dropout_probability(layers_[i].dropout_probability, "layer dropout_probability");
+        if (i + 1 == layers_.size()) {
+            require(layers_[i].dropout_probability == Scalar{0}, "output layer dropout must be zero");
+        }
         if (layers_[i].activation == Activation::softmax) {
             require(i + 1 == layers_.size(), "softmax is only supported on the output layer");
             require(layers_[i].neurons >= 2, "softmax output layer must contain at least two neurons");
@@ -3097,10 +5240,11 @@ TrainingModel TrainingModel::Builder::build() const {
         layer.input_size = previous_size;
         layer.output_size = spec.neurons;
         layer.activation = spec.activation;
+        layer.dropout_probability = spec.dropout_probability;
 
         const std::size_t weight_count = layer.input_size * layer.output_size;
         layer.weights.resize(weight_count);
-        layer.biases.assign(layer.output_size, Scalar{0});
+        layer.biases.assign(layer.output_size, initialization_.bias);
         layer.grad_weights.assign(weight_count, Scalar{0});
         layer.grad_biases.assign(layer.output_size, Scalar{0});
         layer.velocity_weights.assign(weight_count, Scalar{0});
@@ -3110,15 +5254,11 @@ TrainingModel TrainingModel::Builder::build() const {
         layer.second_moment_weights.assign(weight_count, Scalar{0});
         layer.second_moment_biases.assign(layer.output_size, Scalar{0});
 
-        const Scalar limit = spec.activation == Activation::relu
-                                 ? static_cast<Scalar>(std::sqrt(Scalar{6} /
-                                                                 static_cast<Scalar>(layer.input_size)))
-                                 : static_cast<Scalar>(std::sqrt(
-                                       Scalar{6} / static_cast<Scalar>(layer.input_size + layer.output_size)));
-        std::uniform_real_distribution<Scalar> distribution(-limit, limit);
-        for (Scalar& weight : layer.weights) {
-            weight = distribution(rng);
-        }
+        initialize_weights(layer.weights,
+                           resolve_weight_initialization(initialization_.weights, spec.activation),
+                           layer.input_size,
+                           layer.output_size,
+                           rng);
 
         previous_size = spec.neurons;
         impl->layers.push_back(std::move(layer));
@@ -3178,6 +5318,10 @@ NormalizationSpec TrainingModel::normalization() const {
     return impl_->normalization;
 }
 
+std::size_t TrainingModel::completed_epochs() const {
+    return impl_->completed_epochs;
+}
+
 Vector TrainingModel::predict(const Vector& input) const {
     require(input.size() == input_size(), "input has an invalid size");
     for (Scalar value : input) {
@@ -3221,6 +5365,11 @@ TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, 
 TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions& options) {
     validate_training_options(options);
     validate_dataset_shape(dataset.sample_count(), dataset.input_size(), dataset.output_size(), input_size(), output_size());
+    TrainingOptions runtime_options = options;
+    runtime_options.learning_rate_schedule =
+        resolve_learning_rate_schedule(options.learning_rate_schedule, impl_->optimizer.learning_rate);
+    impl_->last_training_options = runtime_options;
+    impl_->has_last_training_options = true;
 
     DatasetSplitOptions split_options;
     split_options.validation_split = options.validation_split;
@@ -3234,15 +5383,63 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
     history.training_loss.reserve(options.epochs);
     history.validation_loss.reserve(options.epochs);
     history.test_loss.reserve(options.epochs);
+    history.epochs.reserve(options.epochs);
+    history.stop_reason = TrainingStopReason::completed_epochs;
+    history.stop_message = "completed requested epochs";
+    const TrainingMonitor resolved_monitor = resolve_training_monitor(options.early_stopping_monitor,
+                                                                       !split.validation_indices.empty(),
+                                                                       !split.test_indices.empty());
+    const TrainingMonitor resolved_learning_rate_monitor =
+        runtime_options.learning_rate_schedule.type == LearningRateSchedule::reduce_on_plateau
+            ? resolve_training_monitor(runtime_options.learning_rate_schedule.reduce_on_plateau_monitor,
+                                       !split.validation_indices.empty(),
+                                       !split.test_indices.empty())
+            : resolved_monitor;
+    history.monitor = resolved_monitor;
+    history.monitor_mode = options.early_stopping_mode;
 
-    Scalar best_metric = std::numeric_limits<Scalar>::infinity();
+    const bool resume_training = impl_->has_resume_epoch;
+    const std::size_t first_epoch = resume_training ? std::min(impl_->resume_epoch, options.epochs) : 0;
+    impl_->has_resume_epoch = false;
+    impl_->completed_epochs = first_epoch;
+    if (first_epoch >= options.epochs) {
+        history.stop_message = "checkpoint already reached requested epochs";
+        return history;
+    }
+
+    Scalar best_metric = initial_best_metric(options.early_stopping_mode);
     std::vector<LayerParameters> best_parameters;
     std::size_t stale_epochs = 0;
+    std::size_t cooldown_remaining = 0;
+    LearningRateSchedulerState learning_rate_state =
+        resume_training && impl_->learning_rate_state.initialized
+            ? impl_->learning_rate_state
+            : initial_learning_rate_state(runtime_options.learning_rate_schedule);
+    learning_rate_state.base_learning_rate = runtime_options.learning_rate_schedule.base_learning_rate;
+    if (learning_rate_state.current_learning_rate == Scalar{0}) {
+        learning_rate_state.current_learning_rate =
+            floor_learning_rate(runtime_options.learning_rate_schedule,
+                                runtime_options.learning_rate_schedule.base_learning_rate);
+    }
+    impl_->learning_rate_state = learning_rate_state;
 
     MiniBatch raw_batch;
     MiniBatch normalized_batch;
 
-    for (std::size_t epoch = 0; epoch < options.epochs; ++epoch) {
+    for (std::size_t epoch = first_epoch; epoch < options.epochs; ++epoch) {
+        const auto epoch_start = std::chrono::steady_clock::now();
+        const Scalar scheduled_learning_rate = learning_rate_for_epoch(runtime_options.learning_rate_schedule,
+                                                                       learning_rate_state,
+                                                                       epoch,
+                                                                       options.epochs);
+        impl_->optimizer.learning_rate = scheduled_learning_rate;
+        if (runtime_options.learning_rate_schedule.type != LearningRateSchedule::reduce_on_plateau) {
+            learning_rate_state.current_learning_rate = scheduled_learning_rate;
+        }
+        Scalar epoch_gradient_norm = Scalar{0};
+        GradientClippingDiagnostics epoch_clipping;
+        bool non_finite_gradient = false;
+
         std::mt19937_64 epoch_rng(non_zero_seed(options.seed, impl_->seed) + epoch);
         if (options.shuffle) {
             std::shuffle(training_indices.begin(), training_indices.end(), epoch_rng);
@@ -3252,34 +5449,159 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
             const std::size_t batch_count = std::min(options.batch_size, training_indices.size() - begin);
             impl_->fill_dataset_batch(dataset, training_indices, begin, batch_count, raw_batch, normalized_batch);
             impl_->zero_gradients();
-            impl_->accumulate_batch_gradients(normalized_batch);
-            impl_->apply_gradients(batch_count);
+            impl_->accumulate_batch_gradients(normalized_batch, &epoch_rng);
+            const auto gradient_result =
+                impl_->apply_gradients(batch_count, runtime_options.gradient_noise_stddev, &epoch_rng);
+            if (!is_finite(gradient_result.gradient_norm)) {
+                epoch_gradient_norm = gradient_result.gradient_norm;
+                non_finite_gradient = true;
+                break;
+            }
+            merge_gradient_clipping(epoch_clipping, gradient_result.clipping);
+            epoch_gradient_norm = std::max(epoch_gradient_norm, gradient_result.gradient_norm);
         }
+        finalize_gradient_clipping(epoch_clipping);
 
         const Scalar training_loss = impl_->loss_for_dataset_indices(dataset, training_indices);
         history.training_loss.push_back(training_loss);
 
-        Scalar monitored_metric = training_loss;
+        bool has_validation_loss = false;
+        Scalar validation_loss = Scalar{0};
         if (!split.validation_indices.empty()) {
-            const Scalar validation_loss = impl_->loss_for_dataset_indices(dataset, split.validation_indices);
+            validation_loss = impl_->loss_for_dataset_indices(dataset, split.validation_indices);
             history.validation_loss.push_back(validation_loss);
-            monitored_metric = validation_loss;
+            has_validation_loss = true;
         }
+        bool has_test_loss = false;
+        Scalar test_loss = Scalar{0};
         if (!split.test_indices.empty()) {
-            history.test_loss.push_back(impl_->loss_for_dataset_indices(dataset, split.test_indices));
+            test_loss = impl_->loss_for_dataset_indices(dataset, split.test_indices);
+            history.test_loss.push_back(test_loss);
+            has_test_loss = true;
         }
 
-        if (monitored_metric + options.min_delta < best_metric) {
+        const WeightStatistics weight_stats = impl_->weight_statistics();
+        const std::size_t non_finite_parameters = impl_->non_finite_parameter_count();
+        const bool non_finite_loss = !is_finite(training_loss) ||
+                                     (has_validation_loss && !is_finite(validation_loss)) ||
+                                     (has_test_loss && !is_finite(test_loss));
+        const bool non_finite_weights = non_finite_parameters > 0;
+        const bool finite_epoch = !non_finite_gradient && !non_finite_loss && !non_finite_weights;
+        const Scalar monitored_metric = select_monitored_metric(resolved_monitor,
+                                                                training_loss,
+                                                                has_validation_loss,
+                                                                validation_loss,
+                                                                has_test_loss,
+                                                                test_loss);
+        const Scalar learning_rate_metric =
+            runtime_options.learning_rate_schedule.type == LearningRateSchedule::reduce_on_plateau
+                ? select_monitored_metric(resolved_learning_rate_monitor,
+                                          training_loss,
+                                          has_validation_loss,
+                                          validation_loss,
+                                          has_test_loss,
+                                          test_loss)
+                : monitored_metric;
+        bool best_checkpoint = false;
+        bool improved = false;
+
+        if (finite_epoch && metric_improved(monitored_metric,
+                                            best_metric,
+                                            options.early_stopping_mode,
+                                            options.min_delta)) {
             best_metric = monitored_metric;
             stale_epochs = 0;
+            cooldown_remaining = options.early_stopping_cooldown;
+            best_checkpoint = true;
+            improved = true;
+            history.has_best_checkpoint = true;
+            history.best_epoch = epoch;
+            history.best_metric = monitored_metric;
             if (options.restore_best_weights) {
                 best_parameters = impl_->parameters();
             }
-        } else {
-            ++stale_epochs;
+        } else if (finite_epoch) {
+            if (cooldown_remaining > 0) {
+                --cooldown_remaining;
+            } else {
+                ++stale_epochs;
+            }
         }
 
+        const bool learning_rate_reduced =
+            update_reduce_on_plateau_learning_rate(runtime_options.learning_rate_schedule,
+                                                   learning_rate_state,
+                                                   epoch,
+                                                   learning_rate_metric,
+                                                   finite_epoch);
+        impl_->learning_rate_state = learning_rate_state;
+        const Scalar next_learning_rate = learning_rate_for_epoch(runtime_options.learning_rate_schedule,
+                                                                  learning_rate_state,
+                                                                  epoch + 1,
+                                                                  options.epochs);
+
+        const auto epoch_end = std::chrono::steady_clock::now();
+        TrainingEpochDiagnostics diagnostics;
+        diagnostics.epoch = epoch;
+        diagnostics.training_loss = training_loss;
+        diagnostics.has_validation_loss = has_validation_loss;
+        diagnostics.validation_loss = validation_loss;
+        diagnostics.has_test_loss = has_test_loss;
+        diagnostics.test_loss = test_loss;
+        diagnostics.monitor = resolved_monitor;
+        diagnostics.monitored_metric = monitored_metric;
+        diagnostics.learning_rate_schedule = runtime_options.learning_rate_schedule.type;
+        diagnostics.learning_rate = impl_->optimizer.learning_rate;
+        diagnostics.next_learning_rate = next_learning_rate;
+        diagnostics.learning_rate_reduced = learning_rate_reduced;
+        diagnostics.gradient_norm = epoch_gradient_norm;
+        diagnostics.clipping = epoch_clipping;
+        diagnostics.weights = weight_stats;
+        diagnostics.finite = finite_epoch;
+        diagnostics.non_finite_parameter_count = non_finite_parameters;
+        diagnostics.epoch_seconds = std::chrono::duration<double>(epoch_end - epoch_start).count();
+        diagnostics.best_checkpoint = best_checkpoint;
+        diagnostics.improved = improved;
+        diagnostics.stale_epochs = stale_epochs;
+        diagnostics.cooldown_remaining = cooldown_remaining;
+        history.epochs.push_back(diagnostics);
+        impl_->completed_epochs = epoch + 1;
+
+        if (diagnostics.finite) {
+            TrainingCheckpointInfo checkpoint_info;
+            checkpoint_info.completed_epochs = impl_->completed_epochs;
+            checkpoint_info.has_metric = true;
+            checkpoint_info.metric = monitored_metric;
+            checkpoint_info.learning_rate_state = learning_rate_state;
+            checkpoint_info.training_options = runtime_options;
+            if (best_checkpoint && !options.best_checkpoint_path.empty()) {
+                checkpoint_info.best_checkpoint = true;
+                save_checkpoint(options.best_checkpoint_path, checkpoint_info);
+            }
+            if (!options.latest_checkpoint_path.empty()) {
+                checkpoint_info.best_checkpoint = false;
+                save_checkpoint(options.latest_checkpoint_path, checkpoint_info);
+            }
+        }
+
+        if (non_finite_gradient) {
+            history.stop_reason = TrainingStopReason::non_finite_gradient;
+            history.stop_message = "stopped because gradient norm became non-finite";
+            break;
+        }
+        if (non_finite_loss) {
+            history.stop_reason = TrainingStopReason::non_finite_loss;
+            history.stop_message = "stopped because loss became non-finite";
+            break;
+        }
+        if (non_finite_weights) {
+            history.stop_reason = TrainingStopReason::non_finite_weights;
+            history.stop_message = "stopped because model parameters became non-finite";
+            break;
+        }
         if (options.early_stopping_patience > 0 && stale_epochs >= options.early_stopping_patience) {
+            history.stop_reason = TrainingStopReason::early_stopping;
+            history.stop_message = "stopped by early stopping patience";
             break;
         }
     }
@@ -3294,6 +5616,11 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
 TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOptions& options) {
     validate_training_options(options);
     validate_dataset_shape(dataset.sample_count(), dataset.input_size(), dataset.output_size(), input_size(), output_size());
+    TrainingOptions runtime_options = options;
+    runtime_options.learning_rate_schedule =
+        resolve_learning_rate_schedule(options.learning_rate_schedule, impl_->optimizer.learning_rate);
+    impl_->last_training_options = runtime_options;
+    impl_->has_last_training_options = true;
 
     DatasetSplitOptions split_options;
     split_options.validation_split = options.validation_split;
@@ -3314,10 +5641,45 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
     history.training_loss.reserve(options.epochs);
     history.validation_loss.reserve(options.epochs);
     history.test_loss.reserve(options.epochs);
+    history.epochs.reserve(options.epochs);
+    history.stop_reason = TrainingStopReason::completed_epochs;
+    history.stop_message = "completed requested epochs";
+    const TrainingMonitor resolved_monitor = resolve_training_monitor(options.early_stopping_monitor,
+                                                                       !split.validation_indices.empty(),
+                                                                       !split.test_indices.empty());
+    const TrainingMonitor resolved_learning_rate_monitor =
+        runtime_options.learning_rate_schedule.type == LearningRateSchedule::reduce_on_plateau
+            ? resolve_training_monitor(runtime_options.learning_rate_schedule.reduce_on_plateau_monitor,
+                                       !split.validation_indices.empty(),
+                                       !split.test_indices.empty())
+            : resolved_monitor;
+    history.monitor = resolved_monitor;
+    history.monitor_mode = options.early_stopping_mode;
 
-    Scalar best_metric = std::numeric_limits<Scalar>::infinity();
+    const bool resume_training = impl_->has_resume_epoch;
+    const std::size_t first_epoch = resume_training ? std::min(impl_->resume_epoch, options.epochs) : 0;
+    impl_->has_resume_epoch = false;
+    impl_->completed_epochs = first_epoch;
+    if (first_epoch >= options.epochs) {
+        history.stop_message = "checkpoint already reached requested epochs";
+        return history;
+    }
+
+    Scalar best_metric = initial_best_metric(options.early_stopping_mode);
     std::vector<LayerParameters> best_parameters;
     std::size_t stale_epochs = 0;
+    std::size_t cooldown_remaining = 0;
+    LearningRateSchedulerState learning_rate_state =
+        resume_training && impl_->learning_rate_state.initialized
+            ? impl_->learning_rate_state
+            : initial_learning_rate_state(runtime_options.learning_rate_schedule);
+    learning_rate_state.base_learning_rate = runtime_options.learning_rate_schedule.base_learning_rate;
+    if (learning_rate_state.current_learning_rate == Scalar{0}) {
+        learning_rate_state.current_learning_rate =
+            floor_learning_rate(runtime_options.learning_rate_schedule,
+                                runtime_options.learning_rate_schedule.base_learning_rate);
+    }
+    impl_->learning_rate_state = learning_rate_state;
 
     struct BufferedSample {
         Vector input;
@@ -3346,7 +5708,20 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
         return total / static_cast<Scalar>(count);
     };
 
-    for (std::size_t epoch = 0; epoch < options.epochs; ++epoch) {
+    for (std::size_t epoch = first_epoch; epoch < options.epochs; ++epoch) {
+        const auto epoch_start = std::chrono::steady_clock::now();
+        const Scalar scheduled_learning_rate = learning_rate_for_epoch(runtime_options.learning_rate_schedule,
+                                                                       learning_rate_state,
+                                                                       epoch,
+                                                                       options.epochs);
+        impl_->optimizer.learning_rate = scheduled_learning_rate;
+        if (runtime_options.learning_rate_schedule.type != LearningRateSchedule::reduce_on_plateau) {
+            learning_rate_state.current_learning_rate = scheduled_learning_rate;
+        }
+        Scalar epoch_gradient_norm = Scalar{0};
+        GradientClippingDiagnostics epoch_clipping;
+        bool non_finite_gradient = false;
+
         std::mt19937_64 epoch_rng(non_zero_seed(options.seed, impl_->seed) + epoch);
         std::vector<BufferedSample> shuffle_buffer;
         const bool use_shuffle_buffer = options.shuffle && options.streaming_shuffle_buffer_size > 0;
@@ -3357,16 +5732,38 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
         impl_->zero_gradients();
         std::size_t batch_count = 0;
 
+        auto apply_pending_batch = [&]() {
+            const auto gradient_result =
+                impl_->apply_gradients(batch_count, runtime_options.gradient_noise_stddev, &epoch_rng);
+            if (!is_finite(gradient_result.gradient_norm)) {
+                epoch_gradient_norm = gradient_result.gradient_norm;
+                non_finite_gradient = true;
+            } else {
+                merge_gradient_clipping(epoch_clipping, gradient_result.clipping);
+                epoch_gradient_norm = std::max(epoch_gradient_norm, gradient_result.gradient_norm);
+            }
+            batch_count = 0;
+        };
+
         auto train_normalized_sample = [&](const Vector& input_sample, const Vector& target_sample) {
-            impl_->accumulate_gradients(input_sample, target_sample);
+            if (non_finite_gradient) {
+                return;
+            }
+            impl_->accumulate_gradients(input_sample.data(),
+                                        input_sample.size(),
+                                        target_sample.data(),
+                                        target_sample.size(),
+                                        &epoch_rng);
             ++batch_count;
             if (batch_count == options.batch_size) {
-                impl_->apply_gradients(batch_count);
-                batch_count = 0;
+                apply_pending_batch();
             }
         };
 
         auto submit_training_sample = [&](const Vector& input_sample, const Vector& target_sample) {
+            if (non_finite_gradient) {
+                return;
+            }
             if (!use_shuffle_buffer) {
                 train_normalized_sample(input_sample, target_sample);
                 return;
@@ -3380,6 +5777,9 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
             std::uniform_int_distribution<std::size_t> distribution(0, shuffle_buffer.size() - 1);
             const std::size_t selected = distribution(epoch_rng);
             train_normalized_sample(shuffle_buffer[selected].input, shuffle_buffer[selected].target);
+            if (non_finite_gradient) {
+                return;
+            }
             shuffle_buffer[selected].input = input_sample;
             shuffle_buffer[selected].target = target_sample;
         };
@@ -3389,45 +5789,170 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
             impl_->read_streaming_sample(dataset, raw_input, raw_target, normalized_input, normalized_target);
             if (partition[index] == 0) {
                 submit_training_sample(normalized_input, normalized_target);
+                if (non_finite_gradient) {
+                    break;
+                }
             }
         }
-        require(!dataset.next(raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size()),
-                "streaming dataset produced more samples than sample_count");
+        if (!non_finite_gradient) {
+            require(!dataset.next(raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size()),
+                    "streaming dataset produced more samples than sample_count");
+        }
 
-        if (use_shuffle_buffer) {
+        if (!non_finite_gradient && use_shuffle_buffer) {
             std::shuffle(shuffle_buffer.begin(), shuffle_buffer.end(), epoch_rng);
             for (const BufferedSample& sample : shuffle_buffer) {
                 train_normalized_sample(sample.input, sample.target);
+                if (non_finite_gradient) {
+                    break;
+                }
             }
         }
-        if (batch_count > 0) {
-            impl_->apply_gradients(batch_count);
+        if (!non_finite_gradient && batch_count > 0) {
+            apply_pending_batch();
         }
+        finalize_gradient_clipping(epoch_clipping);
 
         const Scalar training_loss = stream_loss_for_partition(0);
         history.training_loss.push_back(training_loss);
 
-        Scalar monitored_metric = training_loss;
+        bool has_validation_loss = false;
+        Scalar validation_loss = Scalar{0};
         if (!split.validation_indices.empty()) {
-            const Scalar validation_loss = stream_loss_for_partition(1);
+            validation_loss = stream_loss_for_partition(1);
             history.validation_loss.push_back(validation_loss);
-            monitored_metric = validation_loss;
+            has_validation_loss = true;
         }
+        bool has_test_loss = false;
+        Scalar test_loss = Scalar{0};
         if (!split.test_indices.empty()) {
-            history.test_loss.push_back(stream_loss_for_partition(2));
+            test_loss = stream_loss_for_partition(2);
+            history.test_loss.push_back(test_loss);
+            has_test_loss = true;
         }
 
-        if (monitored_metric + options.min_delta < best_metric) {
+        const WeightStatistics weight_stats = impl_->weight_statistics();
+        const std::size_t non_finite_parameters = impl_->non_finite_parameter_count();
+        const bool non_finite_loss = !is_finite(training_loss) ||
+                                     (has_validation_loss && !is_finite(validation_loss)) ||
+                                     (has_test_loss && !is_finite(test_loss));
+        const bool non_finite_weights = non_finite_parameters > 0;
+        const bool finite_epoch = !non_finite_gradient && !non_finite_loss && !non_finite_weights;
+        const Scalar monitored_metric = select_monitored_metric(resolved_monitor,
+                                                                training_loss,
+                                                                has_validation_loss,
+                                                                validation_loss,
+                                                                has_test_loss,
+                                                                test_loss);
+        const Scalar learning_rate_metric =
+            runtime_options.learning_rate_schedule.type == LearningRateSchedule::reduce_on_plateau
+                ? select_monitored_metric(resolved_learning_rate_monitor,
+                                          training_loss,
+                                          has_validation_loss,
+                                          validation_loss,
+                                          has_test_loss,
+                                          test_loss)
+                : monitored_metric;
+        bool best_checkpoint = false;
+        bool improved = false;
+
+        if (finite_epoch && metric_improved(monitored_metric,
+                                            best_metric,
+                                            options.early_stopping_mode,
+                                            options.min_delta)) {
             best_metric = monitored_metric;
             stale_epochs = 0;
+            cooldown_remaining = options.early_stopping_cooldown;
+            best_checkpoint = true;
+            improved = true;
+            history.has_best_checkpoint = true;
+            history.best_epoch = epoch;
+            history.best_metric = monitored_metric;
             if (options.restore_best_weights) {
                 best_parameters = impl_->parameters();
             }
-        } else {
-            ++stale_epochs;
+        } else if (finite_epoch) {
+            if (cooldown_remaining > 0) {
+                --cooldown_remaining;
+            } else {
+                ++stale_epochs;
+            }
         }
 
+        const bool learning_rate_reduced =
+            update_reduce_on_plateau_learning_rate(runtime_options.learning_rate_schedule,
+                                                   learning_rate_state,
+                                                   epoch,
+                                                   learning_rate_metric,
+                                                   finite_epoch);
+        impl_->learning_rate_state = learning_rate_state;
+        const Scalar next_learning_rate = learning_rate_for_epoch(runtime_options.learning_rate_schedule,
+                                                                  learning_rate_state,
+                                                                  epoch + 1,
+                                                                  options.epochs);
+
+        const auto epoch_end = std::chrono::steady_clock::now();
+        TrainingEpochDiagnostics diagnostics;
+        diagnostics.epoch = epoch;
+        diagnostics.training_loss = training_loss;
+        diagnostics.has_validation_loss = has_validation_loss;
+        diagnostics.validation_loss = validation_loss;
+        diagnostics.has_test_loss = has_test_loss;
+        diagnostics.test_loss = test_loss;
+        diagnostics.monitor = resolved_monitor;
+        diagnostics.monitored_metric = monitored_metric;
+        diagnostics.learning_rate_schedule = runtime_options.learning_rate_schedule.type;
+        diagnostics.learning_rate = impl_->optimizer.learning_rate;
+        diagnostics.next_learning_rate = next_learning_rate;
+        diagnostics.learning_rate_reduced = learning_rate_reduced;
+        diagnostics.gradient_norm = epoch_gradient_norm;
+        diagnostics.clipping = epoch_clipping;
+        diagnostics.weights = weight_stats;
+        diagnostics.finite = finite_epoch;
+        diagnostics.non_finite_parameter_count = non_finite_parameters;
+        diagnostics.epoch_seconds = std::chrono::duration<double>(epoch_end - epoch_start).count();
+        diagnostics.best_checkpoint = best_checkpoint;
+        diagnostics.improved = improved;
+        diagnostics.stale_epochs = stale_epochs;
+        diagnostics.cooldown_remaining = cooldown_remaining;
+        history.epochs.push_back(diagnostics);
+        impl_->completed_epochs = epoch + 1;
+
+        if (diagnostics.finite) {
+            TrainingCheckpointInfo checkpoint_info;
+            checkpoint_info.completed_epochs = impl_->completed_epochs;
+            checkpoint_info.has_metric = true;
+            checkpoint_info.metric = monitored_metric;
+            checkpoint_info.learning_rate_state = learning_rate_state;
+            checkpoint_info.training_options = runtime_options;
+            if (best_checkpoint && !options.best_checkpoint_path.empty()) {
+                checkpoint_info.best_checkpoint = true;
+                save_checkpoint(options.best_checkpoint_path, checkpoint_info);
+            }
+            if (!options.latest_checkpoint_path.empty()) {
+                checkpoint_info.best_checkpoint = false;
+                save_checkpoint(options.latest_checkpoint_path, checkpoint_info);
+            }
+        }
+
+        if (non_finite_gradient) {
+            history.stop_reason = TrainingStopReason::non_finite_gradient;
+            history.stop_message = "stopped because gradient norm became non-finite";
+            break;
+        }
+        if (non_finite_loss) {
+            history.stop_reason = TrainingStopReason::non_finite_loss;
+            history.stop_message = "stopped because loss became non-finite";
+            break;
+        }
+        if (non_finite_weights) {
+            history.stop_reason = TrainingStopReason::non_finite_weights;
+            history.stop_message = "stopped because model parameters became non-finite";
+            break;
+        }
         if (options.early_stopping_patience > 0 && stale_epochs >= options.early_stopping_patience) {
+            history.stop_reason = TrainingStopReason::early_stopping;
+            history.stop_message = "stopped by early stopping patience";
             break;
         }
     }
@@ -3447,6 +5972,10 @@ void TrainingModel::set_parameters(const std::vector<LayerParameters>& parameter
     impl_->set_parameters(parameters);
 }
 
+CompiledModel TrainingModel::compile() const {
+    return CompiledModel(to_inference_model());
+}
+
 InferenceModel TrainingModel::to_inference_model() const {
     return InferenceModel::from_parameters(impl_->parameters(), impl_->normalization);
 }
@@ -3462,7 +5991,7 @@ void TrainingModel::save(const std::filesystem::path& path) const {
     }
 
     output << std::setprecision(17);
-    output << "BRUTAL_MLP_TRAINING_V3\n";
+    output << "BRUTAL_MLP_TRAINING_V5\n";
     output << impl_->input_size << '\n';
     write_loss_config(output, impl_->loss);
     output << to_string(impl_->optimizer.type) << ' '
@@ -3472,13 +6001,19 @@ void TrainingModel::save(const std::filesystem::path& path) const {
            << impl_->optimizer.epsilon << ' '
            << impl_->optimizer.momentum << ' '
            << impl_->optimizer.l2 << ' '
-           << impl_->optimizer.gradient_clip_norm << '\n';
+           << impl_->optimizer.l1 << ' '
+           << impl_->optimizer.decoupled_weight_decay << ' '
+           << impl_->optimizer.max_norm << ' '
+           << impl_->optimizer.gradient_clip_norm << ' '
+           << impl_->optimizer.gradient_clip_value << ' '
+           << impl_->optimizer.layer_gradient_clip_norm << '\n';
     output << impl_->seed << '\n';
     write_normalization(output, impl_->normalization);
     output << impl_->layers.size() << '\n';
 
     for (const Impl::Layer& layer : impl_->layers) {
-        output << layer.input_size << ' ' << layer.output_size << ' ' << to_string(layer.activation) << '\n';
+        output << layer.input_size << ' ' << layer.output_size << ' ' << to_string(layer.activation) << ' '
+               << layer.dropout_probability << '\n';
         output << layer.weights.size();
         for (Scalar weight : layer.weights) {
             output << ' ' << weight;
@@ -3496,6 +6031,89 @@ void TrainingModel::save(const std::filesystem::path& path) const {
     }
 }
 
+void TrainingModel::save_binary(const std::filesystem::path& path, const BinaryMetadata& metadata) const {
+    if (impl_->loss.type == Loss::custom) {
+        throw std::runtime_error("custom loss cannot be serialized");
+    }
+
+    const std::vector<LayerParameters> model_parameters = impl_->parameters();
+    BinaryWriter payload;
+    write_binary_metadata(payload, metadata);
+    payload.write_size(impl_->input_size);
+    payload.write_size(impl_->output_size());
+    write_binary_loss_config(payload, impl_->loss);
+    write_binary_optimizer(payload, impl_->optimizer);
+    payload.write_u64(impl_->seed);
+    payload.write_u64(impl_->optimizer_step);
+    payload.write_bool(impl_->has_last_training_options);
+    if (impl_->has_last_training_options) {
+        write_binary_training_options(payload, impl_->last_training_options);
+    }
+    write_binary_normalization(payload, impl_->normalization);
+    payload.write_size(model_parameters.size());
+    for (const LayerParameters& layer : model_parameters) {
+        write_binary_layer(payload, layer);
+    }
+
+    write_binary_file(path, build_binary_envelope(BinaryModelKind::training, payload.bytes));
+}
+
+void TrainingModel::save_checkpoint(const std::filesystem::path& path,
+                                    const TrainingCheckpointInfo& info) const {
+    if (impl_->loss.type == Loss::custom) {
+        throw std::runtime_error("custom loss cannot be serialized");
+    }
+
+    TrainingCheckpointInfo checkpoint = info;
+    if (checkpoint.completed_epochs == 0 && impl_->completed_epochs > 0) {
+        checkpoint.completed_epochs = impl_->completed_epochs;
+    }
+    if (!impl_->has_last_training_options &&
+        checkpoint.training_options.epochs == TrainingOptions{}.epochs &&
+        checkpoint.training_options.batch_size == TrainingOptions{}.batch_size) {
+        checkpoint.training_options = TrainingOptions{};
+    } else if (impl_->has_last_training_options &&
+               checkpoint.training_options.epochs == TrainingOptions{}.epochs &&
+               checkpoint.training_options.batch_size == TrainingOptions{}.batch_size &&
+               checkpoint.training_options.best_checkpoint_path.empty() &&
+               checkpoint.training_options.latest_checkpoint_path.empty()) {
+        checkpoint.training_options = impl_->last_training_options;
+    }
+    if (!checkpoint.learning_rate_state.initialized && impl_->learning_rate_state.initialized) {
+        checkpoint.learning_rate_state = impl_->learning_rate_state;
+    }
+
+    const std::vector<LayerParameters> model_parameters = impl_->parameters();
+    const std::vector<LayerTrainingState> optimizer_states = impl_->training_states();
+
+    BinaryWriter payload;
+    write_binary_metadata(payload, checkpoint.metadata);
+    payload.write_size(impl_->input_size);
+    payload.write_size(impl_->output_size());
+    write_binary_loss_config(payload, impl_->loss);
+    write_binary_optimizer(payload, impl_->optimizer);
+    payload.write_u64(impl_->seed);
+    payload.write_u64(impl_->optimizer_step);
+    payload.write_size(checkpoint.completed_epochs);
+    payload.write_bool(checkpoint.best_checkpoint);
+    payload.write_bool(checkpoint.has_metric);
+    if (checkpoint.has_metric) {
+        payload.write_scalar(checkpoint.metric);
+    }
+    payload.write_bool(true);
+    write_binary_learning_rate_scheduler_state(payload, checkpoint.learning_rate_state);
+    payload.write_bool(true);
+    write_binary_training_options(payload, checkpoint.training_options);
+    write_binary_normalization(payload, impl_->normalization);
+    payload.write_size(model_parameters.size());
+    for (std::size_t i = 0; i < model_parameters.size(); ++i) {
+        write_binary_layer(payload, model_parameters[i]);
+        write_binary_layer_training_state(payload, optimizer_states[i]);
+    }
+
+    write_binary_file(path, build_binary_envelope(BinaryModelKind::checkpoint, payload.bytes));
+}
+
 TrainingModel TrainingModel::load(const std::filesystem::path& path) {
     std::ifstream input(path);
     if (!input) {
@@ -3503,7 +6121,9 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
     }
 
     const std::string magic = read_token(input, "magic");
-    const bool has_loss_config = magic == "BRUTAL_MLP_TRAINING_V3";
+    const bool has_optimizer_clipping = magic == "BRUTAL_MLP_TRAINING_V5";
+    const bool has_optimizer_regularization = has_optimizer_clipping || magic == "BRUTAL_MLP_TRAINING_V4";
+    const bool has_loss_config = has_optimizer_regularization || magic == "BRUTAL_MLP_TRAINING_V3";
     const bool has_normalization = has_loss_config || magic == "BRUTAL_MLP_TRAINING_V2";
     if (!has_normalization && magic != "BRUTAL_MLP_TRAINING_V1" && magic != "BRUTAL_MLP_V1") {
         throw std::runtime_error("unsupported model file format");
@@ -3522,7 +6142,16 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
     optimizer.epsilon = read_value<Scalar>(input, "epsilon");
     optimizer.momentum = read_value<Scalar>(input, "momentum");
     optimizer.l2 = read_value<Scalar>(input, "l2");
+    if (has_optimizer_regularization) {
+        optimizer.l1 = read_value<Scalar>(input, "l1");
+        optimizer.decoupled_weight_decay = read_value<Scalar>(input, "decoupled_weight_decay");
+        optimizer.max_norm = read_value<Scalar>(input, "max_norm");
+    }
     optimizer.gradient_clip_norm = read_value<Scalar>(input, "gradient_clip_norm");
+    if (has_optimizer_clipping) {
+        optimizer.gradient_clip_value = read_value<Scalar>(input, "gradient_clip_value");
+        optimizer.layer_gradient_clip_norm = read_value<Scalar>(input, "layer_gradient_clip_norm");
+    }
 
     const std::uint64_t seed = read_value<std::uint64_t>(input, "seed");
     NormalizationSpec normalization;
@@ -3545,7 +6174,10 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
         layer.input_size = read_value<std::size_t>(input, "layer_input_size");
         layer.output_size = read_value<std::size_t>(input, "layer_output_size");
         layer.activation = activation_from_string(read_token(input, "layer_activation"));
-        builder.add_layer(layer.output_size, layer.activation);
+        if (has_optimizer_regularization) {
+            layer.dropout_probability = read_value<Scalar>(input, "layer_dropout_probability");
+        }
+        builder.add_layer(layer.output_size, layer.activation, layer.dropout_probability);
 
         const std::size_t weight_count = read_value<std::size_t>(input, "weight_count");
         layer.weights.resize(weight_count);
@@ -3563,6 +6195,70 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
 
     TrainingModel model = builder.build();
     model.set_parameters(parameters);
+    return model;
+}
+
+TrainingModel TrainingModel::load_binary(const std::filesystem::path& path) {
+    ParsedBinaryModel parsed = parse_binary_model_file(path);
+    if (parsed.info.model_kind != BinaryModelKind::training) {
+        throw std::runtime_error("binary model is not a training model");
+    }
+
+    Builder builder = TrainingModel::builder()
+                          .input_size(parsed.info.input_size)
+                          .loss(parsed.loss)
+                          .optimizer(parsed.optimizer)
+                          .normalization(parsed.normalization)
+                          .seed(parsed.info.seed);
+    for (const LayerParameters& layer : parsed.parameters) {
+        builder.add_layer(layer.output_size, layer.activation, layer.dropout_probability);
+    }
+
+    TrainingModel model = builder.build();
+    model.set_parameters(parsed.parameters);
+    model.impl_->optimizer_step = parsed.optimizer_step;
+    model.impl_->has_last_training_options = parsed.info.has_training_options;
+    model.impl_->last_training_options = parsed.info.training_options;
+    return model;
+}
+
+TrainingModel TrainingModel::load_checkpoint(const std::filesystem::path& path,
+                                             TrainingCheckpointInfo* info) {
+    ParsedBinaryModel parsed = parse_binary_model_file(path);
+    if (parsed.info.model_kind != BinaryModelKind::checkpoint) {
+        throw std::runtime_error("binary file is not a training checkpoint");
+    }
+
+    Builder builder = TrainingModel::builder()
+                          .input_size(parsed.info.input_size)
+                          .loss(parsed.loss)
+                          .optimizer(parsed.optimizer)
+                          .normalization(parsed.normalization)
+                          .seed(parsed.info.seed);
+    for (const LayerParameters& layer : parsed.parameters) {
+        builder.add_layer(layer.output_size, layer.activation, layer.dropout_probability);
+    }
+
+    TrainingModel model = builder.build();
+    model.set_parameters(parsed.parameters);
+    model.impl_->set_training_states(parsed.training_states, parsed.optimizer_step);
+    model.impl_->completed_epochs = parsed.info.completed_epochs;
+    model.impl_->resume_epoch = parsed.info.completed_epochs;
+    model.impl_->has_resume_epoch = true;
+    model.impl_->learning_rate_state = parsed.info.learning_rate_state;
+    model.impl_->has_last_training_options = parsed.info.has_training_options;
+    model.impl_->last_training_options = parsed.info.training_options;
+
+    if (info != nullptr) {
+        info->completed_epochs = parsed.info.completed_epochs;
+        info->best_checkpoint = parsed.info.checkpoint_best;
+        info->has_metric = parsed.info.has_checkpoint_metric;
+        info->metric = parsed.info.checkpoint_metric;
+        info->learning_rate_state = parsed.info.learning_rate_state;
+        info->training_options = parsed.info.training_options;
+        info->metadata = parsed.info.metadata;
+    }
+
     return model;
 }
 

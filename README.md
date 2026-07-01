@@ -15,13 +15,16 @@ When using the CMake target `brutal_mlp::brutal_mlp`, the precision macro is pro
 ## API split
 
 - `brutal_mlp::TrainingModel`: owns training state, gradients, optimizer moments, validation, history, serialization, and debug-friendly APIs.
-- `brutal_mlp::InferenceModel`: frozen model for production inference. It stores weights and biases contiguously, has no optimizer or gradient state, and exposes `predict_to(...) noexcept` and `predict_batch_to(...) noexcept` so callers provide all runtime buffers.
+- `brutal_mlp::MutableModel`: alias for `TrainingModel` when you want to name the flexible build/train/modify side explicitly.
+- `brutal_mlp::CompiledModel`: frozen model for production inference. `TrainingModel::compile()` precomputes layer offsets, compacts weights and biases into contiguous buffers, fixes scratch sizing, drops optimizer/gradient state, and exposes safe `predict_to(...) noexcept` APIs plus unchecked fast-path APIs so callers provide all runtime buffers.
+- `brutal_mlp::InferenceModel`: compatibility name for the frozen runtime API. New code should prefer `CompiledModel`.
 - `brutal_mlp::InferenceWorkspace`: reusable output + scratch storage for single-sample inference. Allocate one per thread, worker, renderer tile, or calling context, then reuse it.
+- `brutal_mlp::ParallelOptions`: explicit CPU parallelism policy for coarse batch inference and future training phases. The default is serial execution.
 - `brutal_mlp::Model`: legacy alias for `TrainingModel`.
 
 ## Normalization
 
-Input and output normalization are part of the model, not an external convention. The same normalization spec is saved with training and inference files, and `TrainingModel::to_inference_model()` carries it into the frozen runtime model.
+Input and output normalization are part of the model, not an external convention. The same normalization spec is saved with training and inference files, and `TrainingModel::compile()` carries it into the frozen runtime model. `TrainingModel::to_inference_model()` remains available for existing integrations.
 
 Supported per-feature transforms:
 
@@ -111,6 +114,65 @@ void gradient(const brutal_mlp::Scalar* prediction,
 
 Custom loss callbacks are not serialized. Convert trained weights to `InferenceModel` for production, or use a built-in loss when the training model itself must be saved.
 
+## Initialization
+
+The builder supports explicit weight initialization and constant bias initialization:
+
+```cpp
+auto model = brutal_mlp::TrainingModel::builder()
+    .input_size(16)
+    .add_layer(64, brutal_mlp::Activation::relu)
+    .add_layer(1, brutal_mlp::Activation::linear)
+    .initialization(brutal_mlp::InitializationConfig::he_normal(0.01f))
+    .seed(1234)
+    .build();
+```
+
+Available weight strategies are `automatic`, `he_normal`, `he_uniform`, `xavier_normal`, `xavier_uniform`, `lecun_normal`, and `lecun_uniform`. The default `automatic` mode keeps ReLU layers on He uniform and other layers on Xavier uniform. The builder seed fully controls the initialized weights.
+
+## Regularization
+
+Regularization is configured on the training side. Inference models never carry dropout, gradients, optimizer state, or training-only buffers.
+
+```cpp
+auto optimizer = brutal_mlp::OptimizerConfig::adamw(1e-3f, 1e-2f);
+optimizer.l1 = 1e-6f;
+optimizer.l2 = 1e-5f;
+optimizer.max_norm = 3.0f;
+
+auto training = brutal_mlp::TrainingModel::builder()
+    .input_size(16)
+    .add_layer(64, brutal_mlp::Activation::relu, 0.10f) // hidden-layer dropout
+    .add_layer(1, brutal_mlp::Activation::linear)
+    .optimizer(optimizer)
+    .seed(1234)
+    .build();
+
+brutal_mlp::TrainingOptions options;
+options.gradient_noise_stddev = 1e-5f;
+```
+
+Supported options are L1, coupled L2, AdamW decoupled weight decay, hidden-layer inverted dropout, optional gradient noise, and max-norm constraints on each neuron's incoming weight vector. Output-layer dropout is rejected.
+
+## Gradient Clipping
+
+Clipping is configured on `OptimizerConfig` and reported per epoch:
+
+```cpp
+auto optimizer = brutal_mlp::OptimizerConfig::adamw(1e-3f, 1e-2f);
+optimizer.gradient_clip_norm = 5.0f;       // global gradient norm
+optimizer.layer_gradient_clip_norm = 2.0f; // per-layer gradient norm
+optimizer.gradient_clip_value = 0.25f;     // final per-value clamp
+
+auto history = training.fit(dataset, options);
+
+auto global_rate = history.epochs.back().clipping.global_clip_rate;
+auto layer_rate = history.epochs.back().clipping.layer_clip_rate;
+auto value_rate = history.epochs.back().clipping.value_clip_rate;
+```
+
+`gradient_norm` remains the pre-clipping global norm. The clipping diagnostics include batch, layer, and gradient-value counts, clip counts, per-epoch rates, and the smallest norm clip scale applied during the epoch.
+
 ## Metrics
 
 Losses are used for optimization. Metrics are evaluated separately on predictions and targets.
@@ -163,6 +225,66 @@ auto max_error_value = report.custom_metric("max_error");
 ```
 
 `evaluate_predictions(predictions, targets, options)` is also available when predictions are produced outside a model.
+
+## Training Diagnostics
+
+`fit(...)` returns a `TrainingHistory` with legacy loss vectors and structured diagnostics:
+
+```cpp
+auto history = training.fit(inputs, targets, options);
+
+for (const auto& epoch : history.epochs) {
+    auto loss = epoch.training_loss;
+    auto validation = epoch.has_validation_loss ? epoch.validation_loss : 0.0f;
+    auto gradient_norm = epoch.gradient_norm;
+    auto global_clip_rate = epoch.clipping.global_clip_rate;
+    auto weight_min = epoch.weights.minimum;
+    auto weight_max = epoch.weights.maximum;
+    auto seconds = epoch.epoch_seconds;
+}
+
+if (history.stop_reason != brutal_mlp::TrainingStopReason::completed_epochs) {
+    auto reason = brutal_mlp::to_string(history.stop_reason);
+}
+```
+
+Early stopping can monitor training, validation, or test loss. The default `automatic` monitor uses validation loss when a validation split exists, otherwise training loss.
+
+```cpp
+brutal_mlp::TrainingOptions options;
+options.validation_split = 0.15f;
+options.early_stopping_monitor = brutal_mlp::TrainingMonitor::validation_loss;
+options.early_stopping_mode = brutal_mlp::TrainingMonitorMode::minimize;
+options.early_stopping_patience = 10;
+options.min_delta = 1e-4f;
+options.early_stopping_cooldown = 2;
+options.restore_best_weights = true;
+options.best_checkpoint_path = "best.bmlp";
+```
+
+Learning rate schedules are configured through `TrainingOptions` and are reported in each epoch diagnostic:
+
+```cpp
+brutal_mlp::TrainingOptions options;
+options.learning_rate_schedule =
+    brutal_mlp::LearningRateScheduleConfig::cosine_annealing(200, 1e-5f);
+options.learning_rate_schedule.warmup_epochs = 10;
+options.learning_rate_schedule.warmup_start_learning_rate = 1e-6f;
+```
+
+Available schedules are constant, step decay, exponential decay, cosine annealing, and reduce-on-plateau. Warmup can prefix any schedule:
+
+```cpp
+auto schedule = brutal_mlp::LearningRateScheduleConfig::reduce_on_plateau(5, 0.5f);
+schedule.reduce_on_plateau_monitor = brutal_mlp::TrainingMonitor::validation_loss;
+schedule.reduce_on_plateau_min_delta = 1e-4f;
+schedule.reduce_on_plateau_cooldown = 2;
+schedule.minimum_learning_rate = 1e-6f;
+
+options.learning_rate_schedule = schedule;
+```
+
+Each epoch records training loss, optional validation/test loss, the monitored metric, learning rate, gradient norm, clipping diagnostics, weight min/max/mean, non-finite parameter counts, elapsed time, cooldown/stale counters, and whether it produced the best checkpoint. Training stops with a structured reason for early stopping, non-finite loss, non-finite gradients, or non-finite weights.
 
 ## Datasets
 
@@ -242,6 +364,46 @@ training.fit(streamed, options);
 
 `FunctionStreamingDataset` is available for procedural or application-owned streams. Its callback returns `false` when the stream is exhausted.
 
+## Serialization
+
+Text serialization remains available through `save(...)` and `load(...)` for debugging and review. Production artifacts should use the binary format:
+
+```cpp
+brutal_mlp::BinaryMetadata metadata;
+metadata.description = "shipping renderer model";
+metadata.entries.push_back({"dataset", "lighting-v4"});
+
+training.save_binary("lighting-training.bmlp", metadata);
+auto training_info = brutal_mlp::inspect_binary_model("lighting-training.bmlp");
+auto restored_training = brutal_mlp::TrainingModel::load_binary("lighting-training.bmlp");
+
+auto compiled = training.compile();
+compiled.save_binary("lighting-compiled.bmlp", metadata);
+auto restored_compiled = brutal_mlp::CompiledModel::load_binary("lighting-compiled.bmlp");
+```
+
+Binary files include a magic number, format version, scalar type, model kind, architecture, activations, dimensions, weights, biases, normalization, metadata, checksum, seed, and training configuration when available. Loading rejects unsupported versions, scalar mismatches, truncated files, and checksum failures.
+
+Training checkpoints extend the binary format with optimizer state, completed epoch, checkpoint metric, and full training options:
+
+```cpp
+brutal_mlp::TrainingOptions options;
+options.epochs = 1000;
+options.batch_size = 64;
+options.best_checkpoint_path = "best.bmlp";
+options.latest_checkpoint_path = "latest.bmlp";
+
+auto history = training.fit(dataset, options);
+
+brutal_mlp::TrainingCheckpointInfo info;
+auto resumed = brutal_mlp::TrainingModel::load_checkpoint("latest.bmlp", &info);
+auto resumed_history = resumed.fit(dataset, info.training_options);
+
+auto best = brutal_mlp::TrainingModel::load_checkpoint("best.bmlp");
+```
+
+`latest_checkpoint_path` is written after each finite epoch. `best_checkpoint_path` is updated only when the monitored metric improves. A loaded checkpoint resumes from `completed_epochs` on the next `fit(...)` call when the saved options are reused.
+
 ## Integration
 
 ```cmake
@@ -289,35 +451,74 @@ options.batch_size = 4;
 
 training.fit(x, y, options);
 
-auto inference = training.to_inference_model();
+auto compiled = training.compile();
 
 brutal_mlp::Vector input{1.0, 0.0};
-brutal_mlp::InferenceWorkspace workspace(inference);
+brutal_mlp::InferenceWorkspace workspace(compiled);
 
-auto status = inference.predict_to(input.data(), input.size(), workspace);
+auto status = compiled.predict_to(input.data(), input.size(), workspace);
 
 if (status != brutal_mlp::InferenceStatus::ok) {
     // Handle invalid buffers or shape mismatch outside the hot path.
 }
 ```
 
+The safe inference API validates pointers, sizes, strides, and scratch capacity, then returns an `InferenceStatus`. The fast API assumes every contract is already satisfied and performs no validation:
+
+```cpp
+// Contract: input/output/scratch point to valid buffers sized for this model.
+compiled.predict_unchecked_to(input.data(), workspace);
+```
+
+`CompiledModel` is immutable after construction or loading. It can be shared across threads for concurrent `const` inference calls as long as every thread uses its own output buffer and scratch storage. `InferenceWorkspace` is mutable caller-owned storage; allocate one per thread, worker, tile, or job, or use application-managed `thread_local` storage initialized before the tight loop. Do not share one workspace between simultaneous predictions.
+
 For flat batch inference, use caller-owned contiguous memory:
 
 ```cpp
-std::vector<brutal_mlp::Scalar> inputs(sample_count * inference.input_size());
-std::vector<brutal_mlp::Scalar> outputs(sample_count * inference.output_size());
-std::vector<brutal_mlp::Scalar> scratch(inference.scratch_size());
+std::vector<brutal_mlp::Scalar> inputs(sample_count * compiled.input_size());
+std::vector<brutal_mlp::Scalar> outputs(sample_count * compiled.output_size());
+std::vector<brutal_mlp::Scalar> scratch(compiled.scratch_size());
 
-auto status = inference.predict_batch_to(inputs.data(),
-                                         sample_count,
-                                         inference.input_size(),
-                                         outputs.data(),
-                                         inference.output_size(),
-                                         scratch.data(),
-                                         scratch.size());
+auto status = compiled.predict_batch_to(inputs.data(),
+                                        sample_count,
+                                        compiled.input_size(),
+                                        outputs.data(),
+                                        compiled.output_size(),
+                                        scratch.data(),
+                                        scratch.size());
+
+compiled.predict_batch_unchecked_to(inputs.data(),
+                                     sample_count,
+                                     compiled.input_size(),
+                                     outputs.data(),
+                                     compiled.output_size(),
+                                     scratch.data());
 ```
 
-`InferenceModel::predict_to(...)` and `InferenceModel::predict_batch_to(...)` do not allocate, do not throw, and do not mutate the model. The convenience methods `predict(...)` and `predict_batch(...)` return `Vector`/`Matrix` and are intentionally outside the hot path.
+Batch parallelism is opt-in and uses one scratch slice per worker:
+
+```cpp
+brutal_mlp::ParallelOptions parallel;
+parallel.execution = brutal_mlp::ParallelExecution::worker_threads;
+parallel.thread_count = 0;                 // 0 = hardware_concurrency()
+parallel.minimum_parallel_samples = 64;    // stay serial for tiny batches
+
+std::vector<brutal_mlp::Scalar> parallel_scratch(
+    compiled.batch_scratch_size(sample_count, parallel));
+
+auto parallel_status = compiled.predict_batch_to(inputs.data(),
+                                                 sample_count,
+                                                 compiled.input_size(),
+                                                 outputs.data(),
+                                                 compiled.output_size(),
+                                                 parallel_scratch.data(),
+                                                 parallel_scratch.size(),
+                                                 parallel);
+```
+
+`CompiledModel::predict_to(...)`, the serial `predict_batch_to(...)`, `predict_unchecked_to(...)`, and `predict_batch_unchecked_to(...)` do not allocate, do not throw, and do not mutate the model. The parallel batch overload is also `noexcept` and caller-scratch-based, but it creates worker threads internally; for renderer hot loops, prefer one worker-owned scratch/workspace per application thread and call the serial fast path inside that worker. The convenience methods `predict(...)` and `predict_batch(...)` return `Vector`/`Matrix` and are intentionally outside the hot path.
+
+`TrainingOptions::parallelism` stores the same policy and is written into binary models and checkpoints. The current optimizer update path remains serial and deterministic; the policy is part of the training config so CPU-parallel batch loading, normalization, or gradient accumulation can be enabled without changing the public configuration surface.
 
 ## Build
 
@@ -343,7 +544,33 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Benchmarks are exposed by the `brutal_mlp_benchmarks` executable when `BRUTAL_MLP_BUILD_BENCHMARKS=ON`.
+Benchmarks are exposed by the `brutal_mlp_benchmarks` executable when `BRUTAL_MLP_BUILD_BENCHMARKS=ON`. They cover small, medium, and large models across single prediction, flat batch prediction, matrix convenience prediction, worker-thread batch prediction, one training epoch, and text/binary save/load. Useful filters:
+
+```bash
+# List every benchmark case.
+build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_list_tests
+
+# Compare no-allocation and allocating inference paths.
+build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredict.*(Unchecked|AllocatingMatrix)"
+
+# Measure training epoch and serialization costs.
+build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="TrainingEpoch|Save|Load"
+```
+
+Each benchmark reports `scalar_bits`, model dimensions, weight counts, and, for inference paths, `allocations_per_call` plus `allocating_path`. To compare float and double, build two benchmark trees and run the same filter:
+
+```bash
+cmake -S . -B build-bench-float -DCMAKE_BUILD_TYPE=Release -DBRUTAL_MLP_BUILD_TESTS=OFF -DBRUTAL_MLP_BUILD_BENCHMARKS=ON
+cmake --build build-bench-float --parallel
+
+cmake -S . -B build-bench-double -DCMAKE_BUILD_TYPE=Release -DBRUTAL_MLP_USE_DOUBLE=ON -DBRUTAL_MLP_BUILD_TESTS=OFF -DBRUTAL_MLP_BUILD_BENCHMARKS=ON
+cmake --build build-bench-double --parallel
+
+build-bench-float/benchmarks/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredictUnchecked|TrainingEpoch"
+build-bench-double/benchmarks/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredictUnchecked|TrainingEpoch"
+```
+
+With multi-config generators such as Visual Studio or Xcode, use the same commands with `cmake --build ... --config Release`; the executable is under `benchmarks/Release/`.
 
 When consumed from another CMake project through `FetchContent`, tests and examples default to `OFF`.
 

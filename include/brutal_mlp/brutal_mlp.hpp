@@ -60,7 +60,8 @@ enum class Averaging {
 
 enum class OptimizerType {
     sgd,
-    adam
+    adam,
+    adamw
 };
 
 enum class NormalizationMode {
@@ -81,6 +82,49 @@ enum class InferenceStatus {
     insufficient_scratch
 };
 
+enum class TrainingStopReason {
+    completed_epochs,
+    early_stopping,
+    non_finite_loss,
+    non_finite_gradient,
+    non_finite_weights
+};
+
+enum class TrainingMonitor {
+    automatic,
+    training_loss,
+    validation_loss,
+    test_loss
+};
+
+enum class TrainingMonitorMode {
+    minimize,
+    maximize
+};
+
+enum class LearningRateSchedule {
+    constant,
+    step_decay,
+    exponential_decay,
+    cosine_annealing,
+    reduce_on_plateau
+};
+
+enum class WeightInitialization {
+    automatic,
+    he_normal,
+    he_uniform,
+    xavier_normal,
+    xavier_uniform,
+    lecun_normal,
+    lecun_uniform
+};
+
+enum class ParallelExecution {
+    serial,
+    worker_threads
+};
+
 [[nodiscard]] std::string to_string(Activation activation);
 [[nodiscard]] std::string to_string(Loss loss);
 [[nodiscard]] std::string to_string(Metric metric);
@@ -88,6 +132,12 @@ enum class InferenceStatus {
 [[nodiscard]] std::string to_string(OptimizerType optimizer);
 [[nodiscard]] std::string to_string(NormalizationMode mode);
 [[nodiscard]] std::string to_string(InferenceStatus status);
+[[nodiscard]] std::string to_string(TrainingStopReason reason);
+[[nodiscard]] std::string to_string(TrainingMonitor monitor);
+[[nodiscard]] std::string to_string(TrainingMonitorMode mode);
+[[nodiscard]] std::string to_string(LearningRateSchedule schedule);
+[[nodiscard]] std::string to_string(WeightInitialization initialization);
+[[nodiscard]] std::string to_string(ParallelExecution execution);
 
 [[nodiscard]] Activation activation_from_string(std::string_view value);
 [[nodiscard]] Loss loss_from_string(std::string_view value);
@@ -95,6 +145,7 @@ enum class InferenceStatus {
 [[nodiscard]] Averaging averaging_from_string(std::string_view value);
 [[nodiscard]] OptimizerType optimizer_type_from_string(std::string_view value);
 [[nodiscard]] NormalizationMode normalization_mode_from_string(std::string_view value);
+[[nodiscard]] ParallelExecution parallel_execution_from_string(std::string_view value);
 
 using CustomLossValueFunction = Scalar (*)(const Scalar* prediction,
                                            const Scalar* target,
@@ -194,11 +245,66 @@ struct OptimizerConfig {
     Scalar epsilon{static_cast<Scalar>(1e-8)};
     Scalar momentum{static_cast<Scalar>(0)};
     Scalar l2{static_cast<Scalar>(0)};
+    Scalar l1{static_cast<Scalar>(0)};
+    Scalar decoupled_weight_decay{static_cast<Scalar>(0)};
+    Scalar max_norm{static_cast<Scalar>(0)};
     Scalar gradient_clip_norm{static_cast<Scalar>(0)};
+    Scalar gradient_clip_value{static_cast<Scalar>(0)};
+    Scalar layer_gradient_clip_norm{static_cast<Scalar>(0)};
 
     [[nodiscard]] static OptimizerConfig adam(Scalar learning_rate = static_cast<Scalar>(0.001));
+    [[nodiscard]] static OptimizerConfig adamw(Scalar learning_rate = static_cast<Scalar>(0.001),
+                                               Scalar weight_decay = static_cast<Scalar>(0.01));
     [[nodiscard]] static OptimizerConfig sgd(Scalar learning_rate = static_cast<Scalar>(0.01),
                                              Scalar momentum = static_cast<Scalar>(0));
+};
+
+struct LearningRateScheduleConfig {
+    LearningRateSchedule type{LearningRateSchedule::constant};
+    Scalar base_learning_rate{static_cast<Scalar>(0)};
+    Scalar minimum_learning_rate{static_cast<Scalar>(0)};
+    std::size_t warmup_epochs{0};
+    Scalar warmup_start_learning_rate{static_cast<Scalar>(0)};
+    std::size_t step_size{10};
+    Scalar step_decay_factor{static_cast<Scalar>(0.5)};
+    Scalar exponential_decay_rate{static_cast<Scalar>(0.95)};
+    std::size_t cosine_epochs{0};
+    TrainingMonitor reduce_on_plateau_monitor{TrainingMonitor::automatic};
+    TrainingMonitorMode reduce_on_plateau_mode{TrainingMonitorMode::minimize};
+    std::size_t reduce_on_plateau_patience{10};
+    Scalar reduce_on_plateau_factor{static_cast<Scalar>(0.5)};
+    Scalar reduce_on_plateau_min_delta{static_cast<Scalar>(1e-8)};
+    std::size_t reduce_on_plateau_cooldown{0};
+
+    [[nodiscard]] static LearningRateScheduleConfig constant();
+    [[nodiscard]] static LearningRateScheduleConfig step_decay(std::size_t step_size,
+                                                               Scalar decay_factor);
+    [[nodiscard]] static LearningRateScheduleConfig exponential_decay(Scalar decay_rate);
+    [[nodiscard]] static LearningRateScheduleConfig cosine_annealing(
+        std::size_t cosine_epochs = 0,
+        Scalar minimum_learning_rate = static_cast<Scalar>(0));
+    [[nodiscard]] static LearningRateScheduleConfig reduce_on_plateau(
+        std::size_t patience = 10,
+        Scalar factor = static_cast<Scalar>(0.5));
+};
+
+struct InitializationConfig {
+    WeightInitialization weights{WeightInitialization::automatic};
+    Scalar bias{static_cast<Scalar>(0)};
+
+    [[nodiscard]] static InitializationConfig automatic(Scalar bias = static_cast<Scalar>(0));
+    [[nodiscard]] static InitializationConfig he_normal(Scalar bias = static_cast<Scalar>(0));
+    [[nodiscard]] static InitializationConfig he_uniform(Scalar bias = static_cast<Scalar>(0));
+    [[nodiscard]] static InitializationConfig xavier_normal(Scalar bias = static_cast<Scalar>(0));
+    [[nodiscard]] static InitializationConfig xavier_uniform(Scalar bias = static_cast<Scalar>(0));
+    [[nodiscard]] static InitializationConfig lecun_normal(Scalar bias = static_cast<Scalar>(0));
+    [[nodiscard]] static InitializationConfig lecun_uniform(Scalar bias = static_cast<Scalar>(0));
+};
+
+struct ParallelOptions {
+    ParallelExecution execution{ParallelExecution::serial};
+    std::size_t thread_count{0};
+    std::size_t minimum_parallel_samples{1};
 };
 
 struct TrainingOptions {
@@ -211,14 +317,144 @@ struct TrainingOptions {
     std::size_t streaming_shuffle_buffer_size{0};
     std::size_t early_stopping_patience{0};
     Scalar min_delta{static_cast<Scalar>(1e-8)};
+    TrainingMonitor early_stopping_monitor{TrainingMonitor::automatic};
+    TrainingMonitorMode early_stopping_mode{TrainingMonitorMode::minimize};
+    std::size_t early_stopping_cooldown{0};
+    LearningRateScheduleConfig learning_rate_schedule{};
+    Scalar gradient_noise_stddev{static_cast<Scalar>(0)};
+    ParallelOptions parallelism{};
     bool restore_best_weights{true};
+    std::filesystem::path best_checkpoint_path{};
+    std::filesystem::path latest_checkpoint_path{};
+};
+
+struct LearningRateSchedulerState {
+    bool initialized{false};
+    Scalar base_learning_rate{static_cast<Scalar>(0)};
+    Scalar current_learning_rate{static_cast<Scalar>(0)};
+    bool has_best_metric{false};
+    Scalar best_metric{static_cast<Scalar>(0)};
+    std::size_t stale_epochs{0};
+    std::size_t cooldown_remaining{0};
+};
+
+struct WeightStatistics {
+    Scalar minimum{static_cast<Scalar>(0)};
+    Scalar maximum{static_cast<Scalar>(0)};
+    Scalar mean{static_cast<Scalar>(0)};
+    std::size_t count{0};
+    std::size_t non_finite_count{0};
+    bool finite{true};
+};
+
+struct GradientClippingDiagnostics {
+    std::size_t batch_count{0};
+    std::size_t global_clip_count{0};
+    std::size_t layer_count{0};
+    std::size_t layer_clip_count{0};
+    std::size_t gradient_value_count{0};
+    std::size_t gradient_value_clip_count{0};
+    Scalar global_clip_rate{static_cast<Scalar>(0)};
+    Scalar layer_clip_rate{static_cast<Scalar>(0)};
+    Scalar value_clip_rate{static_cast<Scalar>(0)};
+    Scalar minimum_clip_scale{static_cast<Scalar>(1)};
+};
+
+struct TrainingEpochDiagnostics {
+    std::size_t epoch{0};
+    Scalar training_loss{static_cast<Scalar>(0)};
+    bool has_validation_loss{false};
+    Scalar validation_loss{static_cast<Scalar>(0)};
+    bool has_test_loss{false};
+    Scalar test_loss{static_cast<Scalar>(0)};
+    TrainingMonitor monitor{TrainingMonitor::automatic};
+    Scalar monitored_metric{static_cast<Scalar>(0)};
+    LearningRateSchedule learning_rate_schedule{LearningRateSchedule::constant};
+    Scalar learning_rate{static_cast<Scalar>(0)};
+    Scalar next_learning_rate{static_cast<Scalar>(0)};
+    bool learning_rate_reduced{false};
+    Scalar gradient_norm{static_cast<Scalar>(0)};
+    GradientClippingDiagnostics clipping{};
+    WeightStatistics weights{};
+    bool finite{true};
+    std::size_t non_finite_parameter_count{0};
+    double epoch_seconds{0.0};
+    bool best_checkpoint{false};
+    bool improved{false};
+    std::size_t stale_epochs{0};
+    std::size_t cooldown_remaining{0};
 };
 
 struct TrainingHistory {
     std::vector<Scalar> training_loss;
     std::vector<Scalar> validation_loss;
     std::vector<Scalar> test_loss;
+    std::vector<TrainingEpochDiagnostics> epochs;
+    bool has_best_checkpoint{false};
+    std::size_t best_epoch{0};
+    Scalar best_metric{static_cast<Scalar>(0)};
+    TrainingMonitor monitor{TrainingMonitor::automatic};
+    TrainingMonitorMode monitor_mode{TrainingMonitorMode::minimize};
+    TrainingStopReason stop_reason{TrainingStopReason::completed_epochs};
+    std::string stop_message;
 };
+
+enum class BinaryScalarType {
+    float32,
+    float64
+};
+
+enum class BinaryModelKind {
+    training,
+    inference,
+    checkpoint
+};
+
+struct BinaryMetadataEntry {
+    std::string key;
+    std::string value;
+};
+
+struct BinaryMetadata {
+    std::uint64_t created_unix_time{0};
+    std::string description;
+    std::vector<BinaryMetadataEntry> entries;
+};
+
+struct TrainingCheckpointInfo {
+    std::size_t completed_epochs{0};
+    bool best_checkpoint{false};
+    bool has_metric{false};
+    Scalar metric{static_cast<Scalar>(0)};
+    LearningRateSchedulerState learning_rate_state{};
+    TrainingOptions training_options{};
+    BinaryMetadata metadata{};
+};
+
+struct BinaryModelInfo {
+    std::uint32_t version{0};
+    BinaryScalarType scalar_type{BinaryScalarType::float32};
+    BinaryModelKind model_kind{BinaryModelKind::training};
+    std::size_t input_size{0};
+    std::size_t output_size{0};
+    std::size_t layer_count{0};
+    std::size_t weight_count{0};
+    std::size_t bias_count{0};
+    std::uint64_t seed{0};
+    std::uint64_t optimizer_step{0};
+    std::size_t completed_epochs{0};
+    bool checkpoint_best{false};
+    bool has_checkpoint_metric{false};
+    Scalar checkpoint_metric{static_cast<Scalar>(0)};
+    bool has_learning_rate_state{false};
+    LearningRateSchedulerState learning_rate_state{};
+    bool has_training_options{false};
+    TrainingOptions training_options{};
+    BinaryMetadata metadata{};
+    std::uint32_t checksum{0};
+};
+
+[[nodiscard]] BinaryModelInfo inspect_binary_model(const std::filesystem::path& path);
 
 using IndexedSampleFunction = void (*)(std::size_t index,
                                        Scalar* input,
@@ -440,6 +676,7 @@ private:
 struct LayerSpec {
     std::size_t neurons{0};
     Activation activation{Activation::linear};
+    Scalar dropout_probability{static_cast<Scalar>(0)};
 };
 
 struct LayerParameters {
@@ -448,6 +685,7 @@ struct LayerParameters {
     Activation activation{Activation::linear};
     Vector weights;
     Vector biases;
+    Scalar dropout_probability{static_cast<Scalar>(0)};
 };
 
 struct FeatureNormalization {
@@ -503,6 +741,7 @@ public:
     [[nodiscard]] static InferenceModel from_parameters(const std::vector<LayerParameters>& parameters,
                                                         const NormalizationSpec& normalization = {});
     [[nodiscard]] static InferenceModel load(const std::filesystem::path& path);
+    [[nodiscard]] static InferenceModel load_binary(const std::filesystem::path& path);
 
     InferenceModel(const InferenceModel& other);
     InferenceModel& operator=(const InferenceModel& other);
@@ -515,6 +754,8 @@ public:
     [[nodiscard]] std::size_t output_size() const noexcept;
     [[nodiscard]] std::size_t layer_count() const noexcept;
     [[nodiscard]] std::size_t scratch_size() const noexcept;
+    [[nodiscard]] std::size_t batch_scratch_size(std::size_t sample_count,
+                                                 const ParallelOptions& parallelism) const noexcept;
     [[nodiscard]] std::size_t weight_count() const noexcept;
     [[nodiscard]] std::size_t bias_count() const noexcept;
     [[nodiscard]] const Scalar* weights_data() const noexcept;
@@ -537,6 +778,25 @@ public:
                                                    std::size_t output_stride,
                                                    Scalar* scratch,
                                                    std::size_t scratch_size) const noexcept;
+    [[nodiscard]] InferenceStatus predict_batch_to(const Scalar* inputs,
+                                                   std::size_t sample_count,
+                                                   std::size_t input_stride,
+                                                   Scalar* outputs,
+                                                   std::size_t output_stride,
+                                                   Scalar* scratch,
+                                                   std::size_t scratch_size,
+                                                   const ParallelOptions& parallelism) const noexcept;
+    void predict_unchecked_to(const Scalar* input,
+                              Scalar* output,
+                              Scalar* scratch) const noexcept;
+    void predict_unchecked_to(const Scalar* input,
+                              InferenceWorkspace& workspace) const noexcept;
+    void predict_batch_unchecked_to(const Scalar* inputs,
+                                    std::size_t sample_count,
+                                    std::size_t input_stride,
+                                    Scalar* outputs,
+                                    std::size_t output_stride,
+                                    Scalar* scratch) const noexcept;
 
     [[nodiscard]] Vector predict(const Vector& input) const;
     [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
@@ -546,6 +806,7 @@ public:
 
     [[nodiscard]] std::vector<LayerParameters> parameters() const;
     void save(const std::filesystem::path& path) const;
+    void save_binary(const std::filesystem::path& path, const BinaryMetadata& metadata = {}) const;
 
 private:
     struct Impl;
@@ -553,6 +814,16 @@ private:
     explicit InferenceModel(std::unique_ptr<Impl> impl);
 
     std::unique_ptr<Impl> impl_;
+};
+
+class CompiledModel final : public InferenceModel {
+public:
+    [[nodiscard]] static CompiledModel from_parameters(const std::vector<LayerParameters>& parameters,
+                                                       const NormalizationSpec& normalization = {});
+    [[nodiscard]] static CompiledModel load(const std::filesystem::path& path);
+    [[nodiscard]] static CompiledModel load_binary(const std::filesystem::path& path);
+
+    explicit CompiledModel(InferenceModel model);
 };
 
 class InferenceWorkspace {
@@ -581,11 +852,14 @@ public:
     class Builder {
     public:
         Builder& input_size(std::size_t input_size);
-        Builder& add_layer(std::size_t neurons, Activation activation);
+        Builder& add_layer(std::size_t neurons,
+                           Activation activation,
+                           Scalar dropout_probability = static_cast<Scalar>(0));
         Builder& loss(Loss loss);
         Builder& loss(LossConfig loss);
         Builder& optimizer(OptimizerConfig optimizer);
         Builder& normalization(NormalizationSpec normalization);
+        Builder& initialization(InitializationConfig initialization);
         Builder& seed(std::uint64_t seed);
 
         [[nodiscard]] TrainingModel build() const;
@@ -598,11 +872,15 @@ public:
         LossConfig loss_{};
         OptimizerConfig optimizer_{OptimizerConfig::adam()};
         NormalizationSpec normalization_{};
+        InitializationConfig initialization_{};
         std::uint64_t seed_{5489u};
     };
 
     [[nodiscard]] static Builder builder();
     [[nodiscard]] static TrainingModel load(const std::filesystem::path& path);
+    [[nodiscard]] static TrainingModel load_binary(const std::filesystem::path& path);
+    [[nodiscard]] static TrainingModel load_checkpoint(const std::filesystem::path& path,
+                                                       TrainingCheckpointInfo* info = nullptr);
 
     TrainingModel(const TrainingModel& other);
     TrainingModel& operator=(const TrainingModel& other);
@@ -617,6 +895,7 @@ public:
     [[nodiscard]] LossConfig loss_config() const;
     [[nodiscard]] OptimizerConfig optimizer() const;
     [[nodiscard]] NormalizationSpec normalization() const;
+    [[nodiscard]] std::size_t completed_epochs() const;
 
     [[nodiscard]] Vector predict(const Vector& input) const;
     [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
@@ -631,9 +910,13 @@ public:
 
     [[nodiscard]] std::vector<LayerParameters> parameters() const;
     void set_parameters(const std::vector<LayerParameters>& parameters);
+    [[nodiscard]] CompiledModel compile() const;
     [[nodiscard]] InferenceModel to_inference_model() const;
 
     void save(const std::filesystem::path& path) const;
+    void save_binary(const std::filesystem::path& path, const BinaryMetadata& metadata = {}) const;
+    void save_checkpoint(const std::filesystem::path& path,
+                         const TrainingCheckpointInfo& info = {}) const;
 
 private:
     struct Impl;
@@ -644,5 +927,6 @@ private:
 };
 
 using Model = TrainingModel;
+using MutableModel = TrainingModel;
 
 } // namespace brutal_mlp
