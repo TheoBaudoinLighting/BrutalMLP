@@ -13,7 +13,13 @@
 namespace brutal_mlp {
 namespace {
 
-constexpr Scalar kProbabilityEpsilon = 1e-12;
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
+constexpr Scalar kProbabilityEpsilon = Scalar{1e-12};
+constexpr Scalar kTargetSumTolerance = Scalar{1e-8};
+#else
+constexpr Scalar kProbabilityEpsilon = Scalar{1e-7f};
+constexpr Scalar kTargetSumTolerance = Scalar{1e-4f};
+#endif
 
 [[nodiscard]] bool is_finite(Scalar value) {
     return std::isfinite(value);
@@ -33,19 +39,19 @@ void require_finite(Scalar value, const std::string& name) {
     if (value < kProbabilityEpsilon) {
         return kProbabilityEpsilon;
     }
-    if (value > 1.0 - kProbabilityEpsilon) {
-        return 1.0 - kProbabilityEpsilon;
+    if (value > Scalar{1} - kProbabilityEpsilon) {
+        return Scalar{1} - kProbabilityEpsilon;
     }
     return value;
 }
 
 [[nodiscard]] Scalar sigmoid(Scalar value) noexcept {
-    if (value >= 0.0) {
-        const Scalar z = std::exp(-value);
-        return 1.0 / (1.0 + z);
+    if (value >= Scalar{0}) {
+        const Scalar z = static_cast<Scalar>(std::exp(-value));
+        return Scalar{1} / (Scalar{1} + z);
     }
-    const Scalar z = std::exp(value);
-    return z / (1.0 + z);
+    const Scalar z = static_cast<Scalar>(std::exp(value));
+    return z / (Scalar{1} + z);
 }
 
 [[nodiscard]] Vector apply_activation(const Vector& values, Activation activation) {
@@ -56,7 +62,7 @@ void require_finite(Scalar value, const std::string& name) {
         return values;
     case Activation::relu:
         std::transform(values.begin(), values.end(), result.begin(), [](Scalar v) {
-            return std::max<Scalar>(0.0, v);
+            return std::max<Scalar>(Scalar{0}, v);
         });
         return result;
     case Activation::sigmoid:
@@ -64,14 +70,14 @@ void require_finite(Scalar value, const std::string& name) {
         return result;
     case Activation::tanh:
         std::transform(values.begin(), values.end(), result.begin(), [](Scalar v) {
-            return std::tanh(v);
+            return static_cast<Scalar>(std::tanh(v));
         });
         return result;
     case Activation::softmax: {
         const Scalar max_value = *std::max_element(values.begin(), values.end());
-        Scalar sum = 0.0;
+        Scalar sum = Scalar{0};
         for (std::size_t i = 0; i < values.size(); ++i) {
-            result[i] = std::exp(values[i] - max_value);
+            result[i] = static_cast<Scalar>(std::exp(values[i] - max_value));
             sum += result[i];
         }
         for (Scalar& value : result) {
@@ -87,13 +93,13 @@ void require_finite(Scalar value, const std::string& name) {
 [[nodiscard]] Scalar activation_derivative(Activation activation, Scalar pre_activation, Scalar activation_value) {
     switch (activation) {
     case Activation::linear:
-        return 1.0;
+        return Scalar{1};
     case Activation::relu:
-        return pre_activation > 0.0 ? 1.0 : 0.0;
+        return pre_activation > Scalar{0} ? Scalar{1} : Scalar{0};
     case Activation::sigmoid:
-        return activation_value * (1.0 - activation_value);
+        return activation_value * (Scalar{1} - activation_value);
     case Activation::tanh:
-        return 1.0 - activation_value * activation_value;
+        return Scalar{1} - activation_value * activation_value;
     case Activation::softmax:
         throw std::invalid_argument("softmax derivative requires the full Jacobian");
     }
@@ -103,29 +109,29 @@ void require_finite(Scalar value, const std::string& name) {
 
 void validate_optimizer(const OptimizerConfig& optimizer) {
     require_finite(optimizer.learning_rate, "learning_rate");
-    require(optimizer.learning_rate > 0.0, "learning_rate must be positive");
+    require(optimizer.learning_rate > Scalar{0}, "learning_rate must be positive");
     require_finite(optimizer.beta1, "beta1");
     require_finite(optimizer.beta2, "beta2");
-    require(optimizer.beta1 >= 0.0 && optimizer.beta1 < 1.0, "beta1 must be in [0, 1)");
-    require(optimizer.beta2 >= 0.0 && optimizer.beta2 < 1.0, "beta2 must be in [0, 1)");
+    require(optimizer.beta1 >= Scalar{0} && optimizer.beta1 < Scalar{1}, "beta1 must be in [0, 1)");
+    require(optimizer.beta2 >= Scalar{0} && optimizer.beta2 < Scalar{1}, "beta2 must be in [0, 1)");
     require_finite(optimizer.epsilon, "epsilon");
-    require(optimizer.epsilon > 0.0, "epsilon must be positive");
+    require(optimizer.epsilon > Scalar{0}, "epsilon must be positive");
     require_finite(optimizer.momentum, "momentum");
-    require(optimizer.momentum >= 0.0 && optimizer.momentum < 1.0, "momentum must be in [0, 1)");
+    require(optimizer.momentum >= Scalar{0} && optimizer.momentum < Scalar{1}, "momentum must be in [0, 1)");
     require_finite(optimizer.l2, "l2");
-    require(optimizer.l2 >= 0.0, "l2 must be non-negative");
+    require(optimizer.l2 >= Scalar{0}, "l2 must be non-negative");
     require_finite(optimizer.gradient_clip_norm, "gradient_clip_norm");
-    require(optimizer.gradient_clip_norm >= 0.0, "gradient_clip_norm must be non-negative");
+    require(optimizer.gradient_clip_norm >= Scalar{0}, "gradient_clip_norm must be non-negative");
 }
 
 void validate_training_options(const TrainingOptions& options) {
     require(options.epochs > 0, "epochs must be positive");
     require(options.batch_size > 0, "batch_size must be positive");
     require_finite(options.validation_split, "validation_split");
-    require(options.validation_split >= 0.0 && options.validation_split < 1.0,
+    require(options.validation_split >= Scalar{0} && options.validation_split < Scalar{1},
             "validation_split must be in [0, 1)");
     require_finite(options.min_delta, "min_delta");
-    require(options.min_delta >= 0.0, "min_delta must be non-negative");
+    require(options.min_delta >= Scalar{0}, "min_delta must be non-negative");
 }
 
 void validate_matrix(const Matrix& matrix,
@@ -149,19 +155,19 @@ void validate_targets_for_loss(const Matrix& targets, Loss loss) {
     case Loss::binary_cross_entropy:
         for (const Vector& target : targets) {
             for (Scalar value : target) {
-                require(value >= 0.0 && value <= 1.0,
+                require(value >= Scalar{0} && value <= Scalar{1},
                         "binary_cross_entropy targets must be in [0, 1]");
             }
         }
         return;
     case Loss::categorical_cross_entropy:
         for (const Vector& target : targets) {
-            Scalar sum = 0.0;
+            Scalar sum = Scalar{0};
             for (Scalar value : target) {
-                require(value >= 0.0, "categorical_cross_entropy targets must be non-negative");
+                require(value >= Scalar{0}, "categorical_cross_entropy targets must be non-negative");
                 sum += value;
             }
-            require(std::abs(sum - 1.0) <= 1e-6,
+            require(std::abs(sum - Scalar{1}) <= kTargetSumTolerance,
                     "categorical_cross_entropy targets must sum to 1");
         }
         return;
@@ -214,7 +220,7 @@ void apply_activation_in_place(Scalar* values, std::size_t size, Activation acti
         return;
     case Activation::relu:
         for (std::size_t i = 0; i < size; ++i) {
-            values[i] = values[i] > 0.0 ? values[i] : 0.0;
+            values[i] = values[i] > Scalar{0} ? values[i] : Scalar{0};
         }
         return;
     case Activation::sigmoid:
@@ -224,7 +230,7 @@ void apply_activation_in_place(Scalar* values, std::size_t size, Activation acti
         return;
     case Activation::tanh:
         for (std::size_t i = 0; i < size; ++i) {
-            values[i] = std::tanh(values[i]);
+            values[i] = static_cast<Scalar>(std::tanh(values[i]));
         }
         return;
     case Activation::softmax: {
@@ -235,9 +241,9 @@ void apply_activation_in_place(Scalar* values, std::size_t size, Activation acti
             }
         }
 
-        Scalar sum = 0.0;
+        Scalar sum = Scalar{0};
         for (std::size_t i = 0; i < size; ++i) {
-            values[i] = std::exp(values[i] - max_value);
+            values[i] = static_cast<Scalar>(std::exp(values[i] - max_value));
             sum += values[i];
         }
         for (std::size_t i = 0; i < size; ++i) {
@@ -628,8 +634,8 @@ InferenceStatus InferenceModel::predict_batch_to(const Scalar* inputs,
 }
 
 Vector InferenceModel::predict(const Vector& input) const {
-    Vector output(output_size(), 0.0);
-    Vector scratch(scratch_size(), 0.0);
+    Vector output(output_size(), Scalar{0});
+    Vector scratch(scratch_size(), Scalar{0});
     const InferenceStatus status =
         predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), scratch.size());
     if (status != InferenceStatus::ok) {
@@ -642,10 +648,10 @@ Matrix InferenceModel::predict_batch(const Matrix& inputs) const {
     validate_matrix(inputs, input_size(), "inputs", true);
     Matrix result;
     result.reserve(inputs.size());
-    Vector scratch(scratch_size(), 0.0);
+    Vector scratch(scratch_size(), Scalar{0});
 
     for (const Vector& input : inputs) {
-        Vector output(output_size(), 0.0);
+        Vector output(output_size(), Scalar{0});
         const InferenceStatus status =
             predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), scratch.size());
         if (status != InferenceStatus::ok) {
@@ -662,8 +668,8 @@ InferenceWorkspace::InferenceWorkspace(const InferenceModel& model) {
 }
 
 void InferenceWorkspace::resize_for(const InferenceModel& model) {
-    output_.assign(model.output_size(), 0.0);
-    scratch_.assign(model.scratch_size(), 0.0);
+    output_.assign(model.output_size(), Scalar{0});
+    scratch_.assign(model.scratch_size(), Scalar{0});
 }
 
 void InferenceWorkspace::clear() noexcept {
@@ -831,7 +837,7 @@ struct TrainingModel::Impl {
     [[nodiscard]] Vector forward(const Vector& input) const {
         Vector activations = input;
         for (const Layer& layer : layers) {
-            Vector z(layer.output_size, 0.0);
+            Vector z(layer.output_size, Scalar{0});
             for (std::size_t out = 0; out < layer.output_size; ++out) {
                 Scalar value = layer.biases[out];
                 const std::size_t offset = out * layer.input_size;
@@ -856,7 +862,7 @@ struct TrainingModel::Impl {
 
         for (const Layer& layer : layers) {
             const Vector& previous = activations.back();
-            Vector z(layer.output_size, 0.0);
+            Vector z(layer.output_size, Scalar{0});
             for (std::size_t out = 0; out < layer.output_size; ++out) {
                 Scalar value = layer.biases[out];
                 const std::size_t offset = out * layer.input_size;
@@ -873,7 +879,7 @@ struct TrainingModel::Impl {
     }
 
     [[nodiscard]] Scalar sample_loss(const Vector& prediction, const Vector& target) const {
-        Scalar total = 0.0;
+        Scalar total = Scalar{0};
 
         switch (loss) {
         case Loss::mean_squared_error:
@@ -885,12 +891,13 @@ struct TrainingModel::Impl {
         case Loss::binary_cross_entropy:
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 const Scalar p = clamp_probability(prediction[i]);
-                total += -target[i] * std::log(p) - (1.0 - target[i]) * std::log(1.0 - p);
+                total += static_cast<Scalar>(-target[i] * std::log(p) -
+                                             (Scalar{1} - target[i]) * std::log(Scalar{1} - p));
             }
             return total / static_cast<Scalar>(prediction.size());
         case Loss::categorical_cross_entropy:
             for (std::size_t i = 0; i < prediction.size(); ++i) {
-                total += -target[i] * std::log(clamp_probability(prediction[i]));
+                total += static_cast<Scalar>(-target[i] * std::log(clamp_probability(prediction[i])));
             }
             return total;
         }
@@ -902,7 +909,7 @@ struct TrainingModel::Impl {
                                       const Vector& target,
                                       const Vector& output_pre_activation) const {
         const Layer& output_layer = layers.back();
-        Vector delta(prediction.size(), 0.0);
+        Vector delta(prediction.size(), Scalar{0});
 
         if (loss == Loss::categorical_cross_entropy && output_layer.activation == Activation::softmax) {
             for (std::size_t i = 0; i < prediction.size(); ++i) {
@@ -912,27 +919,27 @@ struct TrainingModel::Impl {
         }
 
         if (loss == Loss::binary_cross_entropy && output_layer.activation == Activation::sigmoid) {
-            const Scalar scale = 1.0 / static_cast<Scalar>(prediction.size());
+            const Scalar scale = Scalar{1} / static_cast<Scalar>(prediction.size());
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 delta[i] = (prediction[i] - target[i]) * scale;
             }
             return delta;
         }
 
-        Vector activation_gradient(prediction.size(), 0.0);
+        Vector activation_gradient(prediction.size(), Scalar{0});
         switch (loss) {
         case Loss::mean_squared_error: {
-            const Scalar scale = 2.0 / static_cast<Scalar>(prediction.size());
+            const Scalar scale = Scalar{2} / static_cast<Scalar>(prediction.size());
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 activation_gradient[i] = (prediction[i] - target[i]) * scale;
             }
             break;
         }
         case Loss::binary_cross_entropy: {
-            const Scalar scale = 1.0 / static_cast<Scalar>(prediction.size());
+            const Scalar scale = Scalar{1} / static_cast<Scalar>(prediction.size());
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 const Scalar p = clamp_probability(prediction[i]);
-                activation_gradient[i] = ((1.0 - target[i]) / (1.0 - p) - target[i] / p) * scale;
+                activation_gradient[i] = ((Scalar{1} - target[i]) / (Scalar{1} - p) - target[i] / p) * scale;
             }
             break;
         }
@@ -947,7 +954,7 @@ struct TrainingModel::Impl {
             const Scalar dot = std::inner_product(activation_gradient.begin(),
                                                   activation_gradient.end(),
                                                   prediction.begin(),
-                                                  Scalar{0.0});
+                                                  Scalar{0});
             for (std::size_t i = 0; i < prediction.size(); ++i) {
                 delta[i] = prediction[i] * (activation_gradient[i] - dot);
             }
@@ -984,9 +991,9 @@ struct TrainingModel::Impl {
             }
 
             const Layer& previous_layer = layers[layer_offset - 1];
-            Vector previous_delta(layer.input_size, 0.0);
+            Vector previous_delta(layer.input_size, Scalar{0});
             for (std::size_t in = 0; in < layer.input_size; ++in) {
-                Scalar value = 0.0;
+                Scalar value = Scalar{0};
                 for (std::size_t out = 0; out < layer.output_size; ++out) {
                     value += layer.weights[out * layer.input_size + in] * delta[out];
                 }
@@ -1001,15 +1008,15 @@ struct TrainingModel::Impl {
 
     void zero_gradients() {
         for (Layer& layer : layers) {
-            std::fill(layer.grad_weights.begin(), layer.grad_weights.end(), 0.0);
-            std::fill(layer.grad_biases.begin(), layer.grad_biases.end(), 0.0);
+            std::fill(layer.grad_weights.begin(), layer.grad_weights.end(), Scalar{0});
+            std::fill(layer.grad_biases.begin(), layer.grad_biases.end(), Scalar{0});
         }
     }
 
     void apply_gradients(std::size_t batch_size) {
         ++optimizer_step;
-        const Scalar batch_scale = 1.0 / static_cast<Scalar>(batch_size);
-        Scalar norm_squared = 0.0;
+        const Scalar batch_scale = Scalar{1} / static_cast<Scalar>(batch_size);
+        Scalar norm_squared = Scalar{0};
 
         for (const Layer& layer : layers) {
             for (std::size_t i = 0; i < layer.weights.size(); ++i) {
@@ -1022,9 +1029,9 @@ struct TrainingModel::Impl {
             }
         }
 
-        Scalar clip_scale = 1.0;
-        if (optimizer.gradient_clip_norm > 0.0) {
-            const Scalar norm = std::sqrt(norm_squared);
+        Scalar clip_scale = Scalar{1};
+        if (optimizer.gradient_clip_norm > Scalar{0}) {
+            const Scalar norm = static_cast<Scalar>(std::sqrt(norm_squared));
             if (norm > optimizer.gradient_clip_norm) {
                 clip_scale = optimizer.gradient_clip_norm / (norm + std::numeric_limits<Scalar>::epsilon());
             }
@@ -1069,7 +1076,7 @@ struct TrainingModel::Impl {
 
             switch (optimizer.type) {
             case OptimizerType::sgd:
-                if (optimizer.momentum > 0.0) {
+                if (optimizer.momentum > Scalar{0}) {
                     velocities[i] = optimizer.momentum * velocities[i] - optimizer.learning_rate * gradient;
                     values[i] += velocities[i];
                 } else {
@@ -1077,15 +1084,18 @@ struct TrainingModel::Impl {
                 }
                 break;
             case OptimizerType::adam: {
-                first_moments[i] = optimizer.beta1 * first_moments[i] + (1.0 - optimizer.beta1) * gradient;
+                first_moments[i] = optimizer.beta1 * first_moments[i] + (Scalar{1} - optimizer.beta1) * gradient;
                 second_moments[i] =
-                    optimizer.beta2 * second_moments[i] + (1.0 - optimizer.beta2) * gradient * gradient;
+                    optimizer.beta2 * second_moments[i] + (Scalar{1} - optimizer.beta2) * gradient * gradient;
 
-                const Scalar bias_correction1 = 1.0 - std::pow(optimizer.beta1, static_cast<Scalar>(optimizer_step));
-                const Scalar bias_correction2 = 1.0 - std::pow(optimizer.beta2, static_cast<Scalar>(optimizer_step));
+                const Scalar bias_correction1 =
+                    Scalar{1} - static_cast<Scalar>(std::pow(optimizer.beta1, static_cast<Scalar>(optimizer_step)));
+                const Scalar bias_correction2 =
+                    Scalar{1} - static_cast<Scalar>(std::pow(optimizer.beta2, static_cast<Scalar>(optimizer_step)));
                 const Scalar m_hat = first_moments[i] / bias_correction1;
                 const Scalar v_hat = second_moments[i] / bias_correction2;
-                values[i] -= optimizer.learning_rate * m_hat / (std::sqrt(v_hat) + optimizer.epsilon);
+                values[i] -= optimizer.learning_rate * m_hat /
+                             (static_cast<Scalar>(std::sqrt(v_hat)) + optimizer.epsilon);
                 break;
             }
             }
@@ -1095,7 +1105,7 @@ struct TrainingModel::Impl {
     [[nodiscard]] Scalar loss_for_indices(const Matrix& inputs,
                                           const Matrix& targets,
                                           const std::vector<std::size_t>& indices) const {
-        Scalar total = 0.0;
+        Scalar total = Scalar{0};
         for (std::size_t index : indices) {
             total += sample_loss(forward(inputs[index]), targets[index]);
         }
@@ -1141,12 +1151,12 @@ struct TrainingModel::Impl {
     }
 
     static void reset_optimizer_state(Layer& layer) {
-        std::fill(layer.velocity_weights.begin(), layer.velocity_weights.end(), 0.0);
-        std::fill(layer.velocity_biases.begin(), layer.velocity_biases.end(), 0.0);
-        std::fill(layer.first_moment_weights.begin(), layer.first_moment_weights.end(), 0.0);
-        std::fill(layer.first_moment_biases.begin(), layer.first_moment_biases.end(), 0.0);
-        std::fill(layer.second_moment_weights.begin(), layer.second_moment_weights.end(), 0.0);
-        std::fill(layer.second_moment_biases.begin(), layer.second_moment_biases.end(), 0.0);
+        std::fill(layer.velocity_weights.begin(), layer.velocity_weights.end(), Scalar{0});
+        std::fill(layer.velocity_biases.begin(), layer.velocity_biases.end(), Scalar{0});
+        std::fill(layer.first_moment_weights.begin(), layer.first_moment_weights.end(), Scalar{0});
+        std::fill(layer.first_moment_biases.begin(), layer.first_moment_biases.end(), Scalar{0});
+        std::fill(layer.second_moment_weights.begin(), layer.second_moment_weights.end(), Scalar{0});
+        std::fill(layer.second_moment_biases.begin(), layer.second_moment_biases.end(), Scalar{0});
     }
 };
 
@@ -1216,19 +1226,21 @@ TrainingModel TrainingModel::Builder::build() const {
 
         const std::size_t weight_count = layer.input_size * layer.output_size;
         layer.weights.resize(weight_count);
-        layer.biases.assign(layer.output_size, 0.0);
-        layer.grad_weights.assign(weight_count, 0.0);
-        layer.grad_biases.assign(layer.output_size, 0.0);
-        layer.velocity_weights.assign(weight_count, 0.0);
-        layer.velocity_biases.assign(layer.output_size, 0.0);
-        layer.first_moment_weights.assign(weight_count, 0.0);
-        layer.first_moment_biases.assign(layer.output_size, 0.0);
-        layer.second_moment_weights.assign(weight_count, 0.0);
-        layer.second_moment_biases.assign(layer.output_size, 0.0);
+        layer.biases.assign(layer.output_size, Scalar{0});
+        layer.grad_weights.assign(weight_count, Scalar{0});
+        layer.grad_biases.assign(layer.output_size, Scalar{0});
+        layer.velocity_weights.assign(weight_count, Scalar{0});
+        layer.velocity_biases.assign(layer.output_size, Scalar{0});
+        layer.first_moment_weights.assign(weight_count, Scalar{0});
+        layer.first_moment_biases.assign(layer.output_size, Scalar{0});
+        layer.second_moment_weights.assign(weight_count, Scalar{0});
+        layer.second_moment_biases.assign(layer.output_size, Scalar{0});
 
         const Scalar limit = spec.activation == Activation::relu
-                                 ? std::sqrt(6.0 / static_cast<Scalar>(layer.input_size))
-                                 : std::sqrt(6.0 / static_cast<Scalar>(layer.input_size + layer.output_size));
+                                 ? static_cast<Scalar>(std::sqrt(Scalar{6} /
+                                                                 static_cast<Scalar>(layer.input_size)))
+                                 : static_cast<Scalar>(std::sqrt(
+                                       Scalar{6} / static_cast<Scalar>(layer.input_size + layer.output_size)));
         std::uniform_real_distribution<Scalar> distribution(-limit, limit);
         for (Scalar& weight : layer.weights) {
             weight = distribution(rng);
@@ -1304,7 +1316,7 @@ Matrix TrainingModel::predict_batch(const Matrix& inputs) const {
 
 Scalar TrainingModel::evaluate_loss(const Matrix& inputs, const Matrix& targets) const {
     validate_training_data(inputs, targets, input_size(), output_size(), impl_->loss);
-    Scalar total = 0.0;
+    Scalar total = Scalar{0};
     for (std::size_t i = 0; i < inputs.size(); ++i) {
         total += impl_->sample_loss(impl_->forward(inputs[i]), targets[i]);
     }
@@ -1317,7 +1329,7 @@ TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, 
 
     std::vector<std::size_t> indices = make_indices(inputs.size());
     std::mt19937_64 split_rng(non_zero_seed(options.seed, impl_->seed));
-    if (options.validation_split > 0.0) {
+    if (options.validation_split > Scalar{0}) {
         std::shuffle(indices.begin(), indices.end(), split_rng);
     }
 

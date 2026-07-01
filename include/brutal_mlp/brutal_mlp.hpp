@@ -10,7 +10,12 @@
 
 namespace brutal_mlp {
 
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
 using Scalar = double;
+#else
+using Scalar = float;
+#endif
+
 using Vector = std::vector<Scalar>;
 using Matrix = std::vector<Vector>;
 
@@ -56,16 +61,17 @@ enum class InferenceStatus {
 
 struct OptimizerConfig {
     OptimizerType type{OptimizerType::adam};
-    Scalar learning_rate{0.001};
-    Scalar beta1{0.9};
-    Scalar beta2{0.999};
-    Scalar epsilon{1e-8};
-    Scalar momentum{0.0};
-    Scalar l2{0.0};
-    Scalar gradient_clip_norm{0.0};
+    Scalar learning_rate{static_cast<Scalar>(0.001)};
+    Scalar beta1{static_cast<Scalar>(0.9)};
+    Scalar beta2{static_cast<Scalar>(0.999)};
+    Scalar epsilon{static_cast<Scalar>(1e-8)};
+    Scalar momentum{static_cast<Scalar>(0)};
+    Scalar l2{static_cast<Scalar>(0)};
+    Scalar gradient_clip_norm{static_cast<Scalar>(0)};
 
-    [[nodiscard]] static OptimizerConfig adam(Scalar learning_rate = 0.001);
-    [[nodiscard]] static OptimizerConfig sgd(Scalar learning_rate = 0.01, Scalar momentum = 0.0);
+    [[nodiscard]] static OptimizerConfig adam(Scalar learning_rate = static_cast<Scalar>(0.001));
+    [[nodiscard]] static OptimizerConfig sgd(Scalar learning_rate = static_cast<Scalar>(0.01),
+                                             Scalar momentum = static_cast<Scalar>(0));
 };
 
 struct TrainingOptions {
@@ -73,9 +79,9 @@ struct TrainingOptions {
     std::size_t batch_size{32};
     bool shuffle{true};
     std::uint64_t seed{0};
-    Scalar validation_split{0.0};
+    Scalar validation_split{static_cast<Scalar>(0)};
     std::size_t early_stopping_patience{0};
-    Scalar min_delta{1e-8};
+    Scalar min_delta{static_cast<Scalar>(1e-8)};
     bool restore_best_weights{true};
 };
 

@@ -18,6 +18,8 @@ namespace bm = brutal_mlp;
 
 namespace {
 
+constexpr double kTightTolerance = sizeof(bm::Scalar) == sizeof(float) ? 1e-5 : 1e-12;
+
 std::atomic<bool> g_count_allocations{false};
 std::atomic<std::size_t> g_allocation_count{0};
 
@@ -116,6 +118,11 @@ void operator delete[](void* pointer, std::size_t) noexcept {
 TEST(ApiShape, ModelIsLegacyAliasForTrainingModel) {
     static_assert(std::is_same<bm::Model, bm::TrainingModel>::value,
                   "Model should remain a source-compatible alias for TrainingModel");
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
+    static_assert(std::is_same<bm::Scalar, double>::value, "BRUTAL_MLP_USE_DOUBLE should select double");
+#else
+    static_assert(std::is_same<bm::Scalar, float>::value, "Default Scalar should be float");
+#endif
     static_assert(noexcept(std::declval<const bm::InferenceModel&>().predict_to(nullptr, 0, nullptr, 0, nullptr, 0)),
                   "InferenceModel::predict_to must remain noexcept");
     static_assert(noexcept(std::declval<const bm::InferenceModel&>().predict_to(
@@ -158,14 +165,14 @@ TEST(StringConversions, RejectUnknownValues) {
 TEST(OptimizerConfig, FactoriesExposeExpectedDefaults) {
     const auto adam = bm::OptimizerConfig::adam(0.02);
     EXPECT_EQ(adam.type, bm::OptimizerType::adam);
-    EXPECT_DOUBLE_EQ(adam.learning_rate, 0.02);
-    EXPECT_DOUBLE_EQ(adam.beta1, 0.9);
-    EXPECT_DOUBLE_EQ(adam.beta2, 0.999);
+    EXPECT_NEAR(adam.learning_rate, 0.02, kTightTolerance);
+    EXPECT_NEAR(adam.beta1, 0.9, kTightTolerance);
+    EXPECT_NEAR(adam.beta2, 0.999, kTightTolerance);
 
     const auto sgd = bm::OptimizerConfig::sgd(0.3, 0.4);
     EXPECT_EQ(sgd.type, bm::OptimizerType::sgd);
-    EXPECT_DOUBLE_EQ(sgd.learning_rate, 0.3);
-    EXPECT_DOUBLE_EQ(sgd.momentum, 0.4);
+    EXPECT_NEAR(sgd.learning_rate, 0.3, kTightTolerance);
+    EXPECT_NEAR(sgd.momentum, 0.4, kTightTolerance);
 }
 
 TEST(BuilderValidation, RejectsInvalidTopology) {
@@ -224,7 +231,7 @@ TEST(BuilderValidation, RejectsInvalidOptimizerConfiguration) {
 TEST(Prediction, ComputesKnownLinearLayer) {
     const auto model = make_known_linear_model();
     const auto prediction = model.predict({3.0, 1.0});
-    expect_vector_near(prediction, {5.5}, 1e-12);
+    expect_vector_near(prediction, {5.5}, kTightTolerance);
 }
 
 TEST(Prediction, BatchPredictionMatchesIndividualPrediction) {
@@ -234,14 +241,14 @@ TEST(Prediction, BatchPredictionMatchesIndividualPrediction) {
 
     ASSERT_EQ(batch.size(), inputs.size());
     for (std::size_t i = 0; i < inputs.size(); ++i) {
-        expect_vector_near(batch[i], model.predict(inputs[i]), 1e-12);
+        expect_vector_near(batch[i], model.predict(inputs[i]), kTightTolerance);
     }
 }
 
 TEST(Prediction, RejectsInvalidInputs) {
     const auto model = make_known_linear_model();
     EXPECT_THROW((void)model.predict({1.0}), std::invalid_argument);
-    EXPECT_THROW((void)model.predict({1.0, std::numeric_limits<double>::quiet_NaN()}), std::invalid_argument);
+    EXPECT_THROW((void)model.predict({1.0, std::numeric_limits<bm::Scalar>::quiet_NaN()}), std::invalid_argument);
     EXPECT_THROW((void)model.predict_batch({{1.0}}), std::invalid_argument);
 }
 
@@ -255,8 +262,8 @@ TEST(Activations, SigmoidIsStableForLargeMagnitudeInputs) {
         bm::LayerParameters{1, 1, bm::Activation::sigmoid, {1.0}, {0.0}},
     });
 
-    EXPECT_NEAR(model.predict({1000.0})[0], 1.0, 1e-12);
-    EXPECT_NEAR(model.predict({-1000.0})[0], 0.0, 1e-12);
+    EXPECT_NEAR(model.predict({1000.0})[0], 1.0, kTightTolerance);
+    EXPECT_NEAR(model.predict({-1000.0})[0], 0.0, kTightTolerance);
 }
 
 TEST(Activations, SoftmaxProducesProbabilityDistribution) {
@@ -275,14 +282,14 @@ TEST(Activations, SoftmaxProducesProbabilityDistribution) {
 
     const auto prediction = model.predict({1.0, 2.0, 3.0});
     const double sum = std::accumulate(prediction.begin(), prediction.end(), 0.0);
-    EXPECT_NEAR(sum, 1.0, 1e-12);
+    EXPECT_NEAR(sum, 1.0, kTightTolerance);
     EXPECT_GT(prediction[2], prediction[1]);
     EXPECT_GT(prediction[1], prediction[0]);
 }
 
 TEST(Losses, MeanSquaredErrorMatchesKnownValue) {
     const auto model = make_known_linear_model();
-    EXPECT_NEAR(model.evaluate_loss({{3.0, 1.0}}, {{4.5}}), 1.0, 1e-12);
+    EXPECT_NEAR(model.evaluate_loss({{3.0, 1.0}}, {{4.5}}), 1.0, kTightTolerance);
 }
 
 TEST(Losses, BinaryCrossEntropyMatchesKnownValue) {
@@ -295,7 +302,7 @@ TEST(Losses, BinaryCrossEntropyMatchesKnownValue) {
         bm::LayerParameters{1, 1, bm::Activation::sigmoid, {0.0}, {0.0}},
     });
 
-    EXPECT_NEAR(model.evaluate_loss({{99.0}}, {{1.0}}), std::log(2.0), 1e-12);
+    EXPECT_NEAR(model.evaluate_loss({{99.0}}, {{1.0}}), std::log(2.0), kTightTolerance);
 }
 
 TEST(Losses, CategoricalCrossEntropyMatchesKnownValue) {
@@ -308,7 +315,7 @@ TEST(Losses, CategoricalCrossEntropyMatchesKnownValue) {
         bm::LayerParameters{1, 3, bm::Activation::softmax, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}},
     });
 
-    EXPECT_NEAR(model.evaluate_loss({{0.0}}, {{0.0, 1.0, 0.0}}), std::log(3.0), 1e-12);
+    EXPECT_NEAR(model.evaluate_loss({{0.0}}, {{0.0, 1.0, 0.0}}), std::log(3.0), kTightTolerance);
 }
 
 TEST(Losses, RejectsInvalidTargetsForLossContracts) {
@@ -473,7 +480,7 @@ TEST(Parameters, RoundTripAndSetParametersWork) {
     parameters[0].biases = {2.0};
     model.set_parameters(parameters);
 
-    expect_vector_near(model.predict({3.0, 1.0}), {3.0}, 1e-12);
+    expect_vector_near(model.predict({3.0, 1.0}), {3.0}, kTightTolerance);
 }
 
 TEST(Parameters, RejectsShapeAndActivationMismatches) {
@@ -498,7 +505,7 @@ TEST(Parameters, ReturnedParametersAreIndependentCopies) {
     auto parameters = model.parameters();
     parameters[0].weights[0] = 100.0;
 
-    expect_vector_near(model.predict({3.0, 1.0}), {5.5}, 1e-12);
+    expect_vector_near(model.predict({3.0, 1.0}), {5.5}, kTightTolerance);
 }
 
 TEST(InferenceModel, FrozenModelMatchesTrainingPrediction) {
@@ -516,7 +523,7 @@ TEST(InferenceModel, FrozenModelMatchesTrainingPrediction) {
     EXPECT_NE(inference.biases_data(), nullptr);
     EXPECT_EQ(inference.scratch_size(), 6U);
 
-    expect_vector_near(inference.predict(input), training.predict(input), 1e-12);
+    expect_vector_near(inference.predict(input), training.predict(input), kTightTolerance);
 
     bm::Vector output(inference.output_size(), 0.0);
     bm::Vector scratch(inference.scratch_size(), 0.0);
@@ -524,7 +531,7 @@ TEST(InferenceModel, FrozenModelMatchesTrainingPrediction) {
         inference.predict_to(input.data(), input.size(), output.data(), output.size(), scratch.data(), scratch.size());
 
     EXPECT_EQ(status, bm::InferenceStatus::ok);
-    expect_vector_near(output, training.predict(input), 1e-12);
+    expect_vector_near(output, training.predict(input), kTightTolerance);
 }
 
 TEST(InferenceModel, PredictToDoesNotAllocateOnHotPath) {
@@ -558,7 +565,7 @@ TEST(InferenceModel, WorkspacePredictDoesNotAllocateOnHotPath) {
 
     EXPECT_EQ(status, bm::InferenceStatus::ok);
     EXPECT_EQ(g_allocation_count.load(std::memory_order_relaxed), 0U);
-    expect_vector_near(workspace.output(), inference.predict(input), 1e-12);
+    expect_vector_near(workspace.output(), inference.predict(input), kTightTolerance);
 }
 
 TEST(InferenceModel, BatchPredictToMatchesScalarPredictionAndDoesNotAllocate) {
@@ -595,7 +602,7 @@ TEST(InferenceModel, BatchPredictToMatchesScalarPredictionAndDoesNotAllocate) {
     for (std::size_t sample = 0; sample < samples; ++sample) {
         bm::Vector input{inputs[sample * input_stride], inputs[sample * input_stride + 1]};
         bm::Vector actual{outputs[sample * output_stride], outputs[sample * output_stride + 1]};
-        expect_vector_near(actual, inference.predict(input), 1e-12);
+        expect_vector_near(actual, inference.predict(input), kTightTolerance);
         EXPECT_EQ(outputs[sample * output_stride + 2], -999.0);
     }
 }
@@ -650,7 +657,7 @@ TEST(InferenceModel, OneLayerModelDoesNotRequireScratch) {
     EXPECT_EQ(inference.scratch_size(), 0U);
     EXPECT_EQ(inference.predict_to(input.data(), input.size(), output.data(), output.size(), nullptr, 0),
               bm::InferenceStatus::ok);
-    expect_vector_near(output, {5.5}, 1e-12);
+    expect_vector_near(output, {5.5}, kTightTolerance);
 }
 
 TEST(InferenceModel, SaveLoadRoundTripsFrozenModel) {
@@ -665,7 +672,7 @@ TEST(InferenceModel, SaveLoadRoundTripsFrozenModel) {
     EXPECT_EQ(loaded.output_size(), inference.output_size());
     EXPECT_EQ(loaded.layer_count(), inference.layer_count());
     EXPECT_EQ(loaded.scratch_size(), inference.scratch_size());
-    expect_vector_near(loaded.predict({2.0, -1.0}), inference.predict({2.0, -1.0}), 1e-12);
+    expect_vector_near(loaded.predict({2.0, -1.0}), inference.predict({2.0, -1.0}), kTightTolerance);
 }
 
 TEST(InferenceModel, RejectsInvalidFrozenParameters) {
@@ -691,8 +698,8 @@ TEST(CopyAndMove, CopyIsDeepAndIndependent) {
     copy_parameters[0].biases[0] = 10.0;
     copy.set_parameters(copy_parameters);
 
-    expect_vector_near(original.predict({3.0, 1.0}), {5.5}, 1e-12);
-    expect_vector_near(copy.predict({3.0, 1.0}), {15.0}, 1e-12);
+    expect_vector_near(original.predict({3.0, 1.0}), {5.5}, kTightTolerance);
+    expect_vector_near(copy.predict({3.0, 1.0}), {15.0}, kTightTolerance);
 }
 
 TEST(Serialization, SaveLoadRoundTripsPredictionsAndMetadata) {
@@ -707,7 +714,7 @@ TEST(Serialization, SaveLoadRoundTripsPredictionsAndMetadata) {
     EXPECT_EQ(loaded.output_size(), model.output_size());
     EXPECT_EQ(loaded.layer_count(), model.layer_count());
     EXPECT_EQ(loaded.loss(), model.loss());
-    expect_vector_near(loaded.predict({3.0, 1.0}), model.predict({3.0, 1.0}), 1e-12);
+    expect_vector_near(loaded.predict({3.0, 1.0}), model.predict({3.0, 1.0}), kTightTolerance);
 }
 
 TEST(Serialization, LoadRejectsMissingOrInvalidFiles) {
@@ -736,7 +743,7 @@ TEST(Determinism, SameSeedProducesSameInitialPredictions) {
                       .seed(123)
                       .build();
 
-    expect_vector_near(first.predict({1.0, 2.0, 3.0}), second.predict({1.0, 2.0, 3.0}), 1e-12);
+    expect_vector_near(first.predict({1.0, 2.0, 3.0}), second.predict({1.0, 2.0, 3.0}), kTightTolerance);
 }
 
 TEST(Determinism, DifferentSeedsUsuallyProduceDifferentInitialPredictions) {

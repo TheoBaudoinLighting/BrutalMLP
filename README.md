@@ -4,6 +4,14 @@ Small C++17 multilayer perceptron library with a stable CMake integration surfac
 
 The runtime library only uses the C++ standard library. GoogleTest and Google Benchmark are fetched only for `BRUTAL_MLP_BUILD_TESTS` and `BRUTAL_MLP_BUILD_BENCHMARKS`.
 
+`brutal_mlp::Scalar` is `float` by default. Use double precision only for debug or numerical investigation builds:
+
+```bash
+cmake -S . -B build-double -DBRUTAL_MLP_USE_DOUBLE=ON
+```
+
+When using the CMake target `brutal_mlp::brutal_mlp`, the precision macro is propagated to consumers. Do not mix objects built with different `BRUTAL_MLP_USE_DOUBLE` settings.
+
 ## API split
 
 - `brutal_mlp::TrainingModel`: owns training state, gradients, optimizer moments, validation, history, serialization, and debug-friendly APIs.

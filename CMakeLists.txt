@@ -15,11 +15,17 @@ endif()
 option(BRUTAL_MLP_BUILD_TESTS "Build brutal_mlp unit tests" ${BRUTAL_MLP_TOP_LEVEL_DEFAULT})
 option(BRUTAL_MLP_BUILD_BENCHMARKS "Build brutal_mlp benchmarks" OFF)
 option(BRUTAL_MLP_BUILD_EXAMPLES "Build brutal_mlp examples" ${BRUTAL_MLP_TOP_LEVEL_DEFAULT})
+option(BRUTAL_MLP_USE_DOUBLE "Use double precision Scalar for debug and numerical investigation builds" OFF)
 
 add_library(brutal_mlp src/brutal_mlp.cpp)
 add_library(brutal_mlp::brutal_mlp ALIAS brutal_mlp)
 
 target_compile_features(brutal_mlp PUBLIC cxx_std_17)
+
+target_compile_definitions(brutal_mlp
+    PUBLIC
+        $<$<BOOL:${BRUTAL_MLP_USE_DOUBLE}>:BRUTAL_MLP_USE_DOUBLE=1>
+)
 
 target_include_directories(brutal_mlp
     PUBLIC
