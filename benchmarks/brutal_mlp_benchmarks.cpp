@@ -107,6 +107,17 @@ bm::Vector make_flat_inputs(std::size_t rows, std::size_t columns) {
     return result;
 }
 
+bm::DenseMatrix make_dense_inputs(std::size_t rows, std::size_t columns) {
+    bm::DenseMatrix result(rows, columns);
+    for (std::size_t row = 0; row < rows; ++row) {
+        for (std::size_t column = 0; column < columns; ++column) {
+            const double angle = static_cast<double>((row + 1) * (column + 3)) * 0.013;
+            result(row, column) = static_cast<bm::Scalar>(std::sin(angle));
+        }
+    }
+    return result;
+}
+
 bm::Matrix make_regression_targets(const bm::Matrix& inputs, std::size_t outputs) {
     bm::Matrix targets(inputs.size(), bm::Vector(outputs, bm::Scalar{0}));
     for (std::size_t row = 0; row < inputs.size(); ++row) {
@@ -319,6 +330,30 @@ static void BM_BatchPredictAllocatingMatrix(benchmark::State& state, const Model
     state.counters["allocating_path"] = 1.0;
 }
 
+static void BM_BatchPredictAllocatingDense(benchmark::State& state, const ModelSpec* spec) {
+    const auto batch_size = static_cast<std::size_t>(state.range(0));
+    auto model = make_compiled_model(*spec);
+    auto inputs = make_dense_inputs(batch_size, spec->inputs);
+
+    const std::size_t allocations = count_allocations([&] {
+        auto outputs = model.predict_batch(inputs);
+        benchmark::DoNotOptimize(outputs.data());
+        benchmark::DoNotOptimize(outputs.scalar_count());
+    });
+
+    for (auto _ : state) {
+        auto outputs = model.predict_batch(inputs);
+        benchmark::DoNotOptimize(outputs.data());
+        benchmark::DoNotOptimize(outputs.scalar_count());
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(batch_size));
+    set_model_counters(state, *spec, model);
+    state.counters["batch_size"] = static_cast<double>(batch_size);
+    state.counters["allocations_per_call"] = static_cast<double>(allocations);
+    state.counters["allocating_path"] = 1.0;
+}
+
 static void BM_BatchPredictParallel(benchmark::State& state, const ModelSpec* spec) {
     const auto batch_size = static_cast<std::size_t>(state.range(0));
     const auto thread_count = static_cast<std::size_t>(state.range(1));
@@ -511,6 +546,7 @@ static void BM_LoadTrainingBinary(benchmark::State& state, const ModelSpec* spec
     BENCHMARK_CAPTURE(BM_BatchPredictUnchecked, label, spec_pointer)->Arg(1)->Arg(32)->Arg(256);            \
     BENCHMARK_CAPTURE(BM_BatchPredictSafe, label, spec_pointer)->Arg(1)->Arg(32)->Arg(256);                 \
     BENCHMARK_CAPTURE(BM_BatchPredictAllocatingMatrix, label, spec_pointer)->Arg(1)->Arg(32)->Arg(256);     \
+    BENCHMARK_CAPTURE(BM_BatchPredictAllocatingDense, label, spec_pointer)->Arg(1)->Arg(32)->Arg(256);      \
     BENCHMARK_CAPTURE(BM_BatchPredictParallel, label, spec_pointer)                                        \
         ->Args({256, 2})                                                                                   \
         ->Args({256, 4})                                                                                   \

@@ -15,6 +15,10 @@
 #include <thread>
 #include <utility>
 
+#ifndef BRUTAL_MLP_VERSION_STRING
+#define BRUTAL_MLP_VERSION_STRING "0.0.0"
+#endif
+
 namespace brutal_mlp {
 namespace {
 
@@ -25,6 +29,8 @@ constexpr Scalar kTargetSumTolerance = Scalar{1e-8};
 constexpr Scalar kProbabilityEpsilon = Scalar{1e-7f};
 constexpr Scalar kTargetSumTolerance = Scalar{1e-4f};
 #endif
+constexpr std::size_t kMaxSerializedLayers = 1000000;
+constexpr std::size_t kMaxSerializedScalars = 268435456;
 
 [[nodiscard]] bool is_finite(Scalar value) {
     return std::isfinite(value);
@@ -38,6 +44,426 @@ void require(bool condition, const std::string& message) {
 
 void require_finite(Scalar value, const std::string& name) {
     require(is_finite(value), name + " must be finite");
+}
+
+[[nodiscard]] std::string utc_timestamp(std::uint64_t unix_time) {
+    const std::time_t raw_time = static_cast<std::time_t>(unix_time);
+    std::tm utc{};
+#if defined(_WIN32)
+    if (gmtime_s(&utc, &raw_time) != 0) {
+        return {};
+    }
+#else
+    if (gmtime_r(&raw_time, &utc) == nullptr) {
+        return {};
+    }
+#endif
+
+    std::ostringstream output;
+    output << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
+    return output.str();
+}
+
+[[nodiscard]] std::string scalar_debug_string(Scalar value) {
+    std::ostringstream output;
+    output << std::setprecision(9) << value;
+    return output.str();
+}
+
+[[nodiscard]] std::string non_finite_kind(Scalar value) {
+    if (std::isnan(value)) {
+        return "NaN";
+    }
+    if (std::isinf(value)) {
+        return value > Scalar{0} ? "+Inf" : "-Inf";
+    }
+    return "non-finite";
+}
+
+[[nodiscard]] std::string scalar_type_string() {
+    return sizeof(Scalar) == sizeof(double) ? "float64" : "float32";
+}
+
+void write_json_escaped(std::ostream& output, std::string_view value) {
+    output << '"';
+    for (char ch : value) {
+        const unsigned char byte = static_cast<unsigned char>(ch);
+        switch (ch) {
+        case '"':
+            output << "\\\"";
+            break;
+        case '\\':
+            output << "\\\\";
+            break;
+        case '\b':
+            output << "\\b";
+            break;
+        case '\f':
+            output << "\\f";
+            break;
+        case '\n':
+            output << "\\n";
+            break;
+        case '\r':
+            output << "\\r";
+            break;
+        case '\t':
+            output << "\\t";
+            break;
+        default:
+            if (byte < 0x20) {
+                output << "\\u"
+                       << std::hex << std::setw(4) << std::setfill('0')
+                       << static_cast<unsigned int>(byte)
+                       << std::dec << std::setfill(' ');
+            } else {
+                output << ch;
+            }
+            break;
+        }
+    }
+    output << '"';
+}
+
+void write_json_indent(std::ostream& output, int spaces) {
+    for (int i = 0; i < spaces; ++i) {
+        output << ' ';
+    }
+}
+
+void write_json_key(std::ostream& output, int indent, std::string_view key) {
+    write_json_indent(output, indent);
+    write_json_escaped(output, key);
+    output << ": ";
+}
+
+void write_json_scalar(std::ostream& output, Scalar value) {
+    if (!is_finite(value)) {
+        output << "null";
+        return;
+    }
+    output << std::setprecision(std::numeric_limits<Scalar>::max_digits10) << value;
+}
+
+void write_json_scalar_array(std::ostream& output, const Vector& values) {
+    output << '[';
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            output << ", ";
+        }
+        write_json_scalar(output, values[i]);
+    }
+    output << ']';
+}
+
+void write_json_feature(std::ostream& output, const FeatureNormalization& feature, int indent) {
+    output << "{\n";
+    write_json_key(output, indent + 2, "mode");
+    write_json_escaped(output, to_string(feature.mode));
+    output << ",\n";
+    write_json_key(output, indent + 2, "mean");
+    write_json_scalar(output, feature.mean);
+    output << ",\n";
+    write_json_key(output, indent + 2, "stddev");
+    write_json_scalar(output, feature.stddev);
+    output << ",\n";
+    write_json_key(output, indent + 2, "minimum");
+    write_json_scalar(output, feature.minimum);
+    output << ",\n";
+    write_json_key(output, indent + 2, "maximum");
+    write_json_scalar(output, feature.maximum);
+    output << ",\n";
+    write_json_key(output, indent + 2, "normalized_min");
+    write_json_scalar(output, feature.normalized_min);
+    output << ",\n";
+    write_json_key(output, indent + 2, "normalized_max");
+    write_json_scalar(output, feature.normalized_max);
+    output << ",\n";
+    write_json_key(output, indent + 2, "clamp");
+    output << (feature.clamp ? "true" : "false");
+    output << ",\n";
+    write_json_key(output, indent + 2, "clamp_min");
+    write_json_scalar(output, feature.clamp_min);
+    output << ",\n";
+    write_json_key(output, indent + 2, "clamp_max");
+    write_json_scalar(output, feature.clamp_max);
+    output << '\n';
+    write_json_indent(output, indent);
+    output << '}';
+}
+
+void write_json_features(std::ostream& output,
+                         const std::vector<FeatureNormalization>& features,
+                         int indent) {
+    output << "[\n";
+    for (std::size_t i = 0; i < features.size(); ++i) {
+        write_json_indent(output, indent + 2);
+        write_json_feature(output, features[i], indent + 2);
+        if (i + 1 < features.size()) {
+            output << ',';
+        }
+        output << '\n';
+    }
+    write_json_indent(output, indent);
+    output << ']';
+}
+
+void write_json_optimizer(std::ostream& output, const OptimizerConfig& optimizer, int indent) {
+    output << "{\n";
+    write_json_key(output, indent + 2, "type");
+    write_json_escaped(output, to_string(optimizer.type));
+    output << ",\n";
+    write_json_key(output, indent + 2, "learning_rate");
+    write_json_scalar(output, optimizer.learning_rate);
+    output << ",\n";
+    write_json_key(output, indent + 2, "beta1");
+    write_json_scalar(output, optimizer.beta1);
+    output << ",\n";
+    write_json_key(output, indent + 2, "beta2");
+    write_json_scalar(output, optimizer.beta2);
+    output << ",\n";
+    write_json_key(output, indent + 2, "epsilon");
+    write_json_scalar(output, optimizer.epsilon);
+    output << ",\n";
+    write_json_key(output, indent + 2, "momentum");
+    write_json_scalar(output, optimizer.momentum);
+    output << ",\n";
+    write_json_key(output, indent + 2, "l1");
+    write_json_scalar(output, optimizer.l1);
+    output << ",\n";
+    write_json_key(output, indent + 2, "l2");
+    write_json_scalar(output, optimizer.l2);
+    output << ",\n";
+    write_json_key(output, indent + 2, "decoupled_weight_decay");
+    write_json_scalar(output, optimizer.decoupled_weight_decay);
+    output << ",\n";
+    write_json_key(output, indent + 2, "max_norm");
+    write_json_scalar(output, optimizer.max_norm);
+    output << ",\n";
+    write_json_key(output, indent + 2, "gradient_clip_norm");
+    write_json_scalar(output, optimizer.gradient_clip_norm);
+    output << ",\n";
+    write_json_key(output, indent + 2, "gradient_clip_value");
+    write_json_scalar(output, optimizer.gradient_clip_value);
+    output << ",\n";
+    write_json_key(output, indent + 2, "layer_gradient_clip_norm");
+    write_json_scalar(output, optimizer.layer_gradient_clip_norm);
+    output << '\n';
+    write_json_indent(output, indent);
+    output << '}';
+}
+
+void write_json_learning_rate_schedule(std::ostream& output,
+                                       const LearningRateScheduleConfig& schedule,
+                                       int indent) {
+    output << "{\n";
+    write_json_key(output, indent + 2, "type");
+    write_json_escaped(output, to_string(schedule.type));
+    output << ",\n";
+    write_json_key(output, indent + 2, "base_learning_rate");
+    write_json_scalar(output, schedule.base_learning_rate);
+    output << ",\n";
+    write_json_key(output, indent + 2, "minimum_learning_rate");
+    write_json_scalar(output, schedule.minimum_learning_rate);
+    output << ",\n";
+    write_json_key(output, indent + 2, "warmup_epochs");
+    output << schedule.warmup_epochs;
+    output << ",\n";
+    write_json_key(output, indent + 2, "warmup_start_learning_rate");
+    write_json_scalar(output, schedule.warmup_start_learning_rate);
+    output << ",\n";
+    write_json_key(output, indent + 2, "step_size");
+    output << schedule.step_size;
+    output << ",\n";
+    write_json_key(output, indent + 2, "step_decay_factor");
+    write_json_scalar(output, schedule.step_decay_factor);
+    output << ",\n";
+    write_json_key(output, indent + 2, "exponential_decay_rate");
+    write_json_scalar(output, schedule.exponential_decay_rate);
+    output << ",\n";
+    write_json_key(output, indent + 2, "cosine_epochs");
+    output << schedule.cosine_epochs;
+    output << ",\n";
+    write_json_key(output, indent + 2, "reduce_on_plateau_monitor");
+    write_json_escaped(output, to_string(schedule.reduce_on_plateau_monitor));
+    output << ",\n";
+    write_json_key(output, indent + 2, "reduce_on_plateau_mode");
+    write_json_escaped(output, to_string(schedule.reduce_on_plateau_mode));
+    output << ",\n";
+    write_json_key(output, indent + 2, "reduce_on_plateau_patience");
+    output << schedule.reduce_on_plateau_patience;
+    output << ",\n";
+    write_json_key(output, indent + 2, "reduce_on_plateau_factor");
+    write_json_scalar(output, schedule.reduce_on_plateau_factor);
+    output << ",\n";
+    write_json_key(output, indent + 2, "reduce_on_plateau_min_delta");
+    write_json_scalar(output, schedule.reduce_on_plateau_min_delta);
+    output << ",\n";
+    write_json_key(output, indent + 2, "reduce_on_plateau_cooldown");
+    output << schedule.reduce_on_plateau_cooldown;
+    output << '\n';
+    write_json_indent(output, indent);
+    output << '}';
+}
+
+void write_json_loss(std::ostream& output, const LossConfig& loss, int indent) {
+    output << "{\n";
+    write_json_key(output, indent + 2, "type");
+    write_json_escaped(output, to_string(loss.type));
+    output << ",\n";
+    write_json_key(output, indent + 2, "huber_delta");
+    write_json_scalar(output, loss.huber_delta);
+    output << ",\n";
+    write_json_key(output, indent + 2, "relative_epsilon");
+    write_json_scalar(output, loss.relative_epsilon);
+    output << ",\n";
+    write_json_key(output, indent + 2, "weights");
+    write_json_scalar_array(output, loss.weights);
+    output << ",\n";
+    write_json_key(output, indent + 2, "custom");
+    output << (loss.type == Loss::custom ? "true" : "false");
+    output << '\n';
+    write_json_indent(output, indent);
+    output << '}';
+}
+
+void write_json_normalization(std::ostream& output,
+                              const NormalizationSpec& normalization,
+                              int indent) {
+    output << "{\n";
+    write_json_key(output, indent + 2, "input_features");
+    write_json_features(output, normalization.input_features, indent + 2);
+    output << ",\n";
+    write_json_key(output, indent + 2, "output_features");
+    write_json_features(output, normalization.output_features, indent + 2);
+    output << '\n';
+    write_json_indent(output, indent);
+    output << '}';
+}
+
+void write_json_training_options(std::ostream& output,
+                                 const TrainingOptions& options,
+                                 int indent) {
+    output << "{\n";
+    write_json_key(output, indent + 2, "epochs");
+    output << options.epochs;
+    output << ",\n";
+    write_json_key(output, indent + 2, "batch_size");
+    output << options.batch_size;
+    output << ",\n";
+    write_json_key(output, indent + 2, "shuffle");
+    output << (options.shuffle ? "true" : "false");
+    output << ",\n";
+    write_json_key(output, indent + 2, "seed");
+    output << options.seed;
+    output << ",\n";
+    write_json_key(output, indent + 2, "validation_split");
+    write_json_scalar(output, options.validation_split);
+    output << ",\n";
+    write_json_key(output, indent + 2, "test_split");
+    write_json_scalar(output, options.test_split);
+    output << ",\n";
+    write_json_key(output, indent + 2, "streaming_shuffle_buffer_size");
+    output << options.streaming_shuffle_buffer_size;
+    output << ",\n";
+    write_json_key(output, indent + 2, "early_stopping_patience");
+    output << options.early_stopping_patience;
+    output << ",\n";
+    write_json_key(output, indent + 2, "min_delta");
+    write_json_scalar(output, options.min_delta);
+    output << ",\n";
+    write_json_key(output, indent + 2, "early_stopping_monitor");
+    write_json_escaped(output, to_string(options.early_stopping_monitor));
+    output << ",\n";
+    write_json_key(output, indent + 2, "early_stopping_mode");
+    write_json_escaped(output, to_string(options.early_stopping_mode));
+    output << ",\n";
+    write_json_key(output, indent + 2, "early_stopping_cooldown");
+    output << options.early_stopping_cooldown;
+    output << ",\n";
+    write_json_key(output, indent + 2, "gradient_noise_stddev");
+    write_json_scalar(output, options.gradient_noise_stddev);
+    output << ",\n";
+    write_json_key(output, indent + 2, "parallelism");
+    output << "{\n";
+    write_json_key(output, indent + 4, "execution");
+    write_json_escaped(output, to_string(options.parallelism.execution));
+    output << ",\n";
+    write_json_key(output, indent + 4, "thread_count");
+    output << options.parallelism.thread_count;
+    output << ",\n";
+    write_json_key(output, indent + 4, "minimum_parallel_samples");
+    output << options.parallelism.minimum_parallel_samples;
+    output << '\n';
+    write_json_indent(output, indent + 2);
+    output << "},\n";
+    write_json_key(output, indent + 2, "debug");
+    output << "{\n";
+    write_json_key(output, indent + 4, "enabled");
+    output << (options.debug.enabled ? "true" : "false");
+    output << ",\n";
+    write_json_key(output, indent + 4, "loss_explosion_factor");
+    write_json_scalar(output, options.debug.loss_explosion_factor);
+    output << ",\n";
+    write_json_key(output, indent + 4, "loss_explosion_threshold");
+    write_json_scalar(output, options.debug.loss_explosion_threshold);
+    output << ",\n";
+    write_json_key(output, indent + 4, "gradient_norm_explosion_factor");
+    write_json_scalar(output, options.debug.gradient_norm_explosion_factor);
+    output << ",\n";
+    write_json_key(output, indent + 4, "gradient_norm_explosion_threshold");
+    write_json_scalar(output, options.debug.gradient_norm_explosion_threshold);
+    output << '\n';
+    write_json_indent(output, indent + 2);
+    output << "},\n";
+    write_json_key(output, indent + 2, "restore_best_weights");
+    output << (options.restore_best_weights ? "true" : "false");
+    output << ",\n";
+    write_json_key(output, indent + 2, "best_checkpoint_path");
+    write_json_escaped(output, options.best_checkpoint_path.generic_string());
+    output << ",\n";
+    write_json_key(output, indent + 2, "latest_checkpoint_path");
+    write_json_escaped(output, options.latest_checkpoint_path.generic_string());
+    output << '\n';
+    write_json_indent(output, indent);
+    output << '}';
+}
+
+void refresh_training_run_result(TrainingHistory& history, std::size_t completed_epochs) {
+    TrainingRunResultConfig& result = history.run_config.result;
+    result.completed_epochs = completed_epochs;
+    result.has_best_score = history.has_best_checkpoint;
+    result.best_epoch = history.best_epoch;
+    result.best_score = history.best_metric;
+    result.monitor = history.monitor;
+    result.monitor_mode = history.monitor_mode;
+    result.stop_reason = history.stop_reason;
+    result.stop_message = history.stop_message;
+
+    result.has_final_training_loss = !history.training_loss.empty();
+    result.final_training_loss = result.has_final_training_loss
+                                     ? history.training_loss.back()
+                                     : Scalar{0};
+    result.has_final_validation_loss = !history.validation_loss.empty();
+    result.final_validation_loss = result.has_final_validation_loss
+                                       ? history.validation_loss.back()
+                                       : Scalar{0};
+    result.has_final_test_loss = !history.test_loss.empty();
+    result.final_test_loss = result.has_final_test_loss
+                                 ? history.test_loss.back()
+                                 : Scalar{0};
+}
+
+struct TrainingDebugFailure : public std::runtime_error {
+    TrainingStopReason reason;
+
+    TrainingDebugFailure(TrainingStopReason stop_reason, std::string message)
+        : std::runtime_error(std::move(message)),
+          reason(stop_reason) {}
+};
+
+[[noreturn]] void throw_training_debug_failure(TrainingStopReason reason, const std::string& message) {
+    throw TrainingDebugFailure(reason, message);
 }
 
 [[nodiscard]] Scalar clamp_probability(Scalar value) {
@@ -251,6 +677,18 @@ void validate_training_options(const TrainingOptions& options) {
     validate_learning_rate_schedule_config(options.learning_rate_schedule);
     require_finite(options.gradient_noise_stddev, "gradient_noise_stddev");
     require(options.gradient_noise_stddev >= Scalar{0}, "gradient_noise_stddev must be non-negative");
+    require_finite(options.debug.loss_explosion_factor, "debug.loss_explosion_factor");
+    require(options.debug.loss_explosion_factor >= Scalar{1},
+            "debug.loss_explosion_factor must be at least 1");
+    require_finite(options.debug.loss_explosion_threshold, "debug.loss_explosion_threshold");
+    require(options.debug.loss_explosion_threshold > Scalar{0},
+            "debug.loss_explosion_threshold must be positive");
+    require_finite(options.debug.gradient_norm_explosion_factor, "debug.gradient_norm_explosion_factor");
+    require(options.debug.gradient_norm_explosion_factor >= Scalar{1},
+            "debug.gradient_norm_explosion_factor must be at least 1");
+    require_finite(options.debug.gradient_norm_explosion_threshold, "debug.gradient_norm_explosion_threshold");
+    require(options.debug.gradient_norm_explosion_threshold > Scalar{0},
+            "debug.gradient_norm_explosion_threshold must be positive");
 }
 
 void validate_dropout_probability(Scalar probability, const std::string& name) {
@@ -298,6 +736,49 @@ void validate_dropout_probability(Scalar probability, const std::string& name) {
     }
 
     throw std::invalid_argument("unknown training monitor");
+}
+
+struct TrainingDebugScalarTracker {
+    bool has_value{false};
+    Scalar value{Scalar{0}};
+};
+
+[[nodiscard]] bool debug_exploded(Scalar current,
+                                  const TrainingDebugScalarTracker& previous,
+                                  Scalar absolute_threshold,
+                                  Scalar relative_factor) noexcept {
+    if (current > absolute_threshold) {
+        return true;
+    }
+    return previous.has_value && previous.value > Scalar{0} && current > previous.value * relative_factor;
+}
+
+[[nodiscard]] std::string debug_explosion_message(const char* label,
+                                                  Scalar current,
+                                                  const TrainingDebugScalarTracker& previous,
+                                                  Scalar absolute_threshold,
+                                                  Scalar relative_factor,
+                                                  std::size_t epoch,
+                                                  const std::string& extra = {}) {
+    std::ostringstream output;
+    output << "debug check failed: " << label << " explosion at epoch " << epoch
+           << " value=" << scalar_debug_string(current)
+           << " threshold=" << scalar_debug_string(absolute_threshold);
+    if (previous.has_value) {
+        output << " previous=" << scalar_debug_string(previous.value)
+               << " factor=" << scalar_debug_string(relative_factor);
+    }
+    if (!extra.empty()) {
+        output << " " << extra;
+    }
+    return output.str();
+}
+
+void update_debug_tracker_if_finite(TrainingDebugScalarTracker& tracker, Scalar value) noexcept {
+    if (is_finite(value)) {
+        tracker.has_value = true;
+        tracker.value = value;
+    }
 }
 
 [[nodiscard]] Scalar initial_best_metric(TrainingMonitorMode mode) {
@@ -616,8 +1097,31 @@ void validate_matrix(const Matrix& matrix,
     for (std::size_t row = 0; row < matrix.size(); ++row) {
         require(matrix[row].size() == expected_columns,
                 name + " row " + std::to_string(row) + " has an invalid column count");
-        for (Scalar value : matrix[row]) {
-            require_finite(value, name + " value");
+        for (std::size_t column = 0; column < matrix[row].size(); ++column) {
+            require_finite(matrix[row][column],
+                           name + " row " + std::to_string(row) +
+                               " column " + std::to_string(column));
+        }
+    }
+}
+
+void validate_dense_matrix(const DenseMatrix& matrix,
+                           std::size_t expected_columns,
+                           const std::string& name,
+                           bool allow_empty = false) {
+    require(allow_empty || !matrix.empty(), name + " must not be empty");
+    if (matrix.empty()) {
+        require(matrix.columns() == expected_columns || matrix.columns() == 0,
+                name + " has an invalid column count");
+        return;
+    }
+    require(matrix.columns() == expected_columns, name + " has an invalid column count");
+    require(matrix.scalar_count() == matrix.rows() * matrix.columns(), name + " storage size mismatch");
+    for (std::size_t row = 0; row < matrix.rows(); ++row) {
+        for (std::size_t column = 0; column < matrix.columns(); ++column) {
+            require_finite(matrix(row, column),
+                           name + " row " + std::to_string(row) +
+                               " column " + std::to_string(column));
         }
     }
 }
@@ -666,6 +1170,12 @@ void validate_targets_for_loss(const Matrix& targets, Loss loss) {
     }
 }
 
+void validate_targets_for_loss(const DenseMatrix& targets, Loss loss) {
+    for (std::size_t row = 0; row < targets.rows(); ++row) {
+        validate_target_for_loss(targets.row_data(row), targets.columns(), loss);
+    }
+}
+
 void validate_training_data(const Matrix& inputs,
                             const Matrix& targets,
                             std::size_t input_size,
@@ -674,6 +1184,17 @@ void validate_training_data(const Matrix& inputs,
     validate_matrix(inputs, input_size, "inputs");
     validate_matrix(targets, output_size, "targets");
     require(inputs.size() == targets.size(), "inputs and targets must have the same number of rows");
+    validate_targets_for_loss(targets, loss.type);
+}
+
+void validate_training_data(const DenseMatrix& inputs,
+                            const DenseMatrix& targets,
+                            std::size_t input_size,
+                            std::size_t output_size,
+                            const LossConfig& loss) {
+    validate_dense_matrix(inputs, input_size, "inputs");
+    validate_dense_matrix(targets, output_size, "targets");
+    require(inputs.rows() == targets.rows(), "inputs and targets must have the same number of rows");
     validate_targets_for_loss(targets, loss.type);
 }
 
@@ -711,6 +1232,54 @@ void validate_sample_values(const Scalar* input,
         require_finite(target[i], "dataset target value");
     }
     validate_target_for_loss(target, target_size, loss);
+}
+
+struct TrainingDebugContext {
+    const char* phase{"training"};
+    std::size_t epoch{0};
+    bool has_epoch{false};
+    std::size_t sample_index{0};
+    bool has_sample_index{false};
+};
+
+[[nodiscard]] std::string debug_context_prefix(const TrainingDebugContext& context) {
+    std::ostringstream output;
+    output << "debug check failed";
+    if (context.phase != nullptr && context.phase[0] != '\0') {
+        output << " during " << context.phase;
+    }
+    if (context.has_epoch) {
+        output << " at epoch " << context.epoch;
+    }
+    if (context.has_sample_index) {
+        output << " sample " << context.sample_index;
+    }
+    return output.str();
+}
+
+void debug_check_finite_buffer(const Scalar* values,
+                               std::size_t size,
+                               const char* label,
+                               const TrainingDebugContext& context) {
+    require(values != nullptr || size == 0, std::string(label) + " buffer must not be null");
+    for (std::size_t i = 0; i < size; ++i) {
+        if (!is_finite(values[i])) {
+            throw_training_debug_failure(
+                TrainingStopReason::invalid_training_data,
+                debug_context_prefix(context) + ": " + non_finite_kind(values[i]) +
+                    " in " + label + "[" + std::to_string(i) + "]=" +
+                    scalar_debug_string(values[i]));
+        }
+    }
+}
+
+void debug_check_sample_values(const Scalar* input,
+                               std::size_t input_size,
+                               const Scalar* target,
+                               std::size_t target_size,
+                               const TrainingDebugContext& context) {
+    debug_check_finite_buffer(input, input_size, "input", context);
+    debug_check_finite_buffer(target, target_size, "target", context);
 }
 
 void validate_dataset_split_options(const DatasetSplitOptions& options) {
@@ -779,8 +1348,21 @@ void validate_evaluation_data(const Matrix& predictions,
     require(predictions.size() == targets.size(), "predictions and targets must have the same number of rows");
 }
 
+void validate_evaluation_data(const DenseMatrix& predictions,
+                              const DenseMatrix& targets) {
+    validate_dense_matrix(predictions, predictions.columns(), "predictions");
+    require(predictions.columns() > 0, "predictions must have at least one column");
+    validate_dense_matrix(targets, predictions.columns(), "targets");
+    require(predictions.rows() == targets.rows(), "predictions and targets must have the same number of rows");
+}
+
 [[nodiscard]] std::size_t argmax_index(const Vector& values) {
     return static_cast<std::size_t>(std::distance(values.begin(), std::max_element(values.begin(), values.end())));
+}
+
+[[nodiscard]] std::size_t argmax_index(const Scalar* values, std::size_t size) {
+    require(values != nullptr, "values buffer must not be null");
+    return static_cast<std::size_t>(std::distance(values, std::max_element(values, values + size)));
 }
 
 [[nodiscard]] std::size_t class_count_for_output_size(std::size_t output_size) noexcept {
@@ -794,6 +1376,14 @@ void validate_evaluation_data(const Matrix& predictions,
     return argmax_index(row);
 }
 
+[[nodiscard]] std::size_t class_label_from_row(const Scalar* row, std::size_t size, Scalar threshold) {
+    require(row != nullptr, "classification row buffer must not be null");
+    if (size == 1) {
+        return row[0] >= threshold ? std::size_t{1} : std::size_t{0};
+    }
+    return argmax_index(row, size);
+}
+
 [[nodiscard]] ConfusionMatrix make_confusion_matrix(const Matrix& predictions,
                                                     const Matrix& targets,
                                                     Scalar threshold) {
@@ -804,6 +1394,22 @@ void validate_evaluation_data(const Matrix& predictions,
     for (std::size_t row = 0; row < predictions.size(); ++row) {
         const std::size_t actual = class_label_from_row(targets[row], threshold);
         const std::size_t predicted = class_label_from_row(predictions[row], threshold);
+        ++matrix.counts[actual][predicted];
+    }
+    return matrix;
+}
+
+[[nodiscard]] ConfusionMatrix make_confusion_matrix(const DenseMatrix& predictions,
+                                                    const DenseMatrix& targets,
+                                                    Scalar threshold) {
+    const std::size_t output_size = predictions.columns();
+    const std::size_t class_count = class_count_for_output_size(output_size);
+    ConfusionMatrix matrix;
+    matrix.counts.assign(class_count, std::vector<std::size_t>(class_count, 0));
+
+    for (std::size_t row = 0; row < predictions.rows(); ++row) {
+        const std::size_t actual = class_label_from_row(targets.row_data(row), output_size, threshold);
+        const std::size_t predicted = class_label_from_row(predictions.row_data(row), output_size, threshold);
         ++matrix.counts[actual][predicted];
     }
     return matrix;
@@ -958,6 +1564,39 @@ struct RegressionSummary {
     return summary;
 }
 
+[[nodiscard]] RegressionSummary summarize_regression(const DenseMatrix& predictions, const DenseMatrix& targets) {
+    Scalar squared_error = Scalar{0};
+    Scalar absolute_error = Scalar{0};
+    Scalar target_sum = Scalar{0};
+    const std::size_t count = predictions.scalar_count();
+
+    for (std::size_t i = 0; i < count; ++i) {
+        const Scalar delta = predictions.values()[i] - targets.values()[i];
+        squared_error += delta * delta;
+        absolute_error += static_cast<Scalar>(std::abs(delta));
+        target_sum += targets.values()[i];
+    }
+
+    const Scalar count_scalar = static_cast<Scalar>(count);
+    const Scalar mean_target = target_sum / count_scalar;
+    Scalar target_variance_sum = Scalar{0};
+    for (Scalar value : targets.values()) {
+        const Scalar centered = value - mean_target;
+        target_variance_sum += centered * centered;
+    }
+
+    RegressionSummary summary;
+    summary.mean_squared_error = squared_error / count_scalar;
+    summary.mean_absolute_error = absolute_error / count_scalar;
+    summary.root_mean_squared_error = static_cast<Scalar>(std::sqrt(summary.mean_squared_error));
+    if (target_variance_sum == Scalar{0}) {
+        summary.r2_score = squared_error == Scalar{0} ? Scalar{1} : Scalar{0};
+    } else {
+        summary.r2_score = Scalar{1} - squared_error / target_variance_sum;
+    }
+    return summary;
+}
+
 [[nodiscard]] std::vector<std::size_t> make_indices(std::size_t size) {
     std::vector<std::size_t> indices(size);
     std::iota(indices.begin(), indices.end(), std::size_t{0});
@@ -983,6 +1622,65 @@ T read_value(std::istream& stream, const std::string& name) {
         throw std::runtime_error("failed to read " + name);
     }
     return value;
+}
+
+template <>
+Scalar read_value<Scalar>(std::istream& stream, const std::string& name) {
+    Scalar value{};
+    if (!(stream >> value)) {
+        throw std::runtime_error("failed to read " + name);
+    }
+    require_finite(value, name);
+    return value;
+}
+
+void require_text_stream_consumed(std::istream& stream, const std::string& format_name) {
+    std::string trailing;
+    if (stream >> trailing) {
+        throw std::runtime_error(format_name + " file has trailing data");
+    }
+    if (stream.bad()) {
+        throw std::runtime_error("failed while checking " + format_name + " file ending");
+    }
+}
+
+[[nodiscard]] bool is_supported_activation(Activation activation) noexcept {
+    switch (activation) {
+    case Activation::linear:
+    case Activation::relu:
+    case Activation::sigmoid:
+    case Activation::tanh:
+    case Activation::softmax:
+        return true;
+    }
+    return false;
+}
+
+[[nodiscard]] std::size_t checked_product(std::size_t lhs, std::size_t rhs, const std::string& name) {
+    require(lhs == 0 || rhs <= std::numeric_limits<std::size_t>::max() / lhs,
+            name + " dimensions overflow");
+    return lhs * rhs;
+}
+
+void validate_serialized_layer_count(std::size_t layer_count, const std::string& name) {
+    if (layer_count == 0) {
+        throw std::runtime_error(name + " layer count must be positive");
+    }
+    if (layer_count > kMaxSerializedLayers) {
+        throw std::runtime_error(name + " layer count is unreasonably large");
+    }
+}
+
+void validate_serialized_scalar_count(std::size_t count, const std::string& name) {
+    if (count > kMaxSerializedScalars) {
+        throw std::runtime_error(name + " count is unreasonably large");
+    }
+}
+
+void require_exact_serialized_count(std::size_t actual, std::size_t expected, const std::string& name) {
+    if (actual != expected) {
+        throw std::runtime_error(name + " count mismatch");
+    }
 }
 
 void apply_activation_in_place(Scalar* values, std::size_t size, Activation activation) noexcept {
@@ -1035,8 +1733,10 @@ void validate_layer_parameters(const std::vector<LayerParameters>& parameters) {
         const LayerParameters& layer = parameters[i];
         require(layer.input_size == expected_input_size, "parameter input_size mismatch");
         require(layer.output_size > 0, "parameter output_size must be positive");
-        require(layer.weights.size() == layer.input_size * layer.output_size,
-                "parameter weights size mismatch");
+        require(is_supported_activation(layer.activation), "parameter activation is invalid");
+        const std::size_t expected_weight_count =
+            checked_product(layer.input_size, layer.output_size, "parameter weight");
+        require(layer.weights.size() == expected_weight_count, "parameter weights size mismatch");
         require(layer.biases.size() == layer.output_size, "parameter biases size mismatch");
         validate_dropout_probability(layer.dropout_probability, "layer dropout_probability");
         if (i + 1 == parameters.size()) {
@@ -1237,6 +1937,7 @@ void write_normalization(std::ostream& output, const NormalizationSpec& normaliz
 [[nodiscard]] std::vector<FeatureNormalization> read_normalization_features(std::istream& input,
                                                                             const std::string& name) {
     const std::size_t count = read_value<std::size_t>(input, name + "_feature_count");
+    validate_serialized_scalar_count(count, name + " feature");
     std::vector<FeatureNormalization> features;
     features.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -1296,6 +1997,7 @@ void write_loss_config(std::ostream& output, const LossConfig& loss) {
     loss.huber_delta = read_value<Scalar>(input, "huber_delta");
     loss.relative_epsilon = read_value<Scalar>(input, "relative_epsilon");
     const std::size_t weight_count = read_value<std::size_t>(input, "loss_weight_count");
+    validate_serialized_scalar_count(weight_count, "loss weight");
     loss.weights.resize(weight_count);
     for (Scalar& weight : loss.weights) {
         weight = read_value<Scalar>(input, "loss_weight");
@@ -1304,7 +2006,7 @@ void write_loss_config(std::ostream& output, const LossConfig& loss) {
 }
 
 constexpr unsigned char kBinaryMagic[8] = {'B', 'M', 'L', 'P', 'B', 'I', 'N', '\0'};
-constexpr std::uint32_t kBinaryVersion = 6;
+constexpr std::uint32_t kBinaryVersion = 7;
 
 [[nodiscard]] BinaryScalarType current_binary_scalar_type() noexcept {
 #if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
@@ -1739,6 +2441,17 @@ struct BinaryReader {
 
     [[nodiscard]] Vector read_scalars(const std::string& name) {
         const std::size_t count = read_size(name + "_count");
+        validate_serialized_scalar_count(count, name);
+        Vector values(count);
+        for (Scalar& value : values) {
+            value = read_scalar(name);
+        }
+        return values;
+    }
+
+    [[nodiscard]] Vector read_scalars_exact(const std::string& name, std::size_t expected_count) {
+        const std::size_t count = read_size(name + "_count");
+        require_exact_serialized_count(count, expected_count, name);
         Vector values(count);
         for (Scalar& value : values) {
             value = read_scalar(name);
@@ -1811,6 +2524,11 @@ void write_binary_training_options(BinaryWriter& writer, const TrainingOptions& 
     writer.write_u32(parallel_execution_code(options.parallelism.execution));
     writer.write_size(options.parallelism.thread_count);
     writer.write_size(options.parallelism.minimum_parallel_samples);
+    writer.write_bool(options.debug.enabled);
+    writer.write_scalar(options.debug.loss_explosion_factor);
+    writer.write_scalar(options.debug.loss_explosion_threshold);
+    writer.write_scalar(options.debug.gradient_norm_explosion_factor);
+    writer.write_scalar(options.debug.gradient_norm_explosion_threshold);
     writer.write_bool(options.restore_best_weights);
     writer.write_string(options.best_checkpoint_path.string());
     writer.write_string(options.latest_checkpoint_path.string());
@@ -1858,6 +2576,11 @@ void write_binary_training_options(BinaryWriter& writer, const TrainingOptions& 
         parallel_execution_from_code(reader.read_u32("parallel_execution"));
     options.parallelism.thread_count = reader.read_size("parallel_thread_count");
     options.parallelism.minimum_parallel_samples = reader.read_size("parallel_minimum_samples");
+    options.debug.enabled = reader.read_bool("debug_enabled");
+    options.debug.loss_explosion_factor = reader.read_scalar("debug_loss_explosion_factor");
+    options.debug.loss_explosion_threshold = reader.read_scalar("debug_loss_explosion_threshold");
+    options.debug.gradient_norm_explosion_factor = reader.read_scalar("debug_gradient_norm_explosion_factor");
+    options.debug.gradient_norm_explosion_threshold = reader.read_scalar("debug_gradient_norm_explosion_threshold");
     options.restore_best_weights = reader.read_bool("training_restore_best_weights");
     options.best_checkpoint_path = reader.read_string("training_best_checkpoint_path");
     options.latest_checkpoint_path = reader.read_string("training_latest_checkpoint_path");
@@ -1947,7 +2670,9 @@ void write_binary_loss_config(BinaryWriter& writer, const LossConfig& loss) {
     }
     loss.huber_delta = reader.read_scalar("huber_delta");
     loss.relative_epsilon = reader.read_scalar("relative_epsilon");
-    loss.weights = reader.read_scalars("loss_weights");
+    const std::size_t expected_weight_count =
+        loss.type == Loss::weighted_mean_squared_error ? output_size : std::size_t{0};
+    loss.weights = reader.read_scalars_exact("loss_weights", expected_weight_count);
     validate_loss_config(loss, output_size);
     return loss;
 }
@@ -1989,8 +2714,12 @@ void write_binary_normalization_features(BinaryWriter& writer, const std::vector
 }
 
 [[nodiscard]] std::vector<FeatureNormalization> read_binary_normalization_features(BinaryReader& reader,
-                                                                                   const std::string& name) {
+                                                                                   const std::string& name,
+                                                                                   std::size_t expected_size) {
     const std::size_t count = reader.read_size(name + "_count");
+    if (count != 0 && count != expected_size) {
+        throw std::runtime_error(name + " feature count mismatch");
+    }
     std::vector<FeatureNormalization> features;
     features.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
@@ -2008,8 +2737,8 @@ void write_binary_normalization(BinaryWriter& writer, const NormalizationSpec& n
                                                           std::size_t input_size,
                                                           std::size_t output_size) {
     NormalizationSpec normalization;
-    normalization.input_features = read_binary_normalization_features(reader, "input_normalization");
-    normalization.output_features = read_binary_normalization_features(reader, "output_normalization");
+    normalization.input_features = read_binary_normalization_features(reader, "input_normalization", input_size);
+    normalization.output_features = read_binary_normalization_features(reader, "output_normalization", output_size);
     validate_normalization_spec(normalization, input_size, output_size);
     return normalization;
 }
@@ -2029,12 +2758,13 @@ void write_binary_layer(BinaryWriter& writer, const LayerParameters& layer) {
     layer.output_size = reader.read_size("layer_output_size");
     layer.activation = activation_from_code(reader.read_u32("layer_activation"));
     layer.dropout_probability = reader.read_scalar("layer_dropout_probability");
+    require(layer.input_size > 0, "binary layer input_size must be positive");
+    require(layer.output_size > 0, "binary layer output_size must be positive");
     require(layer.input_size == expected_input_size, "binary topology is inconsistent");
-    layer.weights = reader.read_scalars("weights");
-    layer.biases = reader.read_scalars("biases");
-    require(layer.weights.size() == layer.input_size * layer.output_size,
-            "binary weight count does not match layer dimensions");
-    require(layer.biases.size() == layer.output_size, "binary bias count does not match layer dimensions");
+    const std::size_t expected_weight_count =
+        checked_product(layer.input_size, layer.output_size, "binary weight");
+    layer.weights = reader.read_scalars_exact("weights", expected_weight_count);
+    layer.biases = reader.read_scalars_exact("biases", layer.output_size);
     return layer;
 }
 
@@ -2050,7 +2780,7 @@ struct LayerTrainingState {
 };
 
 void validate_layer_training_state(const LayerTrainingState& state, const LayerParameters& layer) {
-    const std::size_t weight_count = layer.input_size * layer.output_size;
+    const std::size_t weight_count = checked_product(layer.input_size, layer.output_size, "checkpoint weight");
     const std::size_t bias_count = layer.output_size;
     require(state.grad_weights.size() == weight_count, "checkpoint grad weight count mismatch");
     require(state.velocity_weights.size() == weight_count, "checkpoint velocity weight count mismatch");
@@ -2075,15 +2805,17 @@ void write_binary_layer_training_state(BinaryWriter& writer, const LayerTraining
 
 [[nodiscard]] LayerTrainingState read_binary_layer_training_state(BinaryReader& reader,
                                                                   const LayerParameters& layer) {
+    const std::size_t weight_count = checked_product(layer.input_size, layer.output_size, "checkpoint weight");
+    const std::size_t bias_count = layer.output_size;
     LayerTrainingState state;
-    state.grad_weights = reader.read_scalars("grad_weights");
-    state.grad_biases = reader.read_scalars("grad_biases");
-    state.velocity_weights = reader.read_scalars("velocity_weights");
-    state.velocity_biases = reader.read_scalars("velocity_biases");
-    state.first_moment_weights = reader.read_scalars("first_moment_weights");
-    state.first_moment_biases = reader.read_scalars("first_moment_biases");
-    state.second_moment_weights = reader.read_scalars("second_moment_weights");
-    state.second_moment_biases = reader.read_scalars("second_moment_biases");
+    state.grad_weights = reader.read_scalars_exact("grad_weights", weight_count);
+    state.grad_biases = reader.read_scalars_exact("grad_biases", bias_count);
+    state.velocity_weights = reader.read_scalars_exact("velocity_weights", weight_count);
+    state.velocity_biases = reader.read_scalars_exact("velocity_biases", bias_count);
+    state.first_moment_weights = reader.read_scalars_exact("first_moment_weights", weight_count);
+    state.first_moment_biases = reader.read_scalars_exact("first_moment_biases", bias_count);
+    state.second_moment_weights = reader.read_scalars_exact("second_moment_weights", weight_count);
+    state.second_moment_biases = reader.read_scalars_exact("second_moment_biases", bias_count);
     validate_layer_training_state(state, layer);
     return state;
 }
@@ -2222,9 +2954,11 @@ void finalize_binary_info(ParsedBinaryModel& parsed) {
     parsed.info.checksum = envelope.checksum;
     parsed.info.metadata = read_binary_metadata(reader);
     parsed.info.input_size = reader.read_size("input_size");
+    require(parsed.info.input_size > 0, "binary input_size must be positive");
 
     if (envelope.kind == BinaryModelKind::training) {
         const std::size_t declared_output_size = reader.read_size("declared_output_size");
+        require(declared_output_size > 0, "binary declared output_size must be positive");
         parsed.loss = read_binary_loss_config(reader, declared_output_size);
         parsed.optimizer = read_binary_optimizer(reader);
         parsed.info.seed = reader.read_u64("seed");
@@ -2236,6 +2970,7 @@ void finalize_binary_info(ParsedBinaryModel& parsed) {
         parsed.normalization = read_binary_normalization(reader, parsed.info.input_size, declared_output_size);
 
         const std::size_t layer_count = reader.read_size("layer_count");
+        validate_serialized_layer_count(layer_count, "binary training model");
         parsed.parameters.reserve(layer_count);
         std::size_t expected_input_size = parsed.info.input_size;
         for (std::size_t i = 0; i < layer_count; ++i) {
@@ -2250,6 +2985,7 @@ void finalize_binary_info(ParsedBinaryModel& parsed) {
         validate_normalization_for_loss(parsed.normalization, parsed.loss);
     } else if (envelope.kind == BinaryModelKind::inference) {
         const std::size_t declared_output_size = reader.read_size("declared_output_size");
+        require(declared_output_size > 0, "binary declared output_size must be positive");
         parsed.info.seed = reader.read_u64("seed");
         parsed.info.has_training_options = reader.read_bool("has_training_options");
         if (parsed.info.has_training_options) {
@@ -2258,6 +2994,7 @@ void finalize_binary_info(ParsedBinaryModel& parsed) {
         parsed.normalization = read_binary_normalization(reader, parsed.info.input_size, declared_output_size);
 
         const std::size_t layer_count = reader.read_size("layer_count");
+        validate_serialized_layer_count(layer_count, "binary inference model");
         parsed.parameters.reserve(layer_count);
         std::size_t expected_input_size = parsed.info.input_size;
         for (std::size_t i = 0; i < layer_count; ++i) {
@@ -2270,6 +3007,7 @@ void finalize_binary_info(ParsedBinaryModel& parsed) {
                 "binary inference output size does not match topology");
     } else if (envelope.kind == BinaryModelKind::checkpoint) {
         const std::size_t declared_output_size = reader.read_size("declared_output_size");
+        require(declared_output_size > 0, "binary declared output_size must be positive");
         parsed.loss = read_binary_loss_config(reader, declared_output_size);
         parsed.optimizer = read_binary_optimizer(reader);
         parsed.info.seed = reader.read_u64("seed");
@@ -2289,6 +3027,7 @@ void finalize_binary_info(ParsedBinaryModel& parsed) {
         parsed.normalization = read_binary_normalization(reader, parsed.info.input_size, declared_output_size);
 
         const std::size_t layer_count = reader.read_size("layer_count");
+        validate_serialized_layer_count(layer_count, "checkpoint");
         parsed.parameters.reserve(layer_count);
         parsed.training_states.reserve(layer_count);
         std::size_t expected_input_size = parsed.info.input_size;
@@ -2346,6 +3085,208 @@ void write_common_binary_model_payload(BinaryWriter& writer,
 
 BinaryModelInfo inspect_binary_model(const std::filesystem::path& path) {
     return parse_binary_model_file(path).info;
+}
+
+std::string_view version_string() noexcept {
+    return BRUTAL_MLP_VERSION_STRING;
+}
+
+std::string TrainingRunConfig::to_json() const {
+    std::ostringstream output;
+    output << std::setprecision(std::numeric_limits<Scalar>::max_digits10);
+    output << "{\n";
+
+    write_json_key(output, 2, "library");
+    output << "{\n";
+    write_json_key(output, 4, "name");
+    write_json_escaped(output, library_name);
+    output << ",\n";
+    write_json_key(output, 4, "version");
+    write_json_escaped(output, library_version);
+    output << ",\n";
+    write_json_key(output, 4, "scalar_type");
+    write_json_escaped(output, scalar_type);
+    output << '\n';
+    write_json_indent(output, 2);
+    output << "},\n";
+
+    write_json_key(output, 2, "date");
+    output << "{\n";
+    write_json_key(output, 4, "unix_time");
+    output << created_unix_time;
+    output << ",\n";
+    write_json_key(output, 4, "utc");
+    write_json_escaped(output, created_utc);
+    output << '\n';
+    write_json_indent(output, 2);
+    output << "},\n";
+
+    write_json_key(output, 2, "seed");
+    output << "{\n";
+    write_json_key(output, 4, "model");
+    output << model_seed;
+    output << ",\n";
+    write_json_key(output, 4, "training");
+    output << training_seed;
+    output << '\n';
+    write_json_indent(output, 2);
+    output << "},\n";
+
+    write_json_key(output, 2, "architecture");
+    output << "{\n";
+    write_json_key(output, 4, "input_size");
+    output << input_size;
+    output << ",\n";
+    write_json_key(output, 4, "output_size");
+    output << output_size;
+    output << ",\n";
+    write_json_key(output, 4, "layers");
+    output << "[\n";
+    for (std::size_t i = 0; i < architecture.size(); ++i) {
+        const TrainingRunLayerConfig& layer = architecture[i];
+        write_json_indent(output, 6);
+        output << "{\n";
+        write_json_key(output, 8, "input_size");
+        output << layer.input_size;
+        output << ",\n";
+        write_json_key(output, 8, "output_size");
+        output << layer.output_size;
+        output << ",\n";
+        write_json_key(output, 8, "activation");
+        write_json_escaped(output, to_string(layer.activation));
+        output << ",\n";
+        write_json_key(output, 8, "dropout_probability");
+        write_json_scalar(output, layer.dropout_probability);
+        output << '\n';
+        write_json_indent(output, 6);
+        output << '}';
+        if (i + 1 < architecture.size()) {
+            output << ',';
+        }
+        output << '\n';
+    }
+    write_json_indent(output, 4);
+    output << "]\n";
+    write_json_indent(output, 2);
+    output << "},\n";
+
+    write_json_key(output, 2, "optimizer");
+    write_json_optimizer(output, optimizer, 2);
+    output << ",\n";
+    write_json_key(output, 2, "learning_rate_schedule");
+    write_json_learning_rate_schedule(output, learning_rate_schedule, 2);
+    output << ",\n";
+    write_json_key(output, 2, "loss");
+    write_json_loss(output, loss, 2);
+    output << ",\n";
+    write_json_key(output, 2, "normalization");
+    write_json_normalization(output, normalization, 2);
+    output << ",\n";
+
+    write_json_key(output, 2, "dataset");
+    output << "{\n";
+    write_json_key(output, 4, "sample_count");
+    output << dataset.sample_count;
+    output << ",\n";
+    write_json_key(output, 4, "input_size");
+    output << dataset.input_size;
+    output << ",\n";
+    write_json_key(output, 4, "output_size");
+    output << dataset.output_size;
+    output << ",\n";
+    write_json_key(output, 4, "training_sample_count");
+    output << dataset.training_sample_count;
+    output << ",\n";
+    write_json_key(output, 4, "validation_sample_count");
+    output << dataset.validation_sample_count;
+    output << ",\n";
+    write_json_key(output, 4, "test_sample_count");
+    output << dataset.test_sample_count;
+    output << ",\n";
+    write_json_key(output, 4, "validation_split");
+    write_json_scalar(output, dataset.validation_split);
+    output << ",\n";
+    write_json_key(output, 4, "test_split");
+    write_json_scalar(output, dataset.test_split);
+    output << ",\n";
+    write_json_key(output, 4, "shuffle");
+    output << (dataset.shuffle ? "true" : "false");
+    output << ",\n";
+    write_json_key(output, 4, "split_seed");
+    output << dataset.split_seed;
+    output << ",\n";
+    write_json_key(output, 4, "streaming");
+    output << (dataset.streaming ? "true" : "false");
+    output << ",\n";
+    write_json_key(output, 4, "streaming_shuffle_buffer_size");
+    output << dataset.streaming_shuffle_buffer_size;
+    output << '\n';
+    write_json_indent(output, 2);
+    output << "},\n";
+
+    write_json_key(output, 2, "training_options");
+    write_json_training_options(output, options, 2);
+    output << ",\n";
+
+    write_json_key(output, 2, "result");
+    output << "{\n";
+    write_json_key(output, 4, "completed_epochs");
+    output << result.completed_epochs;
+    output << ",\n";
+    write_json_key(output, 4, "has_best_score");
+    output << (result.has_best_score ? "true" : "false");
+    output << ",\n";
+    write_json_key(output, 4, "best_epoch");
+    if (result.has_best_score) {
+        output << result.best_epoch;
+    } else {
+        output << "null";
+    }
+    output << ",\n";
+    write_json_key(output, 4, "best_score");
+    if (result.has_best_score) {
+        write_json_scalar(output, result.best_score);
+    } else {
+        output << "null";
+    }
+    output << ",\n";
+    write_json_key(output, 4, "monitor");
+    write_json_escaped(output, to_string(result.monitor));
+    output << ",\n";
+    write_json_key(output, 4, "monitor_mode");
+    write_json_escaped(output, to_string(result.monitor_mode));
+    output << ",\n";
+    write_json_key(output, 4, "stop_reason");
+    write_json_escaped(output, to_string(result.stop_reason));
+    output << ",\n";
+    write_json_key(output, 4, "stop_message");
+    write_json_escaped(output, result.stop_message);
+    output << ",\n";
+    write_json_key(output, 4, "final_training_loss");
+    if (result.has_final_training_loss) {
+        write_json_scalar(output, result.final_training_loss);
+    } else {
+        output << "null";
+    }
+    output << ",\n";
+    write_json_key(output, 4, "final_validation_loss");
+    if (result.has_final_validation_loss) {
+        write_json_scalar(output, result.final_validation_loss);
+    } else {
+        output << "null";
+    }
+    output << ",\n";
+    write_json_key(output, 4, "final_test_loss");
+    if (result.has_final_test_loss) {
+        write_json_scalar(output, result.final_test_loss);
+    } else {
+        output << "null";
+    }
+    output << '\n';
+    write_json_indent(output, 2);
+    output << "}\n";
+    output << "}\n";
+    return output.str();
 }
 
 std::string to_string(Activation activation) {
@@ -2487,12 +3428,18 @@ std::string to_string(TrainingStopReason reason) {
         return "completed_epochs";
     case TrainingStopReason::early_stopping:
         return "early_stopping";
+    case TrainingStopReason::invalid_training_data:
+        return "invalid_training_data";
     case TrainingStopReason::non_finite_loss:
         return "non_finite_loss";
     case TrainingStopReason::non_finite_gradient:
         return "non_finite_gradient";
     case TrainingStopReason::non_finite_weights:
         return "non_finite_weights";
+    case TrainingStopReason::loss_explosion:
+        return "loss_explosion";
+    case TrainingStopReason::gradient_explosion:
+        return "gradient_explosion";
     }
 
     throw std::invalid_argument("unknown training stop reason");
@@ -2704,6 +3651,115 @@ ParallelExecution parallel_execution_from_string(std::string_view value) {
         return ParallelExecution::worker_threads;
     }
     throw std::invalid_argument("unknown parallel execution: " + std::string(value));
+}
+
+DenseMatrix::DenseMatrix(std::size_t row_count, std::size_t column_count, Scalar value) {
+    resize(row_count, column_count, value);
+}
+
+DenseMatrix DenseMatrix::from_matrix(const Matrix& matrix) {
+    if (matrix.empty()) {
+        return {};
+    }
+    const std::size_t column_count = matrix.front().size();
+    validate_matrix(matrix, column_count, "matrix");
+    DenseMatrix dense(matrix.size(), column_count);
+    for (std::size_t row = 0; row < matrix.size(); ++row) {
+        dense.set_row(row, matrix[row]);
+    }
+    return dense;
+}
+
+Matrix DenseMatrix::to_matrix() const {
+    Matrix matrix(rows_, Vector(columns_, Scalar{0}));
+    for (std::size_t row = 0; row < rows_; ++row) {
+        const Scalar* source = row_data(row);
+        std::copy(source, source + columns_, matrix[row].begin());
+    }
+    return matrix;
+}
+
+void DenseMatrix::resize(std::size_t row_count, std::size_t column_count, Scalar value) {
+    require(column_count > 0 || row_count == 0, "dense matrix columns must be positive");
+    if (column_count != 0) {
+        require(row_count <= std::numeric_limits<std::size_t>::max() / column_count,
+                "dense matrix dimensions overflow");
+    }
+    rows_ = row_count;
+    columns_ = column_count;
+    values_.assign(rows_ * columns_, value);
+}
+
+void DenseMatrix::clear() noexcept {
+    rows_ = 0;
+    columns_ = 0;
+    values_.clear();
+}
+
+bool DenseMatrix::empty() const noexcept {
+    return rows_ == 0;
+}
+
+std::size_t DenseMatrix::rows() const noexcept {
+    return rows_;
+}
+
+std::size_t DenseMatrix::columns() const noexcept {
+    return columns_;
+}
+
+std::size_t DenseMatrix::size() const noexcept {
+    return rows_;
+}
+
+std::size_t DenseMatrix::scalar_count() const noexcept {
+    return values_.size();
+}
+
+const Vector& DenseMatrix::values() const noexcept {
+    return values_;
+}
+
+Scalar* DenseMatrix::data() noexcept {
+    return values_.data();
+}
+
+const Scalar* DenseMatrix::data() const noexcept {
+    return values_.data();
+}
+
+Scalar* DenseMatrix::row_data(std::size_t row) {
+    require(row < rows_, "dense matrix row index is out of range");
+    return values_.data() + row * columns_;
+}
+
+const Scalar* DenseMatrix::row_data(std::size_t row) const {
+    require(row < rows_, "dense matrix row index is out of range");
+    return values_.data() + row * columns_;
+}
+
+Scalar& DenseMatrix::operator()(std::size_t row, std::size_t column) {
+    require(row < rows_, "dense matrix row index is out of range");
+    require(column < columns_, "dense matrix column index is out of range");
+    return values_[row * columns_ + column];
+}
+
+Scalar DenseMatrix::operator()(std::size_t row, std::size_t column) const {
+    require(row < rows_, "dense matrix row index is out of range");
+    require(column < columns_, "dense matrix column index is out of range");
+    return values_[row * columns_ + column];
+}
+
+Vector DenseMatrix::row(std::size_t row_index) const {
+    const Scalar* source = row_data(row_index);
+    return Vector(source, source + columns_);
+}
+
+void DenseMatrix::set_row(std::size_t row_index, const Vector& values) {
+    require(values.size() == columns_, "dense matrix row has an invalid column count");
+    const Scalar* source = values.data();
+    Scalar* destination = row_data(row_index);
+    std::copy(source, source + columns_, destination);
 }
 
 LossConfig LossConfig::from_loss(Loss loss) {
@@ -2985,6 +4041,81 @@ EvaluationResult evaluate_predictions(const Matrix& predictions,
     return result;
 }
 
+EvaluationResult evaluate_predictions(std::initializer_list<Vector> predictions,
+                                      std::initializer_list<Vector> targets,
+                                      const EvaluationOptions& options) {
+    return evaluate_predictions(Matrix(predictions), Matrix(targets), options);
+}
+
+EvaluationResult evaluate_predictions(const DenseMatrix& predictions,
+                                      const DenseMatrix& targets,
+                                      const EvaluationOptions& options) {
+    validate_evaluation_data(predictions, targets);
+    validate_evaluation_options(options);
+
+    const std::vector<Metric> metrics = selected_metrics(options);
+    const bool needs_regression = std::any_of(metrics.begin(), metrics.end(), is_regression_metric);
+    const bool needs_classification = std::any_of(metrics.begin(), metrics.end(), is_classification_metric);
+
+    EvaluationResult result;
+    RegressionSummary regression;
+    if (needs_regression) {
+        regression = summarize_regression(predictions, targets);
+    }
+
+    ClassificationSummary classification;
+    if (needs_classification) {
+        result.confusion_matrix = make_confusion_matrix(predictions, targets, options.classification_threshold);
+        result.has_confusion_matrix = true;
+        classification = summarize_classification(result.confusion_matrix, options);
+    }
+
+    for (Metric metric : metrics) {
+        switch (metric) {
+        case Metric::mean_squared_error:
+            result.values.push_back(MetricValue{metric, to_string(metric), regression.mean_squared_error});
+            break;
+        case Metric::mean_absolute_error:
+            result.values.push_back(MetricValue{metric, to_string(metric), regression.mean_absolute_error});
+            break;
+        case Metric::root_mean_squared_error:
+            result.values.push_back(MetricValue{metric, to_string(metric), regression.root_mean_squared_error});
+            break;
+        case Metric::r2_score:
+            result.values.push_back(MetricValue{metric, to_string(metric), regression.r2_score});
+            break;
+        case Metric::accuracy:
+            result.values.push_back(MetricValue{metric, to_string(metric), classification.accuracy});
+            break;
+        case Metric::precision:
+            result.values.push_back(MetricValue{metric, to_string(metric), classification.precision});
+            break;
+        case Metric::recall:
+            result.values.push_back(MetricValue{metric, to_string(metric), classification.recall});
+            break;
+        case Metric::f1_score:
+            result.values.push_back(MetricValue{metric, to_string(metric), classification.f1_score});
+            break;
+        case Metric::confusion_matrix:
+            break;
+        case Metric::custom:
+            throw std::invalid_argument("custom metrics must be registered with add_custom_metric");
+        }
+    }
+
+    if (!options.custom_metrics.empty()) {
+        const Matrix prediction_matrix = predictions.to_matrix();
+        const Matrix target_matrix = targets.to_matrix();
+        for (const CustomMetric& metric : options.custom_metrics) {
+            const Scalar value = metric.evaluate(prediction_matrix, target_matrix, metric.context);
+            require_finite(value, "custom metric");
+            result.values.push_back(MetricValue{Metric::custom, metric.name, value});
+        }
+    }
+
+    return result;
+}
+
 Dataset::~Dataset() = default;
 
 MatrixDataset::MatrixDataset(const Matrix& inputs, const Matrix& targets)
@@ -3027,6 +4158,46 @@ void MatrixDataset::sample(std::size_t index,
     const Vector& source_target = (*targets_)[index];
     std::copy(source_input.begin(), source_input.end(), input);
     std::copy(source_target.begin(), source_target.end(), target);
+}
+
+DenseMatrixDataset::DenseMatrixDataset(const DenseMatrix& inputs, const DenseMatrix& targets)
+    : inputs_(&inputs),
+      targets_(&targets) {
+    validate_dense_matrix(inputs, inputs.columns(), "inputs");
+    validate_dense_matrix(targets, targets.columns(), "targets");
+    require(inputs.rows() == targets.rows(), "inputs and targets must have the same number of rows");
+    require(inputs.columns() > 0, "inputs must have at least one column");
+    require(targets.columns() > 0, "targets must have at least one column");
+}
+
+std::size_t DenseMatrixDataset::sample_count() const noexcept {
+    return inputs_ ? inputs_->rows() : 0;
+}
+
+std::size_t DenseMatrixDataset::input_size() const noexcept {
+    return inputs_ ? inputs_->columns() : 0;
+}
+
+std::size_t DenseMatrixDataset::output_size() const noexcept {
+    return targets_ ? targets_->columns() : 0;
+}
+
+void DenseMatrixDataset::sample(std::size_t index,
+                                Scalar* input,
+                                std::size_t provided_input_size,
+                                Scalar* target,
+                                std::size_t provided_target_size) const {
+    require(inputs_ != nullptr && targets_ != nullptr, "dense matrix dataset is not initialized");
+    require(index < sample_count(), "dataset sample index is out of range");
+    require(input != nullptr, "dataset input buffer must not be null");
+    require(target != nullptr, "dataset target buffer must not be null");
+    require(provided_input_size == input_size(), "dataset input buffer size mismatch");
+    require(provided_target_size == output_size(), "dataset target buffer size mismatch");
+
+    const Scalar* source_input = inputs_->row_data(index);
+    const Scalar* source_target = targets_->row_data(index);
+    std::copy(source_input, source_input + input_size(), input);
+    std::copy(source_target, source_target + output_size(), target);
 }
 
 GeneratedDataset::GeneratedDataset(std::size_t sample_count_value,
@@ -4108,11 +5279,50 @@ Matrix InferenceModel::predict_batch(const Matrix& inputs) const {
     return result;
 }
 
+Matrix InferenceModel::predict_batch(std::initializer_list<Vector> inputs) const {
+    return predict_batch(Matrix(inputs));
+}
+
+DenseMatrix InferenceModel::predict_batch(const DenseMatrix& inputs) const {
+    validate_dense_matrix(inputs, input_size(), "inputs", true);
+    DenseMatrix result(inputs.rows(), output_size());
+    if (inputs.empty()) {
+        return result;
+    }
+
+    Vector scratch(scratch_size(), Scalar{0});
+    const InferenceStatus status = predict_batch_to(inputs.data(),
+                                                    inputs.rows(),
+                                                    inputs.columns(),
+                                                    result.data(),
+                                                    result.columns(),
+                                                    scratch.data(),
+                                                    scratch.size());
+    if (status != InferenceStatus::ok) {
+        throw std::invalid_argument("inference failed: " + to_string(status));
+    }
+    return result;
+}
+
 EvaluationResult InferenceModel::evaluate_metrics(const Matrix& inputs,
                                                   const Matrix& targets,
                                                   const EvaluationOptions& options) const {
     validate_matrix(inputs, input_size(), "inputs");
     validate_matrix(targets, output_size(), "targets");
+    return evaluate_predictions(predict_batch(inputs), targets, options);
+}
+
+EvaluationResult InferenceModel::evaluate_metrics(std::initializer_list<Vector> inputs,
+                                                  std::initializer_list<Vector> targets,
+                                                  const EvaluationOptions& options) const {
+    return evaluate_metrics(Matrix(inputs), Matrix(targets), options);
+}
+
+EvaluationResult InferenceModel::evaluate_metrics(const DenseMatrix& inputs,
+                                                  const DenseMatrix& targets,
+                                                  const EvaluationOptions& options) const {
+    validate_dense_matrix(inputs, input_size(), "inputs");
+    validate_dense_matrix(targets, output_size(), "targets");
     return evaluate_predictions(predict_batch(inputs), targets, options);
 }
 
@@ -4247,11 +5457,13 @@ InferenceModel InferenceModel::load(const std::filesystem::path& path) {
     }
 
     const std::size_t input_size = read_value<std::size_t>(input, "input_size");
+    require(input_size > 0, "inference input_size must be positive");
     NormalizationSpec normalization;
     if (has_normalization) {
         normalization = read_normalization(input);
     }
     const std::size_t layer_count = read_value<std::size_t>(input, "layer_count");
+    validate_serialized_layer_count(layer_count, "inference model");
     std::vector<LayerParameters> parameters;
     parameters.reserve(layer_count);
 
@@ -4261,15 +5473,21 @@ InferenceModel InferenceModel::load(const std::filesystem::path& path) {
         layer.input_size = read_value<std::size_t>(input, "layer_input_size");
         layer.output_size = read_value<std::size_t>(input, "layer_output_size");
         layer.activation = activation_from_string(read_token(input, "layer_activation"));
+        require(layer.input_size > 0, "inference layer input_size must be positive");
+        require(layer.output_size > 0, "inference layer output_size must be positive");
         require(layer.input_size == expected_input_size, "inference file topology is inconsistent");
+        const std::size_t expected_weight_count =
+            checked_product(layer.input_size, layer.output_size, "inference weight");
 
         const std::size_t weight_count = read_value<std::size_t>(input, "weight_count");
+        require_exact_serialized_count(weight_count, expected_weight_count, "inference weight");
         layer.weights.resize(weight_count);
         for (Scalar& weight : layer.weights) {
             weight = read_value<Scalar>(input, "weight");
         }
 
         const std::size_t bias_count = read_value<std::size_t>(input, "bias_count");
+        require_exact_serialized_count(bias_count, layer.output_size, "inference bias");
         layer.biases.resize(bias_count);
         for (Scalar& bias : layer.biases) {
             bias = read_value<Scalar>(input, "bias");
@@ -4279,6 +5497,9 @@ InferenceModel InferenceModel::load(const std::filesystem::path& path) {
         parameters.push_back(std::move(layer));
     }
 
+    require_text_stream_consumed(input, "inference model");
+    validate_layer_parameters(parameters);
+    validate_normalization_spec(normalization, input_size, parameters.back().output_size);
     return InferenceModel::from_parameters(parameters, normalization);
 }
 
@@ -4326,6 +5547,55 @@ struct TrainingModel::Impl {
         return layers.back().output_size;
     }
 
+    [[nodiscard]] TrainingRunConfig make_training_run_config(const OptimizerConfig& run_optimizer,
+                                                             const TrainingOptions& runtime_options,
+                                                             const DatasetSplit& split,
+                                                             std::size_t sample_count,
+                                                             bool streaming) const {
+        TrainingRunConfig config;
+        config.library_version = std::string(version_string());
+        config.scalar_type = scalar_type_string();
+        config.created_unix_time = current_unix_time();
+        config.created_utc = utc_timestamp(config.created_unix_time);
+        config.model_seed = seed;
+        config.training_seed = non_zero_seed(runtime_options.seed, seed);
+        config.input_size = input_size;
+        config.output_size = output_size();
+
+        config.architecture.reserve(layers.size());
+        for (const Layer& layer : layers) {
+            TrainingRunLayerConfig layer_config;
+            layer_config.input_size = layer.input_size;
+            layer_config.output_size = layer.output_size;
+            layer_config.activation = layer.activation;
+            layer_config.dropout_probability = layer.dropout_probability;
+            config.architecture.push_back(layer_config);
+        }
+
+        config.optimizer = run_optimizer;
+        config.learning_rate_schedule = runtime_options.learning_rate_schedule;
+        config.loss = loss;
+        config.normalization = normalization;
+        config.options = runtime_options;
+
+        config.dataset.sample_count = sample_count;
+        config.dataset.input_size = input_size;
+        config.dataset.output_size = output_size();
+        config.dataset.training_sample_count = split.training_indices.size();
+        config.dataset.validation_sample_count = split.validation_indices.size();
+        config.dataset.test_sample_count = split.test_indices.size();
+        config.dataset.validation_split = runtime_options.validation_split;
+        config.dataset.test_split = runtime_options.test_split;
+        config.dataset.shuffle = runtime_options.shuffle;
+        config.dataset.split_seed = config.training_seed;
+        config.dataset.streaming = streaming;
+        config.dataset.streaming_shuffle_buffer_size = runtime_options.streaming_shuffle_buffer_size;
+
+        config.result.monitor = runtime_options.early_stopping_monitor;
+        config.result.monitor_mode = runtime_options.early_stopping_mode;
+        return config;
+    }
+
     [[nodiscard]] Vector forward(const Vector& input) const {
         Vector activations = input;
         for (const Layer& layer : layers) {
@@ -4346,6 +5616,14 @@ struct TrainingModel::Impl {
     [[nodiscard]] Vector predict_raw(const Vector& input) const {
         return denormalize_vector(forward(normalize_vector(input, normalization.input_features)),
                                   normalization.output_features);
+    }
+
+    [[nodiscard]] Vector predict_raw(const Scalar* input, std::size_t input_count) const {
+        require(input != nullptr, "input buffer must not be null");
+        require(input_count == input_size, "input has an invalid size");
+        Vector normalized(input_count, Scalar{0});
+        normalize_buffer_into(input, input_count, normalization.input_features, normalized.data());
+        return denormalize_vector(forward(normalized), normalization.output_features);
     }
 
     [[nodiscard]] Vector forward_cached(const Scalar* input,
@@ -4439,7 +5717,9 @@ struct TrainingModel::Impl {
         return activations.back();
     }
 
-    [[nodiscard]] Scalar sample_loss(const Vector& prediction, const Vector& target) const {
+    [[nodiscard]] Scalar sample_loss(const Vector& prediction, const Scalar* target, std::size_t target_count) const {
+        require(target != nullptr, "target buffer must not be null");
+        require(target_count == prediction.size(), "target has an invalid size");
         Scalar total = Scalar{0};
 
         switch (loss.type) {
@@ -4501,7 +5781,7 @@ struct TrainingModel::Impl {
             return total;
         case Loss::custom: {
             const Scalar value = loss.custom_loss.value(prediction.data(),
-                                                        target.data(),
+                                                        target,
                                                         prediction.size(),
                                                         loss.custom_loss.context);
             require_finite(value, "custom loss");
@@ -4510,6 +5790,10 @@ struct TrainingModel::Impl {
         }
 
         throw std::invalid_argument("unknown loss");
+    }
+
+    [[nodiscard]] Scalar sample_loss(const Vector& prediction, const Vector& target) const {
+        return sample_loss(prediction, target.data(), target.size());
     }
 
     [[nodiscard]] Vector output_delta(const Vector& prediction,
@@ -4803,9 +6087,71 @@ struct TrainingModel::Impl {
         return count;
     }
 
+    [[nodiscard]] std::string first_non_finite_parameter_location() const {
+        for (std::size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+            const Layer& layer = layers[layer_index];
+            for (std::size_t i = 0; i < layer.weights.size(); ++i) {
+                const Scalar value = layer.weights[i];
+                if (!is_finite(value)) {
+                    return "layer " + std::to_string(layer_index) + " weight[" +
+                           std::to_string(i) + "]=" + scalar_debug_string(value) +
+                           " (" + non_finite_kind(value) + ")";
+                }
+            }
+            for (std::size_t i = 0; i < layer.biases.size(); ++i) {
+                const Scalar value = layer.biases[i];
+                if (!is_finite(value)) {
+                    return "layer " + std::to_string(layer_index) + " bias[" +
+                           std::to_string(i) + "]=" + scalar_debug_string(value) +
+                           " (" + non_finite_kind(value) + ")";
+                }
+            }
+        }
+        return "unknown parameter";
+    }
+
+    [[nodiscard]] std::string first_non_finite_gradient_location(std::size_t batch_size) const {
+        const Scalar batch_scale = Scalar{1} / static_cast<Scalar>(batch_size);
+        for (std::size_t layer_index = 0; layer_index < layers.size(); ++layer_index) {
+            const Layer& layer = layers[layer_index];
+            for (std::size_t i = 0; i < layer.grad_weights.size(); ++i) {
+                const Scalar raw_gradient = layer.grad_weights[i];
+                if (!is_finite(raw_gradient)) {
+                    return "layer " + std::to_string(layer_index) + " grad_weight[" +
+                           std::to_string(i) + "]=" + scalar_debug_string(raw_gradient) +
+                           " (" + non_finite_kind(raw_gradient) + ")";
+                }
+                Scalar gradient = raw_gradient * batch_scale;
+                gradient += optimizer.l2 * layer.weights[i];
+                gradient += optimizer.l1 * sign_or_zero(layer.weights[i]);
+                if (!is_finite(gradient)) {
+                    return "layer " + std::to_string(layer_index) + " effective grad_weight[" +
+                           std::to_string(i) + "]=" + scalar_debug_string(gradient) +
+                           " (" + non_finite_kind(gradient) + ")";
+                }
+            }
+            for (std::size_t i = 0; i < layer.grad_biases.size(); ++i) {
+                const Scalar raw_gradient = layer.grad_biases[i];
+                if (!is_finite(raw_gradient)) {
+                    return "layer " + std::to_string(layer_index) + " grad_bias[" +
+                           std::to_string(i) + "]=" + scalar_debug_string(raw_gradient) +
+                           " (" + non_finite_kind(raw_gradient) + ")";
+                }
+                const Scalar gradient = raw_gradient * batch_scale;
+                if (!is_finite(gradient)) {
+                    return "layer " + std::to_string(layer_index) + " effective grad_bias[" +
+                           std::to_string(i) + "]=" + scalar_debug_string(gradient) +
+                           " (" + non_finite_kind(gradient) + ")";
+                }
+            }
+        }
+        return "unknown gradient";
+    }
+
     struct GradientApplicationResult {
         Scalar gradient_norm{static_cast<Scalar>(0)};
         GradientClippingDiagnostics clipping{};
+        std::string non_finite_location{};
     };
 
     [[nodiscard]] GradientApplicationResult apply_gradients(std::size_t batch_size,
@@ -4815,6 +6161,7 @@ struct TrainingModel::Impl {
         const Scalar gradient_norm = accumulated_gradient_norm(batch_size);
         result.gradient_norm = gradient_norm;
         if (!is_finite(gradient_norm)) {
+            result.non_finite_location = first_non_finite_gradient_location(batch_size);
             zero_gradients();
             return result;
         }
@@ -5004,8 +6351,17 @@ struct TrainingModel::Impl {
                              Vector& raw_input,
                              Vector& raw_target,
                              Vector& normalized_input,
-                             Vector& normalized_target) const {
+                             Vector& normalized_target,
+                             const TrainingDebugOptions* debug = nullptr,
+                             const TrainingDebugContext& debug_context = {}) const {
         dataset.sample(index, raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size());
+        if (debug != nullptr && debug->enabled) {
+            debug_check_sample_values(raw_input.data(),
+                                      raw_input.size(),
+                                      raw_target.data(),
+                                      raw_target.size(),
+                                      debug_context);
+        }
         normalize_sample(raw_input, raw_target, normalized_input, normalized_target);
     }
 
@@ -5014,7 +6370,9 @@ struct TrainingModel::Impl {
                             std::size_t begin,
                             std::size_t count,
                             MiniBatch& raw_batch,
-                            MiniBatch& normalized_batch) const {
+                            MiniBatch& normalized_batch,
+                            const TrainingDebugOptions* debug = nullptr,
+                            const TrainingDebugContext& base_debug_context = {}) const {
         require(begin <= indices.size(), "batch begin index is out of range");
         require(count <= indices.size() - begin, "batch count is out of range");
         raw_batch.resize(count, input_size, output_size());
@@ -5026,6 +6384,16 @@ struct TrainingModel::Impl {
                            raw_batch.input_size,
                            raw_batch.target_data(sample),
                            raw_batch.output_size);
+            if (debug != nullptr && debug->enabled) {
+                TrainingDebugContext context = base_debug_context;
+                context.sample_index = indices[begin + sample];
+                context.has_sample_index = true;
+                debug_check_sample_values(raw_batch.input_data(sample),
+                                          raw_batch.input_size,
+                                          raw_batch.target_data(sample),
+                                          raw_batch.output_size,
+                                          context);
+            }
             normalize_sample(raw_batch.input_data(sample),
                              raw_batch.input_size,
                              raw_batch.target_data(sample),
@@ -5036,7 +6404,11 @@ struct TrainingModel::Impl {
     }
 
     [[nodiscard]] Scalar loss_for_dataset_indices(const Dataset& dataset,
-                                                  const std::vector<std::size_t>& indices) const {
+                                                  const std::vector<std::size_t>& indices,
+                                                  const TrainingDebugOptions* debug = nullptr,
+                                                  const char* debug_phase = "loss",
+                                                  std::size_t epoch = 0,
+                                                  bool has_epoch = false) const {
         require(!indices.empty(), "dataset loss requires at least one sample");
         Vector raw_input(input_size);
         Vector raw_target(output_size());
@@ -5044,7 +6416,20 @@ struct TrainingModel::Impl {
         Vector normalized_target(output_size());
         Scalar total = Scalar{0};
         for (std::size_t index : indices) {
-            read_dataset_sample(dataset, index, raw_input, raw_target, normalized_input, normalized_target);
+            TrainingDebugContext context;
+            context.phase = debug_phase;
+            context.epoch = epoch;
+            context.has_epoch = has_epoch;
+            context.sample_index = index;
+            context.has_sample_index = true;
+            read_dataset_sample(dataset,
+                                index,
+                                raw_input,
+                                raw_target,
+                                normalized_input,
+                                normalized_target,
+                                debug,
+                                context);
             total += sample_loss(forward(normalized_input), normalized_target);
         }
         return total / static_cast<Scalar>(indices.size());
@@ -5054,10 +6439,19 @@ struct TrainingModel::Impl {
                                Vector& raw_input,
                                Vector& raw_target,
                                Vector& normalized_input,
-                               Vector& normalized_target) const {
+                               Vector& normalized_target,
+                               const TrainingDebugOptions* debug = nullptr,
+                               const TrainingDebugContext& debug_context = {}) const {
         const bool has_sample =
             dataset.next(raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size());
         require(has_sample, "streaming dataset ended before sample_count");
+        if (debug != nullptr && debug->enabled) {
+            debug_check_sample_values(raw_input.data(),
+                                      raw_input.size(),
+                                      raw_target.data(),
+                                      raw_target.size(),
+                                      debug_context);
+        }
         normalize_sample(raw_input, raw_target, normalized_input, normalized_target);
     }
 
@@ -5340,6 +6734,20 @@ Matrix TrainingModel::predict_batch(const Matrix& inputs) const {
     return result;
 }
 
+Matrix TrainingModel::predict_batch(std::initializer_list<Vector> inputs) const {
+    return predict_batch(Matrix(inputs));
+}
+
+DenseMatrix TrainingModel::predict_batch(const DenseMatrix& inputs) const {
+    validate_dense_matrix(inputs, input_size(), "inputs", true);
+    DenseMatrix result(inputs.rows(), output_size());
+    for (std::size_t row = 0; row < inputs.rows(); ++row) {
+        const Vector output = impl_->predict_raw(inputs.row_data(row), inputs.columns());
+        std::copy(output.begin(), output.end(), result.row_data(row));
+    }
+    return result;
+}
+
 Scalar TrainingModel::evaluate_loss(const Matrix& inputs, const Matrix& targets) const {
     validate_training_data(inputs, targets, input_size(), output_size(), impl_->loss);
     Scalar total = Scalar{0};
@@ -5347,6 +6755,22 @@ Scalar TrainingModel::evaluate_loss(const Matrix& inputs, const Matrix& targets)
         total += impl_->sample_loss(impl_->predict_raw(inputs[i]), targets[i]);
     }
     return total / static_cast<Scalar>(inputs.size());
+}
+
+Scalar TrainingModel::evaluate_loss(std::initializer_list<Vector> inputs,
+                                    std::initializer_list<Vector> targets) const {
+    return evaluate_loss(Matrix(inputs), Matrix(targets));
+}
+
+Scalar TrainingModel::evaluate_loss(const DenseMatrix& inputs, const DenseMatrix& targets) const {
+    validate_training_data(inputs, targets, input_size(), output_size(), impl_->loss);
+    Scalar total = Scalar{0};
+    for (std::size_t row = 0; row < inputs.rows(); ++row) {
+        total += impl_->sample_loss(impl_->predict_raw(inputs.row_data(row), inputs.columns()),
+                                    targets.row_data(row),
+                                    targets.columns());
+    }
+    return total / static_cast<Scalar>(inputs.rows());
 }
 
 EvaluationResult TrainingModel::evaluate_metrics(const Matrix& inputs,
@@ -5357,8 +6781,35 @@ EvaluationResult TrainingModel::evaluate_metrics(const Matrix& inputs,
     return evaluate_predictions(predict_batch(inputs), targets, options);
 }
 
+EvaluationResult TrainingModel::evaluate_metrics(std::initializer_list<Vector> inputs,
+                                                 std::initializer_list<Vector> targets,
+                                                 const EvaluationOptions& options) const {
+    return evaluate_metrics(Matrix(inputs), Matrix(targets), options);
+}
+
+EvaluationResult TrainingModel::evaluate_metrics(const DenseMatrix& inputs,
+                                                 const DenseMatrix& targets,
+                                                 const EvaluationOptions& options) const {
+    validate_dense_matrix(inputs, input_size(), "inputs");
+    validate_dense_matrix(targets, output_size(), "targets");
+    return evaluate_predictions(predict_batch(inputs), targets, options);
+}
+
 TrainingHistory TrainingModel::fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options) {
     MatrixDataset dataset(inputs, targets);
+    return fit(dataset, options);
+}
+
+TrainingHistory TrainingModel::fit(std::initializer_list<Vector> inputs,
+                                   std::initializer_list<Vector> targets,
+                                   const TrainingOptions& options) {
+    return fit(Matrix(inputs), Matrix(targets), options);
+}
+
+TrainingHistory TrainingModel::fit(const DenseMatrix& inputs,
+                                   const DenseMatrix& targets,
+                                   const TrainingOptions& options) {
+    DenseMatrixDataset dataset(inputs, targets);
     return fit(dataset, options);
 }
 
@@ -5368,6 +6819,8 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
     TrainingOptions runtime_options = options;
     runtime_options.learning_rate_schedule =
         resolve_learning_rate_schedule(options.learning_rate_schedule, impl_->optimizer.learning_rate);
+    OptimizerConfig run_optimizer = impl_->optimizer;
+    run_optimizer.learning_rate = runtime_options.learning_rate_schedule.base_learning_rate;
     impl_->last_training_options = runtime_options;
     impl_->has_last_training_options = true;
 
@@ -5384,6 +6837,11 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
     history.validation_loss.reserve(options.epochs);
     history.test_loss.reserve(options.epochs);
     history.epochs.reserve(options.epochs);
+    history.run_config = impl_->make_training_run_config(run_optimizer,
+                                                         runtime_options,
+                                                         split,
+                                                         dataset.sample_count(),
+                                                         false);
     history.stop_reason = TrainingStopReason::completed_epochs;
     history.stop_message = "completed requested epochs";
     const TrainingMonitor resolved_monitor = resolve_training_monitor(options.early_stopping_monitor,
@@ -5397,6 +6855,10 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
             : resolved_monitor;
     history.monitor = resolved_monitor;
     history.monitor_mode = options.early_stopping_mode;
+    auto finish_history = [&]() -> TrainingHistory {
+        refresh_training_run_result(history, impl_->completed_epochs);
+        return history;
+    };
 
     const bool resume_training = impl_->has_resume_epoch;
     const std::size_t first_epoch = resume_training ? std::min(impl_->resume_epoch, options.epochs) : 0;
@@ -5404,7 +6866,7 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
     impl_->completed_epochs = first_epoch;
     if (first_epoch >= options.epochs) {
         history.stop_message = "checkpoint already reached requested epochs";
-        return history;
+        return finish_history();
     }
 
     Scalar best_metric = initial_best_metric(options.early_stopping_mode);
@@ -5425,6 +6887,10 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
 
     MiniBatch raw_batch;
     MiniBatch normalized_batch;
+    TrainingDebugScalarTracker debug_training_loss;
+    TrainingDebugScalarTracker debug_validation_loss;
+    TrainingDebugScalarTracker debug_test_loss;
+    TrainingDebugScalarTracker debug_gradient_norm;
 
     for (std::size_t epoch = first_epoch; epoch < options.epochs; ++epoch) {
         const auto epoch_start = std::chrono::steady_clock::now();
@@ -5439,6 +6905,9 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
         Scalar epoch_gradient_norm = Scalar{0};
         GradientClippingDiagnostics epoch_clipping;
         bool non_finite_gradient = false;
+        bool gradient_explosion = false;
+        std::string non_finite_gradient_message;
+        std::string gradient_explosion_message;
 
         std::mt19937_64 epoch_rng(non_zero_seed(options.seed, impl_->seed) + epoch);
         if (options.shuffle) {
@@ -5447,7 +6916,27 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
 
         for (std::size_t begin = 0; begin < training_indices.size(); begin += options.batch_size) {
             const std::size_t batch_count = std::min(options.batch_size, training_indices.size() - begin);
-            impl_->fill_dataset_batch(dataset, training_indices, begin, batch_count, raw_batch, normalized_batch);
+            TrainingDebugContext debug_context;
+            debug_context.phase = "training batch";
+            debug_context.epoch = epoch;
+            debug_context.has_epoch = true;
+            try {
+                impl_->fill_dataset_batch(dataset,
+                                          training_indices,
+                                          begin,
+                                          batch_count,
+                                          raw_batch,
+                                          normalized_batch,
+                                          &runtime_options.debug,
+                                          debug_context);
+            } catch (const TrainingDebugFailure& failure) {
+                history.stop_reason = failure.reason;
+                history.stop_message = failure.what();
+                if (options.restore_best_weights && !best_parameters.empty()) {
+                    impl_->set_parameters(best_parameters);
+                }
+                return finish_history();
+            }
             impl_->zero_gradients();
             impl_->accumulate_batch_gradients(normalized_batch, &epoch_rng);
             const auto gradient_result =
@@ -5455,38 +6944,161 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
             if (!is_finite(gradient_result.gradient_norm)) {
                 epoch_gradient_norm = gradient_result.gradient_norm;
                 non_finite_gradient = true;
+                non_finite_gradient_message =
+                    "stopped because gradient norm became non-finite at epoch " +
+                    std::to_string(epoch) + " batch_begin " + std::to_string(begin) +
+                    ": norm=" + scalar_debug_string(gradient_result.gradient_norm);
+                if (!gradient_result.non_finite_location.empty()) {
+                    non_finite_gradient_message += " first_non_finite=" + gradient_result.non_finite_location;
+                }
                 break;
             }
+            if (runtime_options.debug.enabled &&
+                debug_exploded(gradient_result.gradient_norm,
+                               debug_gradient_norm,
+                               runtime_options.debug.gradient_norm_explosion_threshold,
+                               runtime_options.debug.gradient_norm_explosion_factor)) {
+                epoch_gradient_norm = gradient_result.gradient_norm;
+                gradient_explosion = true;
+                gradient_explosion_message =
+                    debug_explosion_message("gradient norm",
+                                            gradient_result.gradient_norm,
+                                            debug_gradient_norm,
+                                            runtime_options.debug.gradient_norm_explosion_threshold,
+                                            runtime_options.debug.gradient_norm_explosion_factor,
+                                            epoch,
+                                            "batch_begin=" + std::to_string(begin));
+                break;
+            }
+            update_debug_tracker_if_finite(debug_gradient_norm, gradient_result.gradient_norm);
             merge_gradient_clipping(epoch_clipping, gradient_result.clipping);
             epoch_gradient_norm = std::max(epoch_gradient_norm, gradient_result.gradient_norm);
         }
         finalize_gradient_clipping(epoch_clipping);
 
-        const Scalar training_loss = impl_->loss_for_dataset_indices(dataset, training_indices);
+        Scalar training_loss = Scalar{0};
+        try {
+            training_loss = impl_->loss_for_dataset_indices(dataset,
+                                                            training_indices,
+                                                            &runtime_options.debug,
+                                                            "training loss",
+                                                            epoch,
+                                                            true);
+        } catch (const TrainingDebugFailure& failure) {
+            history.stop_reason = failure.reason;
+            history.stop_message = failure.what();
+            if (options.restore_best_weights && !best_parameters.empty()) {
+                impl_->set_parameters(best_parameters);
+            }
+            return finish_history();
+        }
         history.training_loss.push_back(training_loss);
 
         bool has_validation_loss = false;
         Scalar validation_loss = Scalar{0};
         if (!split.validation_indices.empty()) {
-            validation_loss = impl_->loss_for_dataset_indices(dataset, split.validation_indices);
+            try {
+                validation_loss = impl_->loss_for_dataset_indices(dataset,
+                                                                  split.validation_indices,
+                                                                  &runtime_options.debug,
+                                                                  "validation loss",
+                                                                  epoch,
+                                                                  true);
+            } catch (const TrainingDebugFailure& failure) {
+                history.stop_reason = failure.reason;
+                history.stop_message = failure.what();
+                if (options.restore_best_weights && !best_parameters.empty()) {
+                    impl_->set_parameters(best_parameters);
+                }
+                return finish_history();
+            }
             history.validation_loss.push_back(validation_loss);
             has_validation_loss = true;
         }
         bool has_test_loss = false;
         Scalar test_loss = Scalar{0};
         if (!split.test_indices.empty()) {
-            test_loss = impl_->loss_for_dataset_indices(dataset, split.test_indices);
+            try {
+                test_loss = impl_->loss_for_dataset_indices(dataset,
+                                                            split.test_indices,
+                                                            &runtime_options.debug,
+                                                            "test loss",
+                                                            epoch,
+                                                            true);
+            } catch (const TrainingDebugFailure& failure) {
+                history.stop_reason = failure.reason;
+                history.stop_message = failure.what();
+                if (options.restore_best_weights && !best_parameters.empty()) {
+                    impl_->set_parameters(best_parameters);
+                }
+                return finish_history();
+            }
             history.test_loss.push_back(test_loss);
             has_test_loss = true;
         }
 
         const WeightStatistics weight_stats = impl_->weight_statistics();
         const std::size_t non_finite_parameters = impl_->non_finite_parameter_count();
+        bool loss_explosion = false;
+        std::string loss_explosion_message;
+        if (runtime_options.debug.enabled && is_finite(training_loss) &&
+            debug_exploded(training_loss,
+                           debug_training_loss,
+                           runtime_options.debug.loss_explosion_threshold,
+                           runtime_options.debug.loss_explosion_factor)) {
+            loss_explosion = true;
+            loss_explosion_message =
+                debug_explosion_message("training loss",
+                                        training_loss,
+                                        debug_training_loss,
+                                        runtime_options.debug.loss_explosion_threshold,
+                                        runtime_options.debug.loss_explosion_factor,
+                                        epoch);
+        }
+        if (!loss_explosion && runtime_options.debug.enabled && has_validation_loss && is_finite(validation_loss) &&
+            debug_exploded(validation_loss,
+                           debug_validation_loss,
+                           runtime_options.debug.loss_explosion_threshold,
+                           runtime_options.debug.loss_explosion_factor)) {
+            loss_explosion = true;
+            loss_explosion_message =
+                debug_explosion_message("validation loss",
+                                        validation_loss,
+                                        debug_validation_loss,
+                                        runtime_options.debug.loss_explosion_threshold,
+                                        runtime_options.debug.loss_explosion_factor,
+                                        epoch);
+        }
+        if (!loss_explosion && runtime_options.debug.enabled && has_test_loss && is_finite(test_loss) &&
+            debug_exploded(test_loss,
+                           debug_test_loss,
+                           runtime_options.debug.loss_explosion_threshold,
+                           runtime_options.debug.loss_explosion_factor)) {
+            loss_explosion = true;
+            loss_explosion_message =
+                debug_explosion_message("test loss",
+                                        test_loss,
+                                        debug_test_loss,
+                                        runtime_options.debug.loss_explosion_threshold,
+                                        runtime_options.debug.loss_explosion_factor,
+                                        epoch);
+        }
+        update_debug_tracker_if_finite(debug_training_loss, training_loss);
+        if (has_validation_loss) {
+            update_debug_tracker_if_finite(debug_validation_loss, validation_loss);
+        }
+        if (has_test_loss) {
+            update_debug_tracker_if_finite(debug_test_loss, test_loss);
+        }
         const bool non_finite_loss = !is_finite(training_loss) ||
                                      (has_validation_loss && !is_finite(validation_loss)) ||
                                      (has_test_loss && !is_finite(test_loss));
         const bool non_finite_weights = non_finite_parameters > 0;
-        const bool finite_epoch = !non_finite_gradient && !non_finite_loss && !non_finite_weights;
+        const bool finite_epoch = !non_finite_gradient &&
+                                  !non_finite_loss &&
+                                  !non_finite_weights &&
+                                  !gradient_explosion &&
+                                  !loss_explosion;
         const Scalar monitored_metric = select_monitored_metric(resolved_monitor,
                                                                 training_loss,
                                                                 has_validation_loss,
@@ -5586,17 +7198,39 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
 
         if (non_finite_gradient) {
             history.stop_reason = TrainingStopReason::non_finite_gradient;
-            history.stop_message = "stopped because gradient norm became non-finite";
-            break;
-        }
-        if (non_finite_loss) {
-            history.stop_reason = TrainingStopReason::non_finite_loss;
-            history.stop_message = "stopped because loss became non-finite";
+            history.stop_message = non_finite_gradient_message.empty()
+                                       ? "stopped because gradient norm became non-finite"
+                                       : non_finite_gradient_message;
             break;
         }
         if (non_finite_weights) {
             history.stop_reason = TrainingStopReason::non_finite_weights;
-            history.stop_message = "stopped because model parameters became non-finite";
+            history.stop_message = "stopped because model parameters became non-finite at epoch " +
+                                   std::to_string(epoch) + ": " +
+                                   impl_->first_non_finite_parameter_location();
+            break;
+        }
+        if (non_finite_loss) {
+            history.stop_reason = TrainingStopReason::non_finite_loss;
+            history.stop_message = "stopped because loss became non-finite at epoch " +
+                                   std::to_string(epoch) +
+                                   " training_loss=" + scalar_debug_string(training_loss);
+            if (has_validation_loss) {
+                history.stop_message += " validation_loss=" + scalar_debug_string(validation_loss);
+            }
+            if (has_test_loss) {
+                history.stop_message += " test_loss=" + scalar_debug_string(test_loss);
+            }
+            break;
+        }
+        if (gradient_explosion) {
+            history.stop_reason = TrainingStopReason::gradient_explosion;
+            history.stop_message = gradient_explosion_message;
+            break;
+        }
+        if (loss_explosion) {
+            history.stop_reason = TrainingStopReason::loss_explosion;
+            history.stop_message = loss_explosion_message;
             break;
         }
         if (options.early_stopping_patience > 0 && stale_epochs >= options.early_stopping_patience) {
@@ -5610,7 +7244,7 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
         impl_->set_parameters(best_parameters);
     }
 
-    return history;
+    return finish_history();
 }
 
 TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOptions& options) {
@@ -5619,6 +7253,8 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
     TrainingOptions runtime_options = options;
     runtime_options.learning_rate_schedule =
         resolve_learning_rate_schedule(options.learning_rate_schedule, impl_->optimizer.learning_rate);
+    OptimizerConfig run_optimizer = impl_->optimizer;
+    run_optimizer.learning_rate = runtime_options.learning_rate_schedule.base_learning_rate;
     impl_->last_training_options = runtime_options;
     impl_->has_last_training_options = true;
 
@@ -5642,6 +7278,11 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
     history.validation_loss.reserve(options.epochs);
     history.test_loss.reserve(options.epochs);
     history.epochs.reserve(options.epochs);
+    history.run_config = impl_->make_training_run_config(run_optimizer,
+                                                         runtime_options,
+                                                         split,
+                                                         dataset.sample_count(),
+                                                         true);
     history.stop_reason = TrainingStopReason::completed_epochs;
     history.stop_message = "completed requested epochs";
     const TrainingMonitor resolved_monitor = resolve_training_monitor(options.early_stopping_monitor,
@@ -5655,6 +7296,10 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
             : resolved_monitor;
     history.monitor = resolved_monitor;
     history.monitor_mode = options.early_stopping_mode;
+    auto finish_history = [&]() -> TrainingHistory {
+        refresh_training_run_result(history, impl_->completed_epochs);
+        return history;
+    };
 
     const bool resume_training = impl_->has_resume_epoch;
     const std::size_t first_epoch = resume_training ? std::min(impl_->resume_epoch, options.epochs) : 0;
@@ -5662,7 +7307,7 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
     impl_->completed_epochs = first_epoch;
     if (first_epoch >= options.epochs) {
         history.stop_message = "checkpoint already reached requested epochs";
-        return history;
+        return finish_history();
     }
 
     Scalar best_metric = initial_best_metric(options.early_stopping_mode);
@@ -5690,13 +7335,29 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
     Vector raw_target(output_size());
     Vector normalized_input(input_size());
     Vector normalized_target(output_size());
+    TrainingDebugScalarTracker debug_training_loss;
+    TrainingDebugScalarTracker debug_validation_loss;
+    TrainingDebugScalarTracker debug_test_loss;
+    TrainingDebugScalarTracker debug_gradient_norm;
 
     auto stream_loss_for_partition = [&](unsigned char requested_partition) {
         dataset.reset();
         Scalar total = Scalar{0};
         std::size_t count = 0;
         for (std::size_t index = 0; index < dataset.sample_count(); ++index) {
-            impl_->read_streaming_sample(dataset, raw_input, raw_target, normalized_input, normalized_target);
+            TrainingDebugContext context;
+            context.phase = requested_partition == 0 ? "streaming training loss"
+                          : requested_partition == 1 ? "streaming validation loss"
+                                                     : "streaming test loss";
+            context.sample_index = index;
+            context.has_sample_index = true;
+            impl_->read_streaming_sample(dataset,
+                                         raw_input,
+                                         raw_target,
+                                         normalized_input,
+                                         normalized_target,
+                                         &runtime_options.debug,
+                                         context);
             if (partition[index] == requested_partition) {
                 total += impl_->sample_loss(impl_->forward(normalized_input), normalized_target);
                 ++count;
@@ -5721,6 +7382,9 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
         Scalar epoch_gradient_norm = Scalar{0};
         GradientClippingDiagnostics epoch_clipping;
         bool non_finite_gradient = false;
+        bool gradient_explosion = false;
+        std::string non_finite_gradient_message;
+        std::string gradient_explosion_message;
 
         std::mt19937_64 epoch_rng(non_zero_seed(options.seed, impl_->seed) + epoch);
         std::vector<BufferedSample> shuffle_buffer;
@@ -5738,7 +7402,32 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
             if (!is_finite(gradient_result.gradient_norm)) {
                 epoch_gradient_norm = gradient_result.gradient_norm;
                 non_finite_gradient = true;
+                non_finite_gradient_message =
+                    "stopped because gradient norm became non-finite at epoch " +
+                    std::to_string(epoch) + ": norm=" + scalar_debug_string(gradient_result.gradient_norm);
+                if (!gradient_result.non_finite_location.empty()) {
+                    non_finite_gradient_message += " first_non_finite=" + gradient_result.non_finite_location;
+                }
             } else {
+                if (runtime_options.debug.enabled &&
+                    debug_exploded(gradient_result.gradient_norm,
+                                   debug_gradient_norm,
+                                   runtime_options.debug.gradient_norm_explosion_threshold,
+                                   runtime_options.debug.gradient_norm_explosion_factor)) {
+                    epoch_gradient_norm = gradient_result.gradient_norm;
+                    gradient_explosion = true;
+                    gradient_explosion_message =
+                        debug_explosion_message("gradient norm",
+                                                gradient_result.gradient_norm,
+                                                debug_gradient_norm,
+                                                runtime_options.debug.gradient_norm_explosion_threshold,
+                                                runtime_options.debug.gradient_norm_explosion_factor,
+                                                epoch,
+                                                "streaming_batch=true");
+                    batch_count = 0;
+                    return;
+                }
+                update_debug_tracker_if_finite(debug_gradient_norm, gradient_result.gradient_norm);
                 merge_gradient_clipping(epoch_clipping, gradient_result.clipping);
                 epoch_gradient_norm = std::max(epoch_gradient_norm, gradient_result.gradient_norm);
             }
@@ -5746,7 +7435,7 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
         };
 
         auto train_normalized_sample = [&](const Vector& input_sample, const Vector& target_sample) {
-            if (non_finite_gradient) {
+            if (non_finite_gradient || gradient_explosion) {
                 return;
             }
             impl_->accumulate_gradients(input_sample.data(),
@@ -5761,7 +7450,7 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
         };
 
         auto submit_training_sample = [&](const Vector& input_sample, const Vector& target_sample) {
-            if (non_finite_gradient) {
+            if (non_finite_gradient || gradient_explosion) {
                 return;
             }
             if (!use_shuffle_buffer) {
@@ -5777,7 +7466,7 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
             std::uniform_int_distribution<std::size_t> distribution(0, shuffle_buffer.size() - 1);
             const std::size_t selected = distribution(epoch_rng);
             train_normalized_sample(shuffle_buffer[selected].input, shuffle_buffer[selected].target);
-            if (non_finite_gradient) {
+            if (non_finite_gradient || gradient_explosion) {
                 return;
             }
             shuffle_buffer[selected].input = input_sample;
@@ -5786,58 +7475,162 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
 
         dataset.reset();
         for (std::size_t index = 0; index < dataset.sample_count(); ++index) {
-            impl_->read_streaming_sample(dataset, raw_input, raw_target, normalized_input, normalized_target);
+            TrainingDebugContext context;
+            context.phase = "streaming training";
+            context.epoch = epoch;
+            context.has_epoch = true;
+            context.sample_index = index;
+            context.has_sample_index = true;
+            try {
+                impl_->read_streaming_sample(dataset,
+                                             raw_input,
+                                             raw_target,
+                                             normalized_input,
+                                             normalized_target,
+                                             &runtime_options.debug,
+                                             context);
+            } catch (const TrainingDebugFailure& failure) {
+                history.stop_reason = failure.reason;
+                history.stop_message = failure.what();
+                if (options.restore_best_weights && !best_parameters.empty()) {
+                    impl_->set_parameters(best_parameters);
+                }
+                return finish_history();
+            }
             if (partition[index] == 0) {
                 submit_training_sample(normalized_input, normalized_target);
-                if (non_finite_gradient) {
+                if (non_finite_gradient || gradient_explosion) {
                     break;
                 }
             }
         }
-        if (!non_finite_gradient) {
+        if (!non_finite_gradient && !gradient_explosion) {
             require(!dataset.next(raw_input.data(), raw_input.size(), raw_target.data(), raw_target.size()),
                     "streaming dataset produced more samples than sample_count");
         }
 
-        if (!non_finite_gradient && use_shuffle_buffer) {
+        if (!non_finite_gradient && !gradient_explosion && use_shuffle_buffer) {
             std::shuffle(shuffle_buffer.begin(), shuffle_buffer.end(), epoch_rng);
             for (const BufferedSample& sample : shuffle_buffer) {
                 train_normalized_sample(sample.input, sample.target);
-                if (non_finite_gradient) {
+                if (non_finite_gradient || gradient_explosion) {
                     break;
                 }
             }
         }
-        if (!non_finite_gradient && batch_count > 0) {
+        if (!non_finite_gradient && !gradient_explosion && batch_count > 0) {
             apply_pending_batch();
         }
         finalize_gradient_clipping(epoch_clipping);
 
-        const Scalar training_loss = stream_loss_for_partition(0);
+        Scalar training_loss = Scalar{0};
+        try {
+            training_loss = stream_loss_for_partition(0);
+        } catch (const TrainingDebugFailure& failure) {
+            history.stop_reason = failure.reason;
+            history.stop_message = failure.what();
+            if (options.restore_best_weights && !best_parameters.empty()) {
+                impl_->set_parameters(best_parameters);
+            }
+            return finish_history();
+        }
         history.training_loss.push_back(training_loss);
 
         bool has_validation_loss = false;
         Scalar validation_loss = Scalar{0};
         if (!split.validation_indices.empty()) {
-            validation_loss = stream_loss_for_partition(1);
+            try {
+                validation_loss = stream_loss_for_partition(1);
+            } catch (const TrainingDebugFailure& failure) {
+                history.stop_reason = failure.reason;
+                history.stop_message = failure.what();
+                if (options.restore_best_weights && !best_parameters.empty()) {
+                    impl_->set_parameters(best_parameters);
+                }
+                return finish_history();
+            }
             history.validation_loss.push_back(validation_loss);
             has_validation_loss = true;
         }
         bool has_test_loss = false;
         Scalar test_loss = Scalar{0};
         if (!split.test_indices.empty()) {
-            test_loss = stream_loss_for_partition(2);
+            try {
+                test_loss = stream_loss_for_partition(2);
+            } catch (const TrainingDebugFailure& failure) {
+                history.stop_reason = failure.reason;
+                history.stop_message = failure.what();
+                if (options.restore_best_weights && !best_parameters.empty()) {
+                    impl_->set_parameters(best_parameters);
+                }
+                return finish_history();
+            }
             history.test_loss.push_back(test_loss);
             has_test_loss = true;
         }
 
         const WeightStatistics weight_stats = impl_->weight_statistics();
         const std::size_t non_finite_parameters = impl_->non_finite_parameter_count();
+        bool loss_explosion = false;
+        std::string loss_explosion_message;
+        if (runtime_options.debug.enabled && is_finite(training_loss) &&
+            debug_exploded(training_loss,
+                           debug_training_loss,
+                           runtime_options.debug.loss_explosion_threshold,
+                           runtime_options.debug.loss_explosion_factor)) {
+            loss_explosion = true;
+            loss_explosion_message =
+                debug_explosion_message("training loss",
+                                        training_loss,
+                                        debug_training_loss,
+                                        runtime_options.debug.loss_explosion_threshold,
+                                        runtime_options.debug.loss_explosion_factor,
+                                        epoch);
+        }
+        if (!loss_explosion && runtime_options.debug.enabled && has_validation_loss && is_finite(validation_loss) &&
+            debug_exploded(validation_loss,
+                           debug_validation_loss,
+                           runtime_options.debug.loss_explosion_threshold,
+                           runtime_options.debug.loss_explosion_factor)) {
+            loss_explosion = true;
+            loss_explosion_message =
+                debug_explosion_message("validation loss",
+                                        validation_loss,
+                                        debug_validation_loss,
+                                        runtime_options.debug.loss_explosion_threshold,
+                                        runtime_options.debug.loss_explosion_factor,
+                                        epoch);
+        }
+        if (!loss_explosion && runtime_options.debug.enabled && has_test_loss && is_finite(test_loss) &&
+            debug_exploded(test_loss,
+                           debug_test_loss,
+                           runtime_options.debug.loss_explosion_threshold,
+                           runtime_options.debug.loss_explosion_factor)) {
+            loss_explosion = true;
+            loss_explosion_message =
+                debug_explosion_message("test loss",
+                                        test_loss,
+                                        debug_test_loss,
+                                        runtime_options.debug.loss_explosion_threshold,
+                                        runtime_options.debug.loss_explosion_factor,
+                                        epoch);
+        }
+        update_debug_tracker_if_finite(debug_training_loss, training_loss);
+        if (has_validation_loss) {
+            update_debug_tracker_if_finite(debug_validation_loss, validation_loss);
+        }
+        if (has_test_loss) {
+            update_debug_tracker_if_finite(debug_test_loss, test_loss);
+        }
         const bool non_finite_loss = !is_finite(training_loss) ||
                                      (has_validation_loss && !is_finite(validation_loss)) ||
                                      (has_test_loss && !is_finite(test_loss));
         const bool non_finite_weights = non_finite_parameters > 0;
-        const bool finite_epoch = !non_finite_gradient && !non_finite_loss && !non_finite_weights;
+        const bool finite_epoch = !non_finite_gradient &&
+                                  !non_finite_loss &&
+                                  !non_finite_weights &&
+                                  !gradient_explosion &&
+                                  !loss_explosion;
         const Scalar monitored_metric = select_monitored_metric(resolved_monitor,
                                                                 training_loss,
                                                                 has_validation_loss,
@@ -5937,17 +7730,39 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
 
         if (non_finite_gradient) {
             history.stop_reason = TrainingStopReason::non_finite_gradient;
-            history.stop_message = "stopped because gradient norm became non-finite";
-            break;
-        }
-        if (non_finite_loss) {
-            history.stop_reason = TrainingStopReason::non_finite_loss;
-            history.stop_message = "stopped because loss became non-finite";
+            history.stop_message = non_finite_gradient_message.empty()
+                                       ? "stopped because gradient norm became non-finite"
+                                       : non_finite_gradient_message;
             break;
         }
         if (non_finite_weights) {
             history.stop_reason = TrainingStopReason::non_finite_weights;
-            history.stop_message = "stopped because model parameters became non-finite";
+            history.stop_message = "stopped because model parameters became non-finite at epoch " +
+                                   std::to_string(epoch) + ": " +
+                                   impl_->first_non_finite_parameter_location();
+            break;
+        }
+        if (non_finite_loss) {
+            history.stop_reason = TrainingStopReason::non_finite_loss;
+            history.stop_message = "stopped because loss became non-finite at epoch " +
+                                   std::to_string(epoch) +
+                                   " training_loss=" + scalar_debug_string(training_loss);
+            if (has_validation_loss) {
+                history.stop_message += " validation_loss=" + scalar_debug_string(validation_loss);
+            }
+            if (has_test_loss) {
+                history.stop_message += " test_loss=" + scalar_debug_string(test_loss);
+            }
+            break;
+        }
+        if (gradient_explosion) {
+            history.stop_reason = TrainingStopReason::gradient_explosion;
+            history.stop_message = gradient_explosion_message;
+            break;
+        }
+        if (loss_explosion) {
+            history.stop_reason = TrainingStopReason::loss_explosion;
+            history.stop_message = loss_explosion_message;
             break;
         }
         if (options.early_stopping_patience > 0 && stale_epochs >= options.early_stopping_patience) {
@@ -5961,7 +7776,7 @@ TrainingHistory TrainingModel::fit(StreamingDataset& dataset, const TrainingOpti
         impl_->set_parameters(best_parameters);
     }
 
-    return history;
+    return finish_history();
 }
 
 std::vector<LayerParameters> TrainingModel::parameters() const {
@@ -6130,6 +7945,7 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
     }
 
     const std::size_t input_size = read_value<std::size_t>(input, "input_size");
+    require(input_size > 0, "training input_size must be positive");
     const LossConfig loss = has_loss_config
                                 ? read_loss_config(input)
                                 : LossConfig::from_loss(loss_from_string(read_token(input, "loss")));
@@ -6159,6 +7975,7 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
         normalization = read_normalization(input);
     }
     const std::size_t layer_count = read_value<std::size_t>(input, "layer_count");
+    validate_serialized_layer_count(layer_count, "training model");
 
     Builder builder = TrainingModel::builder()
                           .input_size(input_size)
@@ -6169,6 +7986,7 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
     std::vector<LayerParameters> parameters;
     parameters.reserve(layer_count);
 
+    std::size_t expected_input_size = input_size;
     for (std::size_t i = 0; i < layer_count; ++i) {
         LayerParameters layer;
         layer.input_size = read_value<std::size_t>(input, "layer_input_size");
@@ -6177,22 +7995,35 @@ TrainingModel TrainingModel::load(const std::filesystem::path& path) {
         if (has_optimizer_regularization) {
             layer.dropout_probability = read_value<Scalar>(input, "layer_dropout_probability");
         }
+        require(layer.input_size > 0, "training layer input_size must be positive");
+        require(layer.output_size > 0, "training layer output_size must be positive");
+        require(layer.input_size == expected_input_size, "training file topology is inconsistent");
+        const std::size_t expected_weight_count =
+            checked_product(layer.input_size, layer.output_size, "training weight");
         builder.add_layer(layer.output_size, layer.activation, layer.dropout_probability);
 
         const std::size_t weight_count = read_value<std::size_t>(input, "weight_count");
+        require_exact_serialized_count(weight_count, expected_weight_count, "training weight");
         layer.weights.resize(weight_count);
         for (Scalar& weight : layer.weights) {
             weight = read_value<Scalar>(input, "weight");
         }
 
         const std::size_t bias_count = read_value<std::size_t>(input, "bias_count");
+        require_exact_serialized_count(bias_count, layer.output_size, "training bias");
         layer.biases.resize(bias_count);
         for (Scalar& bias : layer.biases) {
             bias = read_value<Scalar>(input, "bias");
         }
+        expected_input_size = layer.output_size;
         parameters.push_back(std::move(layer));
     }
 
+    require_text_stream_consumed(input, "training model");
+    validate_layer_parameters(parameters);
+    validate_loss_config(loss, parameters.back().output_size);
+    validate_normalization_spec(normalization, input_size, parameters.back().output_size);
+    validate_normalization_for_loss(normalization, loss);
     TrainingModel model = builder.build();
     model.set_parameters(parameters);
     return model;

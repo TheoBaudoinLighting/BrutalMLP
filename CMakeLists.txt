@@ -24,6 +24,7 @@ target_compile_features(brutal_mlp PUBLIC cxx_std_17)
 
 target_compile_definitions(brutal_mlp
     PUBLIC
+        BRUTAL_MLP_VERSION_STRING="${PROJECT_VERSION}"
         $<$<BOOL:${BRUTAL_MLP_USE_DOUBLE}>:BRUTAL_MLP_USE_DOUBLE=1>
 )
 

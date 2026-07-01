@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -45,6 +46,81 @@ std::filesystem::path temp_test_path(const char* filename) {
     return std::filesystem::temp_directory_path() / unique_name;
 }
 
+void append_u8(std::vector<unsigned char>& bytes, std::uint8_t value) {
+    bytes.push_back(value);
+}
+
+void append_u32(std::vector<unsigned char>& bytes, std::uint32_t value) {
+    for (int shift = 0; shift < 32; shift += 8) {
+        bytes.push_back(static_cast<unsigned char>((value >> shift) & 0xFFu));
+    }
+}
+
+void append_u64(std::vector<unsigned char>& bytes, std::uint64_t value) {
+    for (int shift = 0; shift < 64; shift += 8) {
+        bytes.push_back(static_cast<unsigned char>((value >> shift) & 0xFFu));
+    }
+}
+
+void append_size(std::vector<unsigned char>& bytes, std::size_t value) {
+    append_u64(bytes, static_cast<std::uint64_t>(value));
+}
+
+void append_scalar(std::vector<unsigned char>& bytes, bm::Scalar value) {
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    append_u64(bytes, bits);
+#else
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    append_u32(bytes, bits);
+#endif
+}
+
+void append_string(std::vector<unsigned char>& bytes, const std::string& value) {
+    append_size(bytes, value.size());
+    bytes.insert(bytes.end(), value.begin(), value.end());
+}
+
+std::uint32_t test_crc32(const unsigned char* data, std::size_t size) {
+    std::uint32_t crc = 0xFFFFFFFFu;
+    for (std::size_t i = 0; i < size; ++i) {
+        crc ^= static_cast<std::uint32_t>(data[i]);
+        for (int bit = 0; bit < 8; ++bit) {
+            const std::uint32_t mask = static_cast<std::uint32_t>(-(static_cast<int>(crc & 1u)));
+            crc = (crc >> 1u) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~crc;
+}
+
+std::vector<unsigned char> make_test_binary_envelope(std::uint32_t version,
+                                                     std::uint32_t kind,
+                                                     const std::vector<unsigned char>& payload) {
+    std::vector<unsigned char> bytes;
+    const unsigned char magic[8] = {'B', 'M', 'L', 'P', 'B', 'I', 'N', '\0'};
+    bytes.insert(bytes.end(), magic, magic + 8);
+    append_u32(bytes, version);
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
+    append_u32(bytes, 2);
+#else
+    append_u32(bytes, 1);
+#endif
+    append_u32(bytes, kind);
+    append_size(bytes, payload.size());
+    bytes.insert(bytes.end(), payload.begin(), payload.end());
+    append_u32(bytes, test_crc32(bytes.data(), bytes.size()));
+    return bytes;
+}
+
+void write_binary_bytes(const std::filesystem::path& path, const std::vector<unsigned char>& bytes) {
+    std::ofstream file(path, std::ios::binary);
+    ASSERT_TRUE(file);
+    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    ASSERT_TRUE(file);
+}
+
 void expect_vector_near(const bm::Vector& actual, const bm::Vector& expected, double tolerance) {
     ASSERT_EQ(actual.size(), expected.size());
     for (std::size_t i = 0; i < actual.size(); ++i) {
@@ -57,6 +133,17 @@ void expect_matrix_near(const bm::Matrix& actual, const bm::Matrix& expected, do
     for (std::size_t row = 0; row < actual.size(); ++row) {
         SCOPED_TRACE("row " + std::to_string(row));
         expect_vector_near(actual[row], expected[row], tolerance);
+    }
+}
+
+void expect_dense_matrix_near(const bm::DenseMatrix& actual, const bm::DenseMatrix& expected, double tolerance) {
+    ASSERT_EQ(actual.rows(), expected.rows());
+    ASSERT_EQ(actual.columns(), expected.columns());
+    for (std::size_t row = 0; row < actual.rows(); ++row) {
+        for (std::size_t column = 0; column < actual.columns(); ++column) {
+            EXPECT_NEAR(actual(row, column), expected(row, column), tolerance)
+                << "row " << row << " column " << column;
+        }
     }
 }
 
@@ -202,6 +289,30 @@ void generated_linear_sample(std::size_t index,
     ASSERT_EQ(target_size, 1U);
     input[0] = static_cast<bm::Scalar>(static_cast<double>(index) - 4.0);
     target[0] = bm::Scalar{2} * input[0] + bm::Scalar{1};
+}
+
+void generated_nan_input_sample(std::size_t index,
+                                bm::Scalar* input,
+                                std::size_t input_size,
+                                bm::Scalar* target,
+                                std::size_t target_size,
+                                void*) {
+    generated_linear_sample(index, input, input_size, target, target_size, nullptr);
+    if (index == 2) {
+        input[0] = std::numeric_limits<bm::Scalar>::quiet_NaN();
+    }
+}
+
+void generated_nan_target_sample(std::size_t index,
+                                 bm::Scalar* input,
+                                 std::size_t input_size,
+                                 bm::Scalar* target,
+                                 std::size_t target_size,
+                                 void*) {
+    generated_linear_sample(index, input, input_size, target, target_size, nullptr);
+    if (index == 1) {
+        target[0] = std::numeric_limits<bm::Scalar>::quiet_NaN();
+    }
 }
 
 struct StreamingLinearContext {
@@ -482,6 +593,39 @@ TEST(ApiShape, ModelIsLegacyAliasForTrainingModel) {
     static_assert(noexcept(std::declval<const bm::InferenceModel&>().predict_batch_unchecked_to(
                       nullptr, 0, 0, nullptr, 0, nullptr)),
                   "InferenceModel::predict_batch_unchecked_to must remain noexcept");
+}
+
+TEST(DenseMatrix, StoresRowsInOneContiguousBlockAndRoundTripsMatrix) {
+    bm::DenseMatrix dense(2, 3, bm::Scalar{-1});
+    dense.set_row(0, {bm::Scalar{1}, bm::Scalar{2}, bm::Scalar{3}});
+    dense(1, 0) = bm::Scalar{4};
+    dense(1, 1) = bm::Scalar{5};
+    dense(1, 2) = bm::Scalar{6};
+
+    EXPECT_EQ(dense.rows(), 2U);
+    EXPECT_EQ(dense.columns(), 3U);
+    EXPECT_EQ(dense.scalar_count(), 6U);
+    EXPECT_EQ(dense.values(), (bm::Vector{bm::Scalar{1}, bm::Scalar{2}, bm::Scalar{3},
+                                          bm::Scalar{4}, bm::Scalar{5}, bm::Scalar{6}}));
+    EXPECT_EQ(dense.row_data(1), dense.data() + 3);
+    expect_vector_near(dense.row(1), {bm::Scalar{4}, bm::Scalar{5}, bm::Scalar{6}}, kTightTolerance);
+
+    const bm::Matrix matrix = dense.to_matrix();
+    expect_matrix_near(matrix, {{bm::Scalar{1}, bm::Scalar{2}, bm::Scalar{3}},
+                                {bm::Scalar{4}, bm::Scalar{5}, bm::Scalar{6}}},
+                       kTightTolerance);
+    expect_dense_matrix_near(bm::DenseMatrix::from_matrix(matrix), dense, kTightTolerance);
+}
+
+TEST(DenseMatrix, RejectsInvalidShapeAndAccess) {
+    EXPECT_THROW((void)bm::DenseMatrix(1, 0), std::invalid_argument);
+    EXPECT_THROW((void)bm::DenseMatrix::from_matrix({{bm::Scalar{1}}, {bm::Scalar{1}, bm::Scalar{2}}}),
+                 std::invalid_argument);
+
+    bm::DenseMatrix dense(1, 2);
+    EXPECT_THROW((void)dense.row_data(1), std::invalid_argument);
+    EXPECT_THROW((void)dense(0, 2), std::invalid_argument);
+    EXPECT_THROW(dense.set_row(0, {bm::Scalar{1}}), std::invalid_argument);
 }
 
 TEST(StringConversions, RoundTripSupportedEnums) {
@@ -861,11 +1005,29 @@ TEST(Prediction, BatchPredictionMatchesIndividualPrediction) {
     }
 }
 
+TEST(Prediction, DenseBatchPredictionMatchesMatrixPrediction) {
+    const auto model = make_known_linear_model();
+    const bm::Matrix inputs{{bm::Scalar{3}, bm::Scalar{1}},
+                            {bm::Scalar{0}, bm::Scalar{0}},
+                            {bm::Scalar{-1}, bm::Scalar{2}}};
+    const bm::DenseMatrix dense_inputs = bm::DenseMatrix::from_matrix(inputs);
+
+    const bm::DenseMatrix dense_batch = model.predict_batch(dense_inputs);
+    EXPECT_EQ(dense_batch.rows(), inputs.size());
+    EXPECT_EQ(dense_batch.columns(), 1U);
+    expect_matrix_near(dense_batch.to_matrix(), model.predict_batch(inputs), kTightTolerance);
+
+    const auto compiled = model.compile();
+    const bm::DenseMatrix compiled_batch = compiled.predict_batch(dense_inputs);
+    expect_dense_matrix_near(compiled_batch, dense_batch, kTightTolerance);
+}
+
 TEST(Prediction, RejectsInvalidInputs) {
     const auto model = make_known_linear_model();
     EXPECT_THROW((void)model.predict({1.0}), std::invalid_argument);
     EXPECT_THROW((void)model.predict({1.0, std::numeric_limits<bm::Scalar>::quiet_NaN()}), std::invalid_argument);
     EXPECT_THROW((void)model.predict_batch({{1.0}}), std::invalid_argument);
+    EXPECT_THROW((void)model.predict_batch(bm::DenseMatrix(1, 1)), std::invalid_argument);
 }
 
 TEST(Activations, SigmoidIsStableForLargeMagnitudeInputs) {
@@ -1075,6 +1237,28 @@ TEST(Metrics, RegressionMetricsMatchKnownValues) {
     EXPECT_NEAR(result.metric(bm::Metric::r2_score), 1.0 - 7.0 / 40.75, kTightTolerance);
 }
 
+TEST(Metrics, DenseRegressionMetricsMatchMatrixMetrics) {
+    const bm::Matrix predictions{{bm::Scalar{2}, bm::Scalar{4}}, {bm::Scalar{6}, bm::Scalar{8}}};
+    const bm::Matrix targets{{bm::Scalar{1}, bm::Scalar{5}}, {bm::Scalar{5}, bm::Scalar{10}}};
+
+    const auto matrix_result = bm::evaluate_predictions(predictions, targets);
+    const auto dense_result =
+        bm::evaluate_predictions(bm::DenseMatrix::from_matrix(predictions), bm::DenseMatrix::from_matrix(targets));
+
+    EXPECT_NEAR(dense_result.metric(bm::Metric::mean_squared_error),
+                matrix_result.metric(bm::Metric::mean_squared_error),
+                kTightTolerance);
+    EXPECT_NEAR(dense_result.metric(bm::Metric::mean_absolute_error),
+                matrix_result.metric(bm::Metric::mean_absolute_error),
+                kTightTolerance);
+    EXPECT_NEAR(dense_result.metric(bm::Metric::root_mean_squared_error),
+                matrix_result.metric(bm::Metric::root_mean_squared_error),
+                kTightTolerance);
+    EXPECT_NEAR(dense_result.metric(bm::Metric::r2_score),
+                matrix_result.metric(bm::Metric::r2_score),
+                kTightTolerance);
+}
+
 TEST(Metrics, R2HandlesConstantTargets) {
     EXPECT_NEAR(bm::evaluate_predictions({{bm::Scalar{2}}, {bm::Scalar{2}}},
                                          {{bm::Scalar{2}}, {bm::Scalar{2}}})
@@ -1114,6 +1298,40 @@ TEST(Metrics, BinaryClassificationMetricsAndConfusionMatrixMatchKnownValues) {
     EXPECT_NEAR(result.metric(bm::Metric::precision), 2.0 / 3.0, kTightTolerance);
     EXPECT_NEAR(result.metric(bm::Metric::recall), 2.0 / 3.0, kTightTolerance);
     EXPECT_NEAR(result.metric(bm::Metric::f1_score), 2.0 / 3.0, kTightTolerance);
+}
+
+TEST(Metrics, DenseClassificationMetricsMatchMatrixMetrics) {
+    const bm::Matrix predictions{{bm::Scalar{0.9}},
+                                 {bm::Scalar{0.8}},
+                                 {bm::Scalar{0.4}},
+                                 {bm::Scalar{0.7}},
+                                 {bm::Scalar{0.2}}};
+    const bm::Matrix targets{{bm::Scalar{1}},
+                             {bm::Scalar{0}},
+                             {bm::Scalar{0}},
+                             {bm::Scalar{1}},
+                             {bm::Scalar{1}}};
+    const auto options = bm::EvaluationOptions::binary_classification();
+
+    const auto matrix_result = bm::evaluate_predictions(predictions, targets, options);
+    const auto dense_result = bm::evaluate_predictions(bm::DenseMatrix::from_matrix(predictions),
+                                                       bm::DenseMatrix::from_matrix(targets),
+                                                       options);
+
+    ASSERT_TRUE(dense_result.has_confusion_matrix);
+    EXPECT_EQ(dense_result.confusion_matrix.counts, matrix_result.confusion_matrix.counts);
+    EXPECT_NEAR(dense_result.metric(bm::Metric::accuracy),
+                matrix_result.metric(bm::Metric::accuracy),
+                kTightTolerance);
+    EXPECT_NEAR(dense_result.metric(bm::Metric::precision),
+                matrix_result.metric(bm::Metric::precision),
+                kTightTolerance);
+    EXPECT_NEAR(dense_result.metric(bm::Metric::recall),
+                matrix_result.metric(bm::Metric::recall),
+                kTightTolerance);
+    EXPECT_NEAR(dense_result.metric(bm::Metric::f1_score),
+                matrix_result.metric(bm::Metric::f1_score),
+                kTightTolerance);
 }
 
 TEST(Metrics, MulticlassMacroAndMicroMetricsMatchKnownValues) {
@@ -1285,6 +1503,32 @@ TEST(DatasetPipeline, MiniBatchStoresRowsContiguously) {
     EXPECT_TRUE(batch.inputs.empty());
     EXPECT_TRUE(batch.targets.empty());
     EXPECT_THROW((void)batch.input(0), std::invalid_argument);
+}
+
+TEST(DatasetPipeline, DenseMatrixDatasetFeedsContiguousBatches) {
+    const bm::DenseMatrix inputs = bm::DenseMatrix::from_matrix({{bm::Scalar{0}, bm::Scalar{10}},
+                                                                {bm::Scalar{1}, bm::Scalar{11}},
+                                                                {bm::Scalar{2}, bm::Scalar{12}}});
+    const bm::DenseMatrix targets = bm::DenseMatrix::from_matrix({{bm::Scalar{100}},
+                                                                 {bm::Scalar{101}},
+                                                                 {bm::Scalar{102}}});
+    const bm::DenseMatrixDataset dataset(inputs, targets);
+
+    EXPECT_EQ(dataset.sample_count(), 3U);
+    EXPECT_EQ(dataset.input_size(), 2U);
+    EXPECT_EQ(dataset.output_size(), 1U);
+
+    bm::Vector input(2, bm::Scalar{0});
+    bm::Vector target(1, bm::Scalar{0});
+    dataset.sample(2, input.data(), input.size(), target.data(), target.size());
+    expect_vector_near(input, {bm::Scalar{2}, bm::Scalar{12}}, kTightTolerance);
+    expect_vector_near(target, {bm::Scalar{102}}, kTightTolerance);
+
+    bm::BatchGenerator generator(dataset, 2, false, 0);
+    bm::MiniBatch batch;
+    ASSERT_TRUE(generator.next(batch));
+    EXPECT_EQ(batch.inputs, (bm::Vector{bm::Scalar{0}, bm::Scalar{10}, bm::Scalar{1}, bm::Scalar{11}}));
+    EXPECT_EQ(batch.targets, (bm::Vector{bm::Scalar{100}, bm::Scalar{101}}));
 }
 
 TEST(DatasetPipeline, GeneratedDatasetCanTrainWithoutMatrixStorage) {
@@ -1732,6 +1976,39 @@ TEST(Training, LinearRegressionConvergesWithAdam) {
     EXPECT_NEAR(model.predict({1.5})[0], 2.0, 0.05);
 }
 
+TEST(Training, DenseMatrixRegressionConvergesAndEvaluates) {
+    auto model = bm::Model::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::Loss::mean_squared_error)
+                     .optimizer(bm::OptimizerConfig::adam(bm::Scalar{0.05}))
+                     .seed(111)
+                     .build();
+
+    const bm::DenseMatrix inputs = bm::DenseMatrix::from_matrix({{bm::Scalar{-2}},
+                                                                {bm::Scalar{-1}},
+                                                                {bm::Scalar{0}},
+                                                                {bm::Scalar{1}},
+                                                                {bm::Scalar{2}}});
+    const bm::DenseMatrix targets = bm::DenseMatrix::from_matrix({{bm::Scalar{-5}},
+                                                                 {bm::Scalar{-3}},
+                                                                 {bm::Scalar{-1}},
+                                                                 {bm::Scalar{1}},
+                                                                 {bm::Scalar{3}}});
+    const double before = model.evaluate_loss(inputs, targets);
+
+    auto options = quick_options(500, inputs.rows());
+    options.shuffle = false;
+    const auto history = model.fit(inputs, targets, options);
+    const double after = model.evaluate_loss(inputs, targets);
+
+    ASSERT_FALSE(history.training_loss.empty());
+    EXPECT_LT(after, before * 0.001);
+    const auto metrics = model.evaluate_metrics(inputs, targets);
+    EXPECT_NEAR(metrics.metric(bm::Metric::mean_squared_error), after, 1e-5);
+    EXPECT_NEAR(model.predict_batch(inputs)(3, 0), bm::Scalar{1}, 0.05);
+}
+
 TEST(Training, XorConvergesWithHiddenLayer) {
     auto optimizer = bm::OptimizerConfig::adam(0.08);
     optimizer.gradient_clip_norm = 5.0;
@@ -1895,6 +2172,118 @@ TEST(Training, DiagnosticsReportEpochMetrics) {
         }
     }
     EXPECT_GT(best_checkpoint_count, 0U);
+}
+
+TEST(Training, RunConfigExportsReproducibleTrainingMetadata) {
+    auto optimizer = bm::OptimizerConfig::adamw(bm::Scalar{0.02}, bm::Scalar{0.001});
+    optimizer.gradient_clip_norm = bm::Scalar{3};
+
+    auto normalization = bm::NormalizationSpec::standard_score({bm::Scalar{1}},
+                                                               {bm::Scalar{2}},
+                                                               {bm::Scalar{0}},
+                                                               {bm::Scalar{4}});
+
+    auto model = bm::Model::builder()
+                     .input_size(1)
+                     .add_layer(3, bm::Activation::tanh, bm::Scalar{0.1})
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::huber(bm::Scalar{0.75}))
+                     .optimizer(optimizer)
+                     .normalization(normalization)
+                     .seed(1701)
+                     .build();
+
+    bm::TrainingOptions options;
+    options.epochs = 4;
+    options.batch_size = 2;
+    options.shuffle = true;
+    options.seed = 9001;
+    options.validation_split = bm::Scalar{0.25};
+    options.test_split = bm::Scalar{0.25};
+    options.learning_rate_schedule = bm::LearningRateScheduleConfig::step_decay(2, bm::Scalar{0.5});
+    options.debug.enabled = true;
+
+    const auto history = model.fit({{-3.0}, {-2.0}, {-1.0}, {0.0}, {1.0}, {2.0}, {3.0}, {4.0}},
+                                   {{-5.0}, {-3.0}, {-1.0}, {1.0}, {3.0}, {5.0}, {7.0}, {9.0}},
+                                   options);
+
+    const auto& config = history.run_config;
+    EXPECT_EQ(config.library_name, "brutal_mlp");
+    EXPECT_EQ(config.library_version, bm::version_string());
+    EXPECT_FALSE(config.created_utc.empty());
+    EXPECT_EQ(config.scalar_type, sizeof(bm::Scalar) == sizeof(double) ? "float64" : "float32");
+    EXPECT_EQ(config.model_seed, 1701U);
+    EXPECT_EQ(config.training_seed, 9001U);
+    EXPECT_EQ(config.input_size, 1U);
+    EXPECT_EQ(config.output_size, 1U);
+    ASSERT_EQ(config.architecture.size(), 2U);
+    EXPECT_EQ(config.architecture[0].input_size, 1U);
+    EXPECT_EQ(config.architecture[0].output_size, 3U);
+    EXPECT_EQ(config.architecture[0].activation, bm::Activation::tanh);
+    EXPECT_NEAR(config.architecture[0].dropout_probability, 0.1, kTightTolerance);
+    EXPECT_EQ(config.architecture[1].activation, bm::Activation::linear);
+    EXPECT_EQ(config.optimizer.type, bm::OptimizerType::adamw);
+    EXPECT_NEAR(config.optimizer.learning_rate, 0.02, kTightTolerance);
+    EXPECT_EQ(config.learning_rate_schedule.type, bm::LearningRateSchedule::step_decay);
+    EXPECT_NEAR(config.learning_rate_schedule.base_learning_rate, 0.02, kTightTolerance);
+    EXPECT_EQ(config.loss.type, bm::Loss::huber);
+    EXPECT_NEAR(config.loss.huber_delta, 0.75, kTightTolerance);
+    ASSERT_EQ(config.normalization.input_features.size(), 1U);
+    ASSERT_EQ(config.normalization.output_features.size(), 1U);
+    EXPECT_EQ(config.dataset.sample_count, 8U);
+    EXPECT_EQ(config.dataset.training_sample_count, 4U);
+    EXPECT_EQ(config.dataset.validation_sample_count, 2U);
+    EXPECT_EQ(config.dataset.test_sample_count, 2U);
+    EXPECT_FALSE(config.dataset.streaming);
+    EXPECT_EQ(config.options.epochs, options.epochs);
+    EXPECT_TRUE(config.options.debug.enabled);
+    EXPECT_EQ(config.result.completed_epochs, model.completed_epochs());
+    EXPECT_EQ(config.result.stop_reason, history.stop_reason);
+    EXPECT_EQ(config.result.monitor, history.monitor);
+    EXPECT_EQ(config.result.has_best_score, history.has_best_checkpoint);
+    EXPECT_TRUE(config.result.has_final_training_loss);
+    EXPECT_NEAR(config.result.final_training_loss, history.training_loss.back(), kTightTolerance);
+
+    const std::string json = config.to_json();
+    EXPECT_NE(json.find("\"architecture\""), std::string::npos);
+    EXPECT_NE(json.find("\"optimizer\""), std::string::npos);
+    EXPECT_NE(json.find("\"learning_rate_schedule\""), std::string::npos);
+    EXPECT_NE(json.find("\"normalization\""), std::string::npos);
+    EXPECT_NE(json.find("\"dataset\""), std::string::npos);
+    EXPECT_NE(json.find("\"best_score\""), std::string::npos);
+    EXPECT_NE(json.find("\"library\""), std::string::npos);
+    EXPECT_NE(json.find("\"version\""), std::string::npos);
+    EXPECT_EQ(json.find("nan"), std::string::npos);
+}
+
+TEST(Training, RunConfigMarksStreamingDataset) {
+    StreamingLinearContext context{0, 6};
+    bm::FunctionStreamingDataset dataset(context.count, 1, 1, next_streaming_linear, reset_streaming_linear, &context);
+    auto model = bm::Model::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .optimizer(bm::OptimizerConfig::sgd(bm::Scalar{0.01}))
+                     .seed(1702)
+                     .build();
+
+    bm::TrainingOptions options;
+    options.epochs = 2;
+    options.batch_size = 2;
+    options.shuffle = true;
+    options.seed = 11;
+    options.validation_split = bm::Scalar{0.25};
+    options.streaming_shuffle_buffer_size = 3;
+
+    const auto history = model.fit(dataset, options);
+
+    EXPECT_TRUE(history.run_config.dataset.streaming);
+    EXPECT_EQ(history.run_config.dataset.sample_count, 6U);
+    EXPECT_EQ(history.run_config.dataset.training_sample_count, 5U);
+    EXPECT_EQ(history.run_config.dataset.validation_sample_count, 1U);
+    EXPECT_EQ(history.run_config.dataset.streaming_shuffle_buffer_size, 3U);
+    EXPECT_EQ(history.run_config.training_seed, 11U);
+    EXPECT_EQ(history.run_config.result.completed_epochs, model.completed_epochs());
+    EXPECT_NE(history.run_config.to_json().find("\"streaming\": true"), std::string::npos);
 }
 
 TEST(Training, DiagnosticsReportEarlyStoppingReason) {
@@ -2383,6 +2772,86 @@ TEST(Training, DiagnosticsStopOnNonFiniteParameters) {
     EXPECT_FALSE(history.epochs.back().finite);
     EXPECT_GT(history.epochs.back().non_finite_parameter_count, 0U);
     EXPECT_FALSE(history.epochs.back().weights.finite);
+    EXPECT_NE(history.stop_message.find("layer 0"), std::string::npos);
+}
+
+TEST(Training, DebugModeReportsNaNInputLocation) {
+    bm::GeneratedDataset dataset(4, 1, 1, generated_nan_input_sample);
+    auto model = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .optimizer(bm::OptimizerConfig::sgd(bm::Scalar{0.01}))
+                     .seed(1301)
+                     .build();
+
+    auto options = quick_options(3, 2);
+    options.shuffle = false;
+    options.debug.enabled = true;
+    const auto history = model.fit(dataset, options);
+
+    EXPECT_EQ(history.stop_reason, bm::TrainingStopReason::invalid_training_data);
+    EXPECT_NE(history.stop_message.find("sample 2"), std::string::npos);
+    EXPECT_NE(history.stop_message.find("input[0]"), std::string::npos);
+    EXPECT_NE(history.stop_message.find("NaN"), std::string::npos);
+}
+
+TEST(Training, DebugModeReportsNaNTargetLocation) {
+    bm::GeneratedDataset dataset(4, 1, 1, generated_nan_target_sample);
+    auto model = bm::TrainingModel::builder()
+                     .input_size(1)
+                     .add_layer(1, bm::Activation::linear)
+                     .optimizer(bm::OptimizerConfig::sgd(bm::Scalar{0.01}))
+                     .seed(1302)
+                     .build();
+
+    auto options = quick_options(3, 2);
+    options.shuffle = false;
+    options.debug.enabled = true;
+    const auto history = model.fit(dataset, options);
+
+    EXPECT_EQ(history.stop_reason, bm::TrainingStopReason::invalid_training_data);
+    EXPECT_NE(history.stop_message.find("sample 1"), std::string::npos);
+    EXPECT_NE(history.stop_message.find("target[0]"), std::string::npos);
+    EXPECT_NE(history.stop_message.find("NaN"), std::string::npos);
+}
+
+TEST(Training, DebugModeStopsOnGradientNormExplosion) {
+    auto model = make_known_linear_model();
+    auto options = one_step_options(1);
+    options.epochs = 3;
+    options.shuffle = false;
+    options.restore_best_weights = false;
+    options.debug.enabled = true;
+    options.debug.gradient_norm_explosion_threshold = bm::Scalar{0.001};
+    options.debug.loss_explosion_threshold = bm::Scalar{1e20};
+
+    const auto history = model.fit({{bm::Scalar{3}, bm::Scalar{1}}},
+                                   {{bm::Scalar{100}}},
+                                   options);
+
+    EXPECT_EQ(history.stop_reason, bm::TrainingStopReason::gradient_explosion);
+    EXPECT_NE(history.stop_message.find("gradient norm explosion"), std::string::npos);
+    EXPECT_NE(history.stop_message.find("epoch 0"), std::string::npos);
+    EXPECT_NE(history.stop_message.find("batch_begin=0"), std::string::npos);
+}
+
+TEST(Training, DebugModeStopsOnLossExplosion) {
+    auto model = make_known_linear_model();
+    auto options = one_step_options(1);
+    options.epochs = 3;
+    options.shuffle = false;
+    options.restore_best_weights = false;
+    options.debug.enabled = true;
+    options.debug.loss_explosion_threshold = bm::Scalar{0.001};
+    options.debug.gradient_norm_explosion_threshold = bm::Scalar{1e20};
+
+    const auto history = model.fit({{bm::Scalar{3}, bm::Scalar{1}}},
+                                   {{bm::Scalar{100}}},
+                                   options);
+
+    EXPECT_EQ(history.stop_reason, bm::TrainingStopReason::loss_explosion);
+    EXPECT_NE(history.stop_message.find("training loss explosion"), std::string::npos);
+    EXPECT_NE(history.stop_message.find("epoch 0"), std::string::npos);
 }
 
 TEST(Training, RejectsInvalidTrainingDataAndOptions) {
@@ -3106,6 +3575,11 @@ TEST(Serialization, BinaryTrainingRoundTripsAndReportsSelfDescribingInfo) {
     training_options.parallelism.execution = bm::ParallelExecution::worker_threads;
     training_options.parallelism.thread_count = 2;
     training_options.parallelism.minimum_parallel_samples = 8;
+    training_options.debug.enabled = true;
+    training_options.debug.loss_explosion_factor = bm::Scalar{12};
+    training_options.debug.loss_explosion_threshold = bm::Scalar{1234};
+    training_options.debug.gradient_norm_explosion_factor = bm::Scalar{34};
+    training_options.debug.gradient_norm_explosion_threshold = bm::Scalar{5678};
     training_options.restore_best_weights = false;
     model.fit({{bm::Scalar{1}, bm::Scalar{2}},
                {bm::Scalar{3}, bm::Scalar{6}},
@@ -3122,7 +3596,7 @@ TEST(Serialization, BinaryTrainingRoundTripsAndReportsSelfDescribingInfo) {
     model.save_binary(path, metadata);
 
     const auto info = bm::inspect_binary_model(path);
-    EXPECT_EQ(info.version, 6U);
+    EXPECT_EQ(info.version, 7U);
     EXPECT_EQ(info.scalar_type,
               sizeof(bm::Scalar) == sizeof(float) ? bm::BinaryScalarType::float32
                                                    : bm::BinaryScalarType::float64);
@@ -3149,6 +3623,11 @@ TEST(Serialization, BinaryTrainingRoundTripsAndReportsSelfDescribingInfo) {
     EXPECT_EQ(info.training_options.parallelism.execution, bm::ParallelExecution::worker_threads);
     EXPECT_EQ(info.training_options.parallelism.thread_count, 2U);
     EXPECT_EQ(info.training_options.parallelism.minimum_parallel_samples, 8U);
+    EXPECT_TRUE(info.training_options.debug.enabled);
+    EXPECT_NEAR(info.training_options.debug.loss_explosion_factor, 12.0, kTightTolerance);
+    EXPECT_NEAR(info.training_options.debug.loss_explosion_threshold, 1234.0, kTightTolerance);
+    EXPECT_NEAR(info.training_options.debug.gradient_norm_explosion_factor, 34.0, kTightTolerance);
+    EXPECT_NEAR(info.training_options.debug.gradient_norm_explosion_threshold, 5678.0, kTightTolerance);
     EXPECT_EQ(info.metadata.created_unix_time, metadata.created_unix_time);
     EXPECT_EQ(info.metadata.description, metadata.description);
     ASSERT_EQ(info.metadata.entries.size(), 2U);
@@ -3230,6 +3709,45 @@ TEST(Serialization, BinaryChecksumRejectsCorruption) {
 
     EXPECT_THROW((void)bm::inspect_binary_model(path), std::runtime_error);
     EXPECT_THROW((void)bm::TrainingModel::load_binary(path), std::runtime_error);
+    std::filesystem::remove(path);
+}
+
+TEST(Serialization, BinaryLoaderRejectsSupportedChecksumWithInvalidShape) {
+    const auto path = temp_test_path("brutal_mlp_invalid_shape.bmlp");
+
+    std::vector<unsigned char> payload;
+    append_u64(payload, 123456789); // metadata created time
+    append_string(payload, "");
+    append_size(payload, 0); // metadata entries
+    append_size(payload, 2); // input size
+    append_size(payload, 1); // declared output size
+    append_u64(payload, 0);  // seed
+    append_u8(payload, 0);   // no training options
+    append_size(payload, 0); // input normalization
+    append_size(payload, 0); // output normalization
+    append_size(payload, 1); // layer count
+    append_size(payload, 2); // layer input size
+    append_size(payload, 1); // layer output size
+    append_u32(payload, 1);  // linear activation
+    append_scalar(payload, bm::Scalar{0});
+    append_size(payload, 1); // invalid weights count; expected 2
+    append_scalar(payload, bm::Scalar{1});
+    append_size(payload, 1);
+    append_scalar(payload, bm::Scalar{0});
+
+    write_binary_bytes(path, make_test_binary_envelope(7, 2, payload));
+    EXPECT_THROW((void)bm::inspect_binary_model(path), std::exception);
+    EXPECT_THROW((void)bm::InferenceModel::load_binary(path), std::exception);
+    std::filesystem::remove(path);
+}
+
+TEST(Serialization, BinaryLoaderRejectsUnsupportedVersion) {
+    const auto path = temp_test_path("brutal_mlp_bad_version.bmlp");
+    const std::vector<unsigned char> payload;
+    write_binary_bytes(path, make_test_binary_envelope(999, 2, payload));
+
+    EXPECT_THROW((void)bm::inspect_binary_model(path), std::runtime_error);
+    EXPECT_THROW((void)bm::InferenceModel::load_binary(path), std::runtime_error);
     std::filesystem::remove(path);
 }
 
@@ -3414,6 +3932,47 @@ TEST(Serialization, LoadRejectsMissingOrInvalidFiles) {
         file << "NOPE\n";
     }
     EXPECT_THROW((void)bm::Model::load(path), std::runtime_error);
+    std::filesystem::remove(path);
+}
+
+TEST(Serialization, TextInferenceLoaderRejectsNaNAndInvalidCounts) {
+    const auto nan_path = temp_test_path("brutal_mlp_nan_inference.model");
+    {
+        std::ofstream file(nan_path);
+        file << "BRUTAL_MLP_INFERENCE_V1\n"
+             << "2\n"
+             << "1\n"
+             << "2 1 linear\n"
+             << "2 1 nan\n"
+             << "1 0\n";
+    }
+    EXPECT_THROW((void)bm::InferenceModel::load(nan_path), std::exception);
+    std::filesystem::remove(nan_path);
+
+    const auto count_path = temp_test_path("brutal_mlp_bad_count_inference.model");
+    {
+        std::ofstream file(count_path);
+        file << "BRUTAL_MLP_INFERENCE_V1\n"
+             << "2\n"
+             << "1\n"
+             << "2 1 linear\n"
+             << "1 1\n"
+             << "1 0\n";
+    }
+    EXPECT_THROW((void)bm::InferenceModel::load(count_path), std::exception);
+    std::filesystem::remove(count_path);
+}
+
+TEST(Serialization, TextTrainingLoaderRejectsTrailingData) {
+    const auto path = temp_test_path("brutal_mlp_trailing_training.model");
+    auto model = make_known_linear_model();
+    model.save(path);
+    {
+        std::ofstream file(path, std::ios::app);
+        file << "trailing-token\n";
+    }
+
+    EXPECT_THROW((void)bm::TrainingModel::load(path), std::runtime_error);
     std::filesystem::remove(path);
 }
 

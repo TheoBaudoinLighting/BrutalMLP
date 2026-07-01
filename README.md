@@ -22,6 +22,8 @@ When using the CMake target `brutal_mlp::brutal_mlp`, the precision macro is pro
 - `brutal_mlp::ParallelOptions`: explicit CPU parallelism policy for coarse batch inference and future training phases. The default is serial execution.
 - `brutal_mlp::Model`: legacy alias for `TrainingModel`.
 
+Public function contracts are documented in [docs/API_CONTRACTS.md](docs/API_CONTRACTS.md): expected sizes, accepted values, errors, approximate cost, thread-safety, ownership, and API stability.
+
 ## Normalization
 
 Input and output normalization are part of the model, not an external convention. The same normalization spec is saved with training and inference files, and `TrainingModel::compile()` carries it into the frozen runtime model. `TrainingModel::to_inference_model()` remains available for existing integrations.
@@ -246,7 +248,11 @@ for (const auto& epoch : history.epochs) {
 if (history.stop_reason != brutal_mlp::TrainingStopReason::completed_epochs) {
     auto reason = brutal_mlp::to_string(history.stop_reason);
 }
+
+auto run_config_json = history.run_config.to_json();
 ```
+
+`history.run_config` captures the reproducibility context for the run: library version, scalar type, UTC date, architecture, optimizer, learning rate schedule, seed, loss, normalization, dataset size, train/validation/test split, requested epochs, stop reason, final losses, and best monitored score when one exists.
 
 Early stopping can monitor training, validation, or test loss. The default `automatic` monitor uses validation loss when a validation split exists, otherwise training loss.
 
@@ -284,16 +290,50 @@ schedule.minimum_learning_rate = 1e-6f;
 options.learning_rate_schedule = schedule;
 ```
 
-Each epoch records training loss, optional validation/test loss, the monitored metric, learning rate, gradient norm, clipping diagnostics, weight min/max/mean, non-finite parameter counts, elapsed time, cooldown/stale counters, and whether it produced the best checkpoint. Training stops with a structured reason for early stopping, non-finite loss, non-finite gradients, or non-finite weights.
+Enable debug checks when a training run must fail loudly with location-aware diagnostics:
+
+```cpp
+brutal_mlp::TrainingOptions options;
+options.debug.enabled = true;
+options.debug.loss_explosion_threshold = 1e8f;
+options.debug.loss_explosion_factor = 100.0f;
+options.debug.gradient_norm_explosion_threshold = 1e6f;
+options.debug.gradient_norm_explosion_factor = 100.0f;
+```
+
+Debug mode reports NaN/Inf in inputs, targets, weights, and gradients with the epoch, sample, feature, layer, and parameter offset when available. It can also stop on loss or gradient norm explosions using absolute thresholds or a relative jump from the previous finite value.
+
+Each epoch records training loss, optional validation/test loss, the monitored metric, learning rate, gradient norm, clipping diagnostics, weight min/max/mean, non-finite parameter counts, elapsed time, cooldown/stale counters, and whether it produced the best checkpoint. Training stops with a structured reason for early stopping, invalid training data, non-finite loss, non-finite gradients, non-finite weights, loss explosion, or gradient explosion.
 
 ## Datasets
 
-`fit(inputs, targets)` remains available for small in-memory datasets. For larger or generated data, use the dataset pipeline.
+`fit(inputs, targets)` remains available for small in-memory datasets. `Matrix` is source-friendly, but it stores one vector per row. For larger in-memory batches, prefer `DenseMatrix`: it stores `rows * columns` scalars in one row-major block and can be passed directly to `fit`, `predict_batch`, and `evaluate_metrics`.
+
+```cpp
+brutal_mlp::DenseMatrix inputs(4, 2);
+inputs.set_row(0, {0.0f, 0.0f});
+inputs.set_row(1, {0.0f, 1.0f});
+inputs.set_row(2, {1.0f, 0.0f});
+inputs.set_row(3, {1.0f, 1.0f});
+
+brutal_mlp::DenseMatrix targets(4, 1);
+targets.set_row(0, {0.0f});
+targets.set_row(1, {1.0f});
+targets.set_row(2, {1.0f});
+targets.set_row(3, {0.0f});
+
+auto history = training.fit(inputs, targets, options);
+auto outputs = training.compile().predict_batch(inputs);
+```
+
+`DenseMatrix::data()` exposes the contiguous buffer for interop with flat APIs. `DenseMatrix::from_matrix(...)` and `to_matrix()` are available at API boundaries when gradual migration is useful.
+
+For larger or generated data, use the dataset pipeline.
 
 Random-access datasets support deterministic train/validation/test splits and shuffled mini-batches without copying the full dataset:
 
 ```cpp
-brutal_mlp::MatrixDataset dataset(inputs, targets);
+brutal_mlp::DenseMatrixDataset dataset(inputs, targets);
 
 brutal_mlp::TrainingOptions options;
 options.epochs = 500;
@@ -305,6 +345,8 @@ options.seed = 42;
 
 auto history = training.fit(dataset, options);
 ```
+
+`MatrixDataset` and `DenseMatrixDataset` are non-owning views over caller-owned data. Keep the source matrices alive for the full training call.
 
 Split utilities are exposed directly:
 
@@ -516,7 +558,9 @@ auto parallel_status = compiled.predict_batch_to(inputs.data(),
                                                  parallel);
 ```
 
-`CompiledModel::predict_to(...)`, the serial `predict_batch_to(...)`, `predict_unchecked_to(...)`, and `predict_batch_unchecked_to(...)` do not allocate, do not throw, and do not mutate the model. The parallel batch overload is also `noexcept` and caller-scratch-based, but it creates worker threads internally; for renderer hot loops, prefer one worker-owned scratch/workspace per application thread and call the serial fast path inside that worker. The convenience methods `predict(...)` and `predict_batch(...)` return `Vector`/`Matrix` and are intentionally outside the hot path.
+`CompiledModel::predict_to(...)`, the serial `predict_batch_to(...)`, `predict_unchecked_to(...)`, and `predict_batch_unchecked_to(...)` do not allocate, do not throw, and do not mutate the model. The parallel batch overload is also `noexcept` and caller-scratch-based, but it creates worker threads internally; for renderer hot loops, prefer one worker-owned scratch/workspace per application thread and call the serial fast path inside that worker. The convenience methods `predict(...)` and legacy `predict_batch(Matrix)` return `Vector`/`Matrix` and are intentionally outside the hot path.
+
+`predict_batch(DenseMatrix)` is the convenient contiguous batch API. It allocates one output block plus one scratch buffer, so it is much cheaper than the legacy `Matrix` convenience API, but the pointer-based `predict_batch_to(...)` remains the no-allocation renderer path.
 
 `TrainingOptions::parallelism` stores the same policy and is written into binary models and checkpoints. The current optimizer update path remains serial and deterministic; the policy is part of the training config so CPU-parallel batch loading, normalization, or gradient accumulation can be enabled without changing the public configuration surface.
 
@@ -544,14 +588,14 @@ cmake --build build --parallel
 ctest --test-dir build --output-on-failure
 ```
 
-Benchmarks are exposed by the `brutal_mlp_benchmarks` executable when `BRUTAL_MLP_BUILD_BENCHMARKS=ON`. They cover small, medium, and large models across single prediction, flat batch prediction, matrix convenience prediction, worker-thread batch prediction, one training epoch, and text/binary save/load. Useful filters:
+Benchmarks are exposed by the `brutal_mlp_benchmarks` executable when `BRUTAL_MLP_BUILD_BENCHMARKS=ON`. They cover small, medium, and large models across single prediction, flat batch prediction, dense and matrix convenience prediction, worker-thread batch prediction, one training epoch, and text/binary save/load. Useful filters:
 
 ```bash
 # List every benchmark case.
 build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_list_tests
 
 # Compare no-allocation and allocating inference paths.
-build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredict.*(Unchecked|AllocatingMatrix)"
+build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredict.*(Unchecked|AllocatingDense|AllocatingMatrix)"
 
 # Measure training epoch and serialization costs.
 build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="TrainingEpoch|Save|Load"

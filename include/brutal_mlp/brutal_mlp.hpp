@@ -3,11 +3,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <initializer_list>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <vector>
 
+// Public API contracts are documented in docs/API_CONTRACTS.md.
 namespace brutal_mlp {
 
 #if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
@@ -18,6 +20,38 @@ using Scalar = float;
 
 using Vector = std::vector<Scalar>;
 using Matrix = std::vector<Vector>;
+
+class DenseMatrix {
+public:
+    DenseMatrix() = default;
+    explicit DenseMatrix(std::size_t rows, std::size_t columns, Scalar value = Scalar{0});
+
+    [[nodiscard]] static DenseMatrix from_matrix(const Matrix& matrix);
+    [[nodiscard]] Matrix to_matrix() const;
+
+    void resize(std::size_t rows, std::size_t columns, Scalar value = Scalar{0});
+    void clear() noexcept;
+
+    [[nodiscard]] bool empty() const noexcept;
+    [[nodiscard]] std::size_t rows() const noexcept;
+    [[nodiscard]] std::size_t columns() const noexcept;
+    [[nodiscard]] std::size_t size() const noexcept;
+    [[nodiscard]] std::size_t scalar_count() const noexcept;
+    [[nodiscard]] const Vector& values() const noexcept;
+    [[nodiscard]] Scalar* data() noexcept;
+    [[nodiscard]] const Scalar* data() const noexcept;
+    [[nodiscard]] Scalar* row_data(std::size_t row);
+    [[nodiscard]] const Scalar* row_data(std::size_t row) const;
+    [[nodiscard]] Scalar& operator()(std::size_t row, std::size_t column);
+    [[nodiscard]] Scalar operator()(std::size_t row, std::size_t column) const;
+    [[nodiscard]] Vector row(std::size_t row) const;
+    void set_row(std::size_t row, const Vector& values);
+
+private:
+    std::size_t rows_{0};
+    std::size_t columns_{0};
+    Vector values_{};
+};
 
 enum class Activation {
     linear,
@@ -85,9 +119,12 @@ enum class InferenceStatus {
 enum class TrainingStopReason {
     completed_epochs,
     early_stopping,
+    invalid_training_data,
     non_finite_loss,
     non_finite_gradient,
-    non_finite_weights
+    non_finite_weights,
+    loss_explosion,
+    gradient_explosion
 };
 
 enum class TrainingMonitor {
@@ -125,6 +162,7 @@ enum class ParallelExecution {
     worker_threads
 };
 
+[[nodiscard]] std::string_view version_string() noexcept;
 [[nodiscard]] std::string to_string(Activation activation);
 [[nodiscard]] std::string to_string(Loss loss);
 [[nodiscard]] std::string to_string(Metric metric);
@@ -236,6 +274,12 @@ struct EvaluationResult {
 [[nodiscard]] EvaluationResult evaluate_predictions(const Matrix& predictions,
                                                     const Matrix& targets,
                                                     const EvaluationOptions& options = {});
+[[nodiscard]] EvaluationResult evaluate_predictions(std::initializer_list<Vector> predictions,
+                                                    std::initializer_list<Vector> targets,
+                                                    const EvaluationOptions& options = {});
+[[nodiscard]] EvaluationResult evaluate_predictions(const DenseMatrix& predictions,
+                                                    const DenseMatrix& targets,
+                                                    const EvaluationOptions& options = {});
 
 struct OptimizerConfig {
     OptimizerType type{OptimizerType::adam};
@@ -307,6 +351,14 @@ struct ParallelOptions {
     std::size_t minimum_parallel_samples{1};
 };
 
+struct TrainingDebugOptions {
+    bool enabled{false};
+    Scalar loss_explosion_factor{static_cast<Scalar>(1000)};
+    Scalar loss_explosion_threshold{static_cast<Scalar>(1e20)};
+    Scalar gradient_norm_explosion_factor{static_cast<Scalar>(1000)};
+    Scalar gradient_norm_explosion_threshold{static_cast<Scalar>(1e10)};
+};
+
 struct TrainingOptions {
     std::size_t epochs{100};
     std::size_t batch_size{32};
@@ -323,6 +375,7 @@ struct TrainingOptions {
     LearningRateScheduleConfig learning_rate_schedule{};
     Scalar gradient_noise_stddev{static_cast<Scalar>(0)};
     ParallelOptions parallelism{};
+    TrainingDebugOptions debug{};
     bool restore_best_weights{true};
     std::filesystem::path best_checkpoint_path{};
     std::filesystem::path latest_checkpoint_path{};
@@ -383,20 +436,6 @@ struct TrainingEpochDiagnostics {
     bool improved{false};
     std::size_t stale_epochs{0};
     std::size_t cooldown_remaining{0};
-};
-
-struct TrainingHistory {
-    std::vector<Scalar> training_loss;
-    std::vector<Scalar> validation_loss;
-    std::vector<Scalar> test_loss;
-    std::vector<TrainingEpochDiagnostics> epochs;
-    bool has_best_checkpoint{false};
-    std::size_t best_epoch{0};
-    Scalar best_metric{static_cast<Scalar>(0)};
-    TrainingMonitor monitor{TrainingMonitor::automatic};
-    TrainingMonitorMode monitor_mode{TrainingMonitorMode::minimize};
-    TrainingStopReason stop_reason{TrainingStopReason::completed_epochs};
-    std::string stop_message;
 };
 
 enum class BinaryScalarType {
@@ -501,6 +540,24 @@ private:
     const Matrix* targets_{nullptr};
     std::size_t input_size_{0};
     std::size_t output_size_{0};
+};
+
+class DenseMatrixDataset final : public Dataset {
+public:
+    DenseMatrixDataset(const DenseMatrix& inputs, const DenseMatrix& targets);
+
+    [[nodiscard]] std::size_t sample_count() const noexcept override;
+    [[nodiscard]] std::size_t input_size() const noexcept override;
+    [[nodiscard]] std::size_t output_size() const noexcept override;
+    void sample(std::size_t index,
+                Scalar* input,
+                std::size_t input_size,
+                Scalar* target,
+                std::size_t target_size) const override;
+
+private:
+    const DenseMatrix* inputs_{nullptr};
+    const DenseMatrix* targets_{nullptr};
 };
 
 class GeneratedDataset final : public Dataset {
@@ -734,6 +791,82 @@ struct NormalizationSpec {
     [[nodiscard]] bool has_output_normalization() const noexcept;
 };
 
+struct TrainingRunLayerConfig {
+    std::size_t input_size{0};
+    std::size_t output_size{0};
+    Activation activation{Activation::linear};
+    Scalar dropout_probability{static_cast<Scalar>(0)};
+};
+
+struct TrainingRunDatasetConfig {
+    std::size_t sample_count{0};
+    std::size_t input_size{0};
+    std::size_t output_size{0};
+    std::size_t training_sample_count{0};
+    std::size_t validation_sample_count{0};
+    std::size_t test_sample_count{0};
+    Scalar validation_split{static_cast<Scalar>(0)};
+    Scalar test_split{static_cast<Scalar>(0)};
+    bool shuffle{true};
+    std::uint64_t split_seed{0};
+    bool streaming{false};
+    std::size_t streaming_shuffle_buffer_size{0};
+};
+
+struct TrainingRunResultConfig {
+    std::size_t completed_epochs{0};
+    bool has_best_score{false};
+    std::size_t best_epoch{0};
+    Scalar best_score{static_cast<Scalar>(0)};
+    TrainingMonitor monitor{TrainingMonitor::automatic};
+    TrainingMonitorMode monitor_mode{TrainingMonitorMode::minimize};
+    TrainingStopReason stop_reason{TrainingStopReason::completed_epochs};
+    std::string stop_message;
+    bool has_final_training_loss{false};
+    Scalar final_training_loss{static_cast<Scalar>(0)};
+    bool has_final_validation_loss{false};
+    Scalar final_validation_loss{static_cast<Scalar>(0)};
+    bool has_final_test_loss{false};
+    Scalar final_test_loss{static_cast<Scalar>(0)};
+};
+
+struct TrainingRunConfig {
+    std::string library_name{"brutal_mlp"};
+    std::string library_version;
+    std::string scalar_type;
+    std::uint64_t created_unix_time{0};
+    std::string created_utc;
+    std::uint64_t model_seed{0};
+    std::uint64_t training_seed{0};
+    std::size_t input_size{0};
+    std::size_t output_size{0};
+    std::vector<TrainingRunLayerConfig> architecture;
+    OptimizerConfig optimizer{};
+    LearningRateScheduleConfig learning_rate_schedule{};
+    LossConfig loss{};
+    NormalizationSpec normalization{};
+    TrainingOptions options{};
+    TrainingRunDatasetConfig dataset{};
+    TrainingRunResultConfig result{};
+
+    [[nodiscard]] std::string to_json() const;
+};
+
+struct TrainingHistory {
+    std::vector<Scalar> training_loss;
+    std::vector<Scalar> validation_loss;
+    std::vector<Scalar> test_loss;
+    std::vector<TrainingEpochDiagnostics> epochs;
+    TrainingRunConfig run_config;
+    bool has_best_checkpoint{false};
+    std::size_t best_epoch{0};
+    Scalar best_metric{static_cast<Scalar>(0)};
+    TrainingMonitor monitor{TrainingMonitor::automatic};
+    TrainingMonitorMode monitor_mode{TrainingMonitorMode::minimize};
+    TrainingStopReason stop_reason{TrainingStopReason::completed_epochs};
+    std::string stop_message;
+};
+
 class InferenceWorkspace;
 
 class InferenceModel {
@@ -800,8 +933,16 @@ public:
 
     [[nodiscard]] Vector predict(const Vector& input) const;
     [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
+    [[nodiscard]] Matrix predict_batch(std::initializer_list<Vector> inputs) const;
+    [[nodiscard]] DenseMatrix predict_batch(const DenseMatrix& inputs) const;
     [[nodiscard]] EvaluationResult evaluate_metrics(const Matrix& inputs,
                                                     const Matrix& targets,
+                                                    const EvaluationOptions& options = {}) const;
+    [[nodiscard]] EvaluationResult evaluate_metrics(std::initializer_list<Vector> inputs,
+                                                    std::initializer_list<Vector> targets,
+                                                    const EvaluationOptions& options = {}) const;
+    [[nodiscard]] EvaluationResult evaluate_metrics(const DenseMatrix& inputs,
+                                                    const DenseMatrix& targets,
                                                     const EvaluationOptions& options = {}) const;
 
     [[nodiscard]] std::vector<LayerParameters> parameters() const;
@@ -899,12 +1040,27 @@ public:
 
     [[nodiscard]] Vector predict(const Vector& input) const;
     [[nodiscard]] Matrix predict_batch(const Matrix& inputs) const;
+    [[nodiscard]] Matrix predict_batch(std::initializer_list<Vector> inputs) const;
+    [[nodiscard]] DenseMatrix predict_batch(const DenseMatrix& inputs) const;
     [[nodiscard]] Scalar evaluate_loss(const Matrix& inputs, const Matrix& targets) const;
+    [[nodiscard]] Scalar evaluate_loss(std::initializer_list<Vector> inputs,
+                                       std::initializer_list<Vector> targets) const;
+    [[nodiscard]] Scalar evaluate_loss(const DenseMatrix& inputs, const DenseMatrix& targets) const;
     [[nodiscard]] EvaluationResult evaluate_metrics(const Matrix& inputs,
                                                     const Matrix& targets,
                                                     const EvaluationOptions& options = {}) const;
+    [[nodiscard]] EvaluationResult evaluate_metrics(std::initializer_list<Vector> inputs,
+                                                    std::initializer_list<Vector> targets,
+                                                    const EvaluationOptions& options = {}) const;
+    [[nodiscard]] EvaluationResult evaluate_metrics(const DenseMatrix& inputs,
+                                                    const DenseMatrix& targets,
+                                                    const EvaluationOptions& options = {}) const;
 
     TrainingHistory fit(const Matrix& inputs, const Matrix& targets, const TrainingOptions& options = {});
+    TrainingHistory fit(std::initializer_list<Vector> inputs,
+                        std::initializer_list<Vector> targets,
+                        const TrainingOptions& options = {});
+    TrainingHistory fit(const DenseMatrix& inputs, const DenseMatrix& targets, const TrainingOptions& options = {});
     TrainingHistory fit(const Dataset& dataset, const TrainingOptions& options = {});
     TrainingHistory fit(StreamingDataset& dataset, const TrainingOptions& options = {});
 
