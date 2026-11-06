@@ -394,6 +394,26 @@ struct TrainingOptions {
     std::filesystem::path latest_checkpoint_path{};
 };
 
+// Options of TrainingModel::fit_steps: training for a number of optimizer steps on mini-batches
+// drawn at random from a dataset, with memory proportional to the batch size only.
+struct StepTrainingOptions {
+    std::uint64_t steps{1000};
+    std::size_t batch_size{1024};
+    // 0 uses the model seed. Batch composition and dropout depend only on (seed, step index).
+    std::uint64_t seed{0};
+    // Index of the first step: a run split into several calls with the same seed and
+    // first_step = steps already done draws exactly the same batches as a single call.
+    std::uint64_t first_step{0};
+    // Steps per reported period (history entry, validation, learning-rate schedule epoch).
+    // 0 reports a single period covering every step.
+    std::uint64_t evaluation_interval{0};
+    // Interpreted per period: one schedule "epoch" is one evaluation interval of steps.
+    LearningRateScheduleConfig learning_rate_schedule{};
+    Scalar gradient_noise_stddev{static_cast<Scalar>(0)};
+    ParallelOptions parallelism{};
+    TrainingDebugOptions debug{};
+};
+
 struct LearningRateSchedulerState {
     bool initialized{false};
     Scalar base_learning_rate{static_cast<Scalar>(0)};
@@ -1084,6 +1104,14 @@ public:
     TrainingHistory fit(const DenseMatrix& inputs, const DenseMatrix& targets, const TrainingOptions& options = {});
     TrainingHistory fit(const Dataset& dataset, const TrainingOptions& options = {});
     TrainingHistory fit(StreamingDataset& dataset, const TrainingOptions& options = {});
+    // Trains for options.steps optimizer steps. Each mini-batch draws options.batch_size sample
+    // indices uniformly at random, with replacement, from [0, training.sample_count()); no list of
+    // the dataset's samples is ever built, so `training` may be very large or generated on demand.
+    // The training loss of a period is the mean loss of its mini-batches (training-mode forward
+    // pass, during the updates). `validation`, when given, is evaluated fully after each period.
+    TrainingHistory fit_steps(const Dataset& training,
+                              const StepTrainingOptions& options = {},
+                              const Dataset* validation = nullptr);
 
     [[nodiscard]] std::vector<LayerParameters> parameters() const;
     void set_parameters(const std::vector<LayerParameters>& parameters);

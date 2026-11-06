@@ -480,7 +480,8 @@ void TrainingModel::Impl::accumulate_block_gradients(const Scalar* inputs,
                                                      std::size_t count,
                                                      TrainingWorkspace& workspace,
                                                      bool apply_dropout,
-                                                     const GradientSink& sink) const {
+                                                     const GradientSink& sink,
+                                                     Scalar* loss_sum) const {
     require(targets != nullptr || count == 0, "target buffer must not be null");
     const std::size_t outputs = output_size();
     forward_batch(inputs, count, workspace, apply_dropout);
@@ -490,6 +491,11 @@ void TrainingModel::Impl::accumulate_block_gradients(const Scalar* inputs,
     Scalar* previous_delta = workspace.previous_delta.data();
     const Scalar* predictions = workspace.activations.back().data();
     const Scalar* output_z = workspace.pre_activations.back().data();
+    if (loss_sum != nullptr) {
+        for (std::size_t sample = 0; sample < count; ++sample) {
+            *loss_sum += sample_loss(predictions + sample * outputs, outputs, targets + sample * outputs, outputs);
+        }
+    }
     for (std::size_t sample = 0; sample < count; ++sample) {
         output_delta_into(predictions + sample * outputs,
                           outputs,
@@ -555,7 +561,8 @@ void TrainingModel::Impl::accumulate_batch_gradients(const Scalar* inputs,
                                                      const Scalar* targets,
                                                      std::size_t count,
                                                      TrainingWorkspace& workspace,
-                                                     std::mt19937_64* rng) {
+                                                     std::mt19937_64* rng,
+                                                     Scalar* loss_sum) {
     require(inputs != nullptr || count == 0, "input buffer must not be null");
     require(targets != nullptr || count == 0, "target buffer must not be null");
     refresh_layer_gradient_sink(workspace.layer_sink);
@@ -570,16 +577,18 @@ void TrainingModel::Impl::accumulate_batch_gradients(const Scalar* inputs,
                                    block,
                                    workspace,
                                    rng != nullptr,
-                                   workspace.layer_sink);
+                                   workspace.layer_sink,
+                                   loss_sum);
     }
 }
 
 void TrainingModel::Impl::accumulate_batch_gradients(const MiniBatch& batch,
                                                      TrainingWorkspace& workspace,
-                                                     std::mt19937_64* rng) {
+                                                     std::mt19937_64* rng,
+                                                     Scalar* loss_sum) {
     require(batch.input_size == input_size, "mini-batch input width mismatch");
     require(batch.output_size == output_size(), "mini-batch output width mismatch");
-    accumulate_batch_gradients(batch.inputs.data(), batch.targets.data(), batch.size(), workspace, rng);
+    accumulate_batch_gradients(batch.inputs.data(), batch.targets.data(), batch.size(), workspace, rng, loss_sum);
 }
 
 TrainingModel::Impl::ParallelTraining TrainingModel::Impl::make_parallel_training(const TrainingOptions& options,
@@ -620,6 +629,7 @@ TrainingModel::Impl::ParallelTraining TrainingModel::Impl::make_parallel_trainin
         parallel.batch_masks[layer_index].assign(batch_size * layers[layer_index].output_size, Scalar{1});
     }
     parallel.chunk_losses.assign(kLossChunksPerBlock, Scalar{0});
+    parallel.chunk_training_losses.assign(chunks, Scalar{0});
     parallel.loss_raw_batch.resize(kLossChunkSamples * kLossChunksPerBlock, input_size, output_size());
     parallel.loss_normalized_batch.resize(kLossChunkSamples * kLossChunksPerBlock, input_size, output_size());
     return parallel;
@@ -627,7 +637,8 @@ TrainingModel::Impl::ParallelTraining TrainingModel::Impl::make_parallel_trainin
 
 void TrainingModel::Impl::accumulate_batch_gradients_parallel(const MiniBatch& batch,
                                                               ParallelTraining& parallel,
-                                                              std::mt19937_64* rng) {
+                                                              std::mt19937_64* rng,
+                                                              Scalar* loss_sum) {
     require(batch.input_size == input_size, "mini-batch input width mismatch");
     require(batch.output_size == output_size(), "mini-batch output width mismatch");
     const std::size_t count = batch.size();
@@ -650,6 +661,10 @@ void TrainingModel::Impl::accumulate_batch_gradients_parallel(const MiniBatch& b
         TrainingWorkspace& workspace = parallel.workspaces[worker];
         Vector& gradients = parallel.chunk_gradients[chunk];
         std::fill(gradients.begin(), gradients.end(), Scalar{0});
+        Scalar* chunk_loss = loss_sum != nullptr ? &parallel.chunk_training_losses[chunk] : nullptr;
+        if (chunk_loss != nullptr) {
+            *chunk_loss = Scalar{0};
+        }
         const std::size_t first = chunk_begin(chunk, chunks, count);
         const std::size_t last = chunk_begin(chunk + 1, chunks, count);
         for (std::size_t begin = first; begin < last; begin += workspace.capacity) {
@@ -666,10 +681,17 @@ void TrainingModel::Impl::accumulate_batch_gradients_parallel(const MiniBatch& b
                                        block,
                                        workspace,
                                        apply_dropout,
-                                       parallel.chunk_sinks[chunk]);
+                                       parallel.chunk_sinks[chunk],
+                                       chunk_loss);
         }
     };
     parallel.pool->run(chunks, chunk_task);
+    if (loss_sum != nullptr) {
+        // Chunk sums are added in chunk order, whichever worker produced them.
+        for (std::size_t chunk = 0; chunk < chunks; ++chunk) {
+            *loss_sum += parallel.chunk_training_losses[chunk];
+        }
+    }
 
     // Reduction: every parameter adds the chunk contributions in chunk order 0, 1, 2, ...
     // Slices of parameters are independent, so they can be summed by any worker.

@@ -325,6 +325,34 @@ Debug mode reports NaN/Inf in inputs, targets, weights, and gradients with the e
 
 Each epoch records training loss, optional validation/test loss, the monitored metric, learning rate, gradient norm, clipping diagnostics, weight min/max/mean, non-finite parameter counts, elapsed time, cooldown/stale counters, and whether it produced the best checkpoint. Training stops with a structured reason for early stopping, invalid training data, non-finite loss, non-finite gradients, non-finite weights, loss explosion, or gradient explosion.
 
+## Step training on large or generated datasets
+
+`fit` works in epochs: every epoch visits every sample once, so it keeps one index per sample. `fit_steps` trains for a number of optimizer steps instead. Each mini-batch draws `batch_size` indices uniformly at random, with replacement, from `[0, sample_count())`; the indices are computed from `(seed, step, slot)` and never stored. Memory is proportional to the batch size, so the dataset can be enormous or generate samples on demand (for example a renderer that traces fresh noisy samples for `sample(index)`).
+
+```cpp
+class RenderedSamples final : public brutal_mlp::Dataset {
+public:
+    std::size_t sample_count() const noexcept override { return std::size_t{1} << 40; }
+    std::size_t input_size() const noexcept override { return 22; }
+    std::size_t output_size() const noexcept override { return 3; }
+    bool supports_concurrent_sample() const noexcept override { return true; }
+    void sample(std::size_t index, brutal_mlp::Scalar* input, std::size_t, brutal_mlp::Scalar* target, std::size_t) const override {
+        // Deterministic in `index`: e.g. seed a random generator with it and trace a few paths.
+    }
+};
+
+brutal_mlp::StepTrainingOptions options;
+options.steps = 30000;
+options.batch_size = 4096;
+options.evaluation_interval = 1000;   // history entry, validation and schedule epoch every 1000 steps
+options.parallelism.execution = brutal_mlp::ParallelExecution::worker_threads;
+auto history = model.fit_steps(RenderedSamples{}, options, &validation_dataset);
+```
+
+- The training loss of a period is the mean loss of its mini-batches, measured during the updates (training-mode forward pass, dropout active); no extra pass over the data is made. `validation`, when given, is evaluated fully after each period.
+- Results depend only on the seed and the step indices: a run split into calls with `first_step` set to the steps already done, using the same seed, reproduces a single call exactly, and the thread count does not change the result. Learning-rate schedules count one epoch per evaluation interval; set `cosine_epochs` explicitly when a cosine schedule spans several calls.
+- On a 10^12-sample generated dataset, the 22 → 4 x 64 → 3 network trains 8.2 million samples with a process peak of about 19 MiB.
+
 ## Datasets
 
 `fit(inputs, targets)` remains available for small in-memory datasets. `Matrix` is source-friendly, but it stores one vector per row. For larger in-memory batches, prefer `DenseMatrix`: it stores `rows * columns` scalars in one row-major block and can be passed directly to `fit`, `predict_batch`, and `evaluate_metrics`.

@@ -2769,6 +2769,139 @@ TEST(ParallelTraining, InvalidSampleReportIsIndependentOfThreads) {
     }
 }
 
+namespace {
+
+// Generates sample `index` on demand: x in [-1, 1] derived from the index, targets 2x + 1 and
+// x * x. sample_count() is far too large to ever store one entry per sample.
+class OnDemandDataset final : public bm::Dataset {
+public:
+    [[nodiscard]] std::size_t sample_count() const noexcept override { return std::size_t{1000000000000ULL}; }
+    [[nodiscard]] std::size_t input_size() const noexcept override { return 1; }
+    [[nodiscard]] std::size_t output_size() const noexcept override { return 2; }
+    [[nodiscard]] bool supports_concurrent_sample() const noexcept override { return true; }
+    void sample(std::size_t index, bm::Scalar* input, std::size_t, bm::Scalar* target, std::size_t) const override {
+        std::uint64_t value = static_cast<std::uint64_t>(index) * 0x9E3779B97F4A7C15ULL;
+        value ^= value >> 29U;
+        const double x = static_cast<double>(value % 2001U) / 1000.0 - 1.0;
+        input[0] = static_cast<bm::Scalar>(x);
+        target[0] = static_cast<bm::Scalar>(2.0 * x + 1.0);
+        target[1] = static_cast<bm::Scalar>(x * x);
+    }
+};
+
+bm::TrainingModel make_step_training_model(bm::Scalar dropout = bm::Scalar{0}) {
+    return bm::TrainingModel::builder()
+        .input_size(1)
+        .add_layer(16, bm::Activation::tanh, dropout)
+        .add_layer(2, bm::Activation::linear)
+        .optimizer(bm::OptimizerConfig::adam(bm::Scalar{0.01}))
+        .seed(99)
+        .build();
+}
+
+std::vector<bm::LayerParameters> train_steps(const bm::Dataset& dataset,
+                                             std::uint64_t first_step,
+                                             std::uint64_t steps,
+                                             bm::TrainingModel& model,
+                                             std::size_t thread_count = 0) {
+    bm::StepTrainingOptions options;
+    options.steps = steps;
+    options.first_step = first_step;
+    options.batch_size = 70;
+    options.seed = 1234;
+    if (thread_count > 0) {
+        options.parallelism.execution = bm::ParallelExecution::worker_threads;
+        options.parallelism.thread_count = thread_count;
+    }
+    (void)model.fit_steps(dataset, options);
+    return model.parameters();
+}
+
+void expect_same_parameters(const std::vector<bm::LayerParameters>& actual,
+                            const std::vector<bm::LayerParameters>& expected) {
+    ASSERT_EQ(actual.size(), expected.size());
+    for (std::size_t layer = 0; layer < actual.size(); ++layer) {
+        EXPECT_EQ(actual[layer].weights, expected[layer].weights);
+        EXPECT_EQ(actual[layer].biases, expected[layer].biases);
+    }
+}
+
+} // namespace
+
+TEST(StepTraining, LearnsFromAnOnDemandDatasetAndReportsPeriods) {
+    const OnDemandDataset training;
+    bm::Matrix validation_inputs;
+    bm::Matrix validation_targets;
+    for (int i = -10; i <= 10; ++i) {
+        const double x = i / 10.0;
+        validation_inputs.push_back({static_cast<bm::Scalar>(x)});
+        validation_targets.push_back({static_cast<bm::Scalar>(2.0 * x + 1.0), static_cast<bm::Scalar>(x * x)});
+    }
+    const bm::MatrixDataset validation(validation_inputs, validation_targets);
+
+    auto model = make_step_training_model();
+    bm::StepTrainingOptions options;
+    options.steps = 2000;
+    options.batch_size = 64;
+    options.evaluation_interval = 500;
+    const auto history = model.fit_steps(training, options, &validation);
+
+    EXPECT_EQ(history.stop_reason, bm::TrainingStopReason::completed_epochs);
+    ASSERT_EQ(history.training_loss.size(), 4U);
+    ASSERT_EQ(history.validation_loss.size(), 4U);
+    ASSERT_EQ(history.epochs.size(), 4U);
+    EXPECT_LT(history.validation_loss.back(), history.validation_loss.front());
+    EXPECT_LT(history.validation_loss.back(), 1e-3);
+    EXPECT_EQ(history.monitor, bm::TrainingMonitor::validation_loss);
+    EXPECT_EQ(history.run_config.dataset.training_sample_count, training.sample_count());
+}
+
+TEST(StepTraining, SplitRunMatchesSingleRun) {
+    const OnDemandDataset training;
+    auto single = make_step_training_model(bm::Scalar{0.2});
+    const auto single_parameters = train_steps(training, 0, 200, single);
+
+    auto split = make_step_training_model(bm::Scalar{0.2});
+    (void)train_steps(training, 0, 120, split);
+    const auto split_parameters = train_steps(training, 120, 80, split);
+    expect_same_parameters(split_parameters, single_parameters);
+}
+
+TEST(StepTraining, ResultsAreIdenticalForEveryThreadCount) {
+    const OnDemandDataset training;
+    auto reference = make_step_training_model(bm::Scalar{0.2});
+    const auto reference_parameters = train_steps(training, 0, 60, reference, 1);
+    for (std::size_t thread_count : {2U, 3U, 8U}) {
+        SCOPED_TRACE(thread_count);
+        auto model = make_step_training_model(bm::Scalar{0.2});
+        expect_same_parameters(train_steps(training, 0, 60, model, thread_count), reference_parameters);
+    }
+
+    // A batch of 70 samples is two gradient chunks: serial training agrees up to rounding.
+    auto serial = make_step_training_model(bm::Scalar{0.2});
+    const auto serial_parameters = train_steps(training, 0, 60, serial);
+    for (std::size_t layer = 0; layer < serial_parameters.size(); ++layer) {
+        expect_vector_near(serial_parameters[layer].weights, reference_parameters[layer].weights, 1e-4);
+    }
+}
+
+TEST(StepTraining, RejectsInvalidOptions) {
+    const OnDemandDataset training;
+    auto model = make_step_training_model();
+    bm::StepTrainingOptions options;
+    options.steps = 0;
+    EXPECT_THROW((void)model.fit_steps(training, options), std::invalid_argument);
+    options.steps = 10;
+    options.batch_size = 0;
+    EXPECT_THROW((void)model.fit_steps(training, options), std::invalid_argument);
+
+    const bm::Matrix wrong_inputs{{1.0, 2.0}};
+    const bm::Matrix wrong_targets{{1.0, 2.0}};
+    const bm::MatrixDataset wrong_validation(wrong_inputs, wrong_targets);
+    options.batch_size = 8;
+    EXPECT_THROW((void)model.fit_steps(training, options, &wrong_validation), std::invalid_argument);
+}
+
 TEST(Datasets, ConcurrentSampleSupportIsDeclaredPerDataset) {
     const bm::Matrix inputs{{1.0}, {2.0}};
     const bm::Matrix targets{{1.0}, {2.0}};

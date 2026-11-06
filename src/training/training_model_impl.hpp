@@ -127,12 +127,14 @@ struct TrainingModel::Impl {
 
     // Adds to `sink` the parameter gradients of `count <= capacity` contiguous samples, in sample
     // order. Only reads the model, so concurrent calls with distinct workspaces and sinks are safe.
+    // With `loss_sum`, also adds every sample's loss (of the training-mode forward pass) to it.
     void accumulate_block_gradients(const Scalar* inputs,
                                     const Scalar* targets,
                                     std::size_t count,
                                     TrainingWorkspace& workspace,
                                     bool apply_dropout,
-                                    const GradientSink& sink) const;
+                                    const GradientSink& sink,
+                                    Scalar* loss_sum = nullptr) const;
 
     // Points `sink` at the model's gradient buffers (Layer::grad_weights / grad_biases).
     void refresh_layer_gradient_sink(GradientSink& sink);
@@ -143,11 +145,13 @@ struct TrainingModel::Impl {
                                     const Scalar* targets,
                                     std::size_t count,
                                     TrainingWorkspace& workspace,
-                                    std::mt19937_64* rng = nullptr);
+                                    std::mt19937_64* rng = nullptr,
+                                    Scalar* loss_sum = nullptr);
 
     void accumulate_batch_gradients(const MiniBatch& batch,
                                     TrainingWorkspace& workspace,
-                                    std::mt19937_64* rng = nullptr);
+                                    std::mt19937_64* rng = nullptr,
+                                    Scalar* loss_sum = nullptr);
 
     // State of deterministic multi-threaded training, built once per fit call when
     // TrainingOptions::parallelism selects worker threads.
@@ -165,6 +169,7 @@ struct TrainingModel::Impl {
         std::vector<GradientSink> chunk_sinks;      // Views of chunk_gradients per layer.
         std::vector<Vector> batch_masks;            // Dropout masks of one whole mini-batch.
         std::vector<Scalar> chunk_losses;           // Per-chunk sums of the loss evaluation.
+        std::vector<Scalar> chunk_training_losses;  // Per-chunk sums of the running training loss.
         MiniBatch loss_raw_batch;                   // Samples of one loss evaluation block.
         MiniBatch loss_normalized_batch;
     };
@@ -187,7 +192,8 @@ struct TrainingModel::Impl {
     // Same contract as accumulate_batch_gradients(MiniBatch&, ...), computed by the worker pool.
     void accumulate_batch_gradients_parallel(const MiniBatch& batch,
                                              ParallelTraining& parallel,
-                                             std::mt19937_64* rng);
+                                             std::mt19937_64* rng,
+                                             Scalar* loss_sum = nullptr);
 
     void zero_gradients();
 

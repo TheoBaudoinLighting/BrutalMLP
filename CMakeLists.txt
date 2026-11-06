@@ -59,6 +59,7 @@ add_library(brutal_mlp
     src/training/training_diagnostics.cpp
     src/training/training_fit.cpp
     src/training/training_fit_streaming.cpp
+    src/training/training_fit_steps.cpp
     src/training/training_model.cpp
     src/training/training_model_impl.cpp
     src/training/training_model_io.cpp
