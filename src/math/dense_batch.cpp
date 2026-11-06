@@ -4,6 +4,13 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
+#include <limits>
+
+#if defined(BRUTAL_MLP_HAS_ISPC) && !(defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE)
+#define BRUTAL_MLP_DENSE_BATCH_ISPC 1
+#include "dense_batch_kernels_ispc.h"
+#endif
 
 #if defined(_MSC_VER)
 #define BRUTAL_MLP_RESTRICT __restrict
@@ -31,6 +38,14 @@ constexpr std::size_t kTileBytes = 32 * 1024;
     return std::max<std::size_t>(1, kTileBytes / row_bytes);
 }
 
+#if defined(BRUTAL_MLP_DENSE_BATCH_ISPC)
+// The ISPC kernels index inside a row with 32-bit integers.
+[[nodiscard]] bool ispc_dimensions_supported(std::size_t input_size, std::size_t output_size) noexcept {
+    constexpr std::size_t kMaxIndex = static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max());
+    return input_size <= kMaxIndex && output_size <= kMaxIndex;
+}
+#endif
+
 } // namespace
 
 void transpose_weights(const Scalar* weights,
@@ -52,6 +67,19 @@ void dense_forward_batch(const Scalar* inputs,
                          const Scalar* biases,
                          std::size_t output_size,
                          Scalar* z) noexcept {
+#if defined(BRUTAL_MLP_DENSE_BATCH_ISPC)
+    if (ispc_dimensions_supported(input_size, output_size)) {
+        ::ispc::brutal_mlp_dense_forward_batch_f32(inputs,
+                                                   static_cast<std::int64_t>(count),
+                                                   static_cast<std::int32_t>(input_size),
+                                                   weights_transposed,
+                                                   biases,
+                                                   static_cast<std::int32_t>(output_size),
+                                                   static_cast<std::int32_t>(rows_per_tile(output_size)),
+                                                   z);
+        return;
+    }
+#endif
     for (std::size_t sample = 0; sample < count; ++sample) {
         Scalar* BRUTAL_MLP_RESTRICT row = z + sample * output_size;
         for (std::size_t out = 0; out < output_size; ++out) {
@@ -110,6 +138,19 @@ void dense_accumulate_gradients_batch(const Scalar* delta,
                                       std::size_t output_size,
                                       Scalar* grad_weights,
                                       Scalar* grad_biases) noexcept {
+#if defined(BRUTAL_MLP_DENSE_BATCH_ISPC)
+    if (ispc_dimensions_supported(input_size, output_size)) {
+        ::ispc::brutal_mlp_dense_accumulate_gradients_batch_f32(delta,
+                                                                inputs,
+                                                                static_cast<std::int64_t>(count),
+                                                                static_cast<std::int32_t>(input_size),
+                                                                static_cast<std::int32_t>(output_size),
+                                                                static_cast<std::int32_t>(rows_per_tile(input_size)),
+                                                                grad_weights,
+                                                                grad_biases);
+        return;
+    }
+#endif
     for (std::size_t sample = 0; sample < count; ++sample) {
         const Scalar* d = delta + sample * output_size;
         for (std::size_t out = 0; out < output_size; ++out) {
@@ -165,6 +206,18 @@ void dense_input_gradient_batch(const Scalar* delta,
                                 std::size_t input_size,
                                 std::size_t output_size,
                                 Scalar* input_gradient) noexcept {
+#if defined(BRUTAL_MLP_DENSE_BATCH_ISPC)
+    if (ispc_dimensions_supported(input_size, output_size)) {
+        ::ispc::brutal_mlp_dense_input_gradient_batch_f32(delta,
+                                                          weights,
+                                                          static_cast<std::int64_t>(count),
+                                                          static_cast<std::int32_t>(input_size),
+                                                          static_cast<std::int32_t>(output_size),
+                                                          static_cast<std::int32_t>(rows_per_tile(input_size)),
+                                                          input_gradient);
+        return;
+    }
+#endif
     for (std::size_t sample = 0; sample < count; ++sample) {
         Scalar* BRUTAL_MLP_RESTRICT g = input_gradient + sample * input_size;
         for (std::size_t in = 0; in < input_size; ++in) {

@@ -24,7 +24,7 @@ signature is named.
 | Function | Size contract | Accepted values | Errors | Cost | Thread-safety | Ownership | Stability |
 |---|---|---|---|---|---|---|---|
 | `version_string()` | No input. | Always returns a non-empty version string. | Never throws. | O(1). | Thread-safe. | Returned `string_view` points to static storage. | Stable. |
-| `inference_backend()` | No input. | Returns the compiled inference backend: `scalar` or `ispc`. Double precision builds always report `scalar`. | Never throws. | O(1). | Thread-safe. | Returns enum by value. | Stable. |
+| `inference_backend()` | No input. | Returns the compiled SIMD backend, used by inference and training kernels: `scalar` or `ispc`. Double precision builds always report `scalar`. | Never throws. | O(1). | Thread-safe. | Returns enum by value. | Stable. |
 | `to_string(Activation)`, `to_string(Loss)`, `to_string(Metric)`, `to_string(Averaging)`, `to_string(OptimizerType)`, `to_string(NormalizationMode)`, `to_string(InferenceStatus)`, `to_string(TrainingStopReason)`, `to_string(TrainingMonitor)`, `to_string(TrainingMonitorMode)`, `to_string(LearningRateSchedule)`, `to_string(WeightInitialization)`, `to_string(ParallelExecution)`, `to_string(InferenceBackend)` | One enum value. | Any valid enumerator of the matching enum. | Throws `std::invalid_argument` for an invalid enum representation. | O(1). | Thread-safe. | Returns an owning `std::string`. | Stable. |
 | `activation_from_string`, `loss_from_string`, `metric_from_string`, `averaging_from_string`, `optimizer_type_from_string`, `normalization_mode_from_string`, `parallel_execution_from_string`, `inference_backend_from_string` | One string token. | Exact lower-case tokens produced by matching `to_string`. | Throws `std::invalid_argument` for unknown tokens. | O(token length). | Thread-safe. | Does not retain the input view. | Stable. |
 
@@ -123,7 +123,8 @@ signature is named.
 
 When the optional ISPC backend is compiled, float inference uses an ISPC dense-layer
 kernel inside the same public contracts. The backend does not change buffer sizes,
-ownership, error behavior, or thread-safety requirements.
+ownership, error behavior, or thread-safety requirements. Its outputs may differ from the
+C++ kernel by floating-point rounding; training results do not depend on the backend.
 
 | Function | Size contract | Accepted values | Errors | Cost | Thread-safety | Ownership | Stability |
 |---|---|---|---|---|---|---|---|

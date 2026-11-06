@@ -16,9 +16,10 @@ option(BRUTAL_MLP_BUILD_TESTS "Build brutal_mlp unit tests" ${BRUTAL_MLP_TOP_LEV
 option(BRUTAL_MLP_BUILD_BENCHMARKS "Build brutal_mlp benchmarks" OFF)
 option(BRUTAL_MLP_BUILD_EXAMPLES "Build brutal_mlp examples" ${BRUTAL_MLP_TOP_LEVEL_DEFAULT})
 option(BRUTAL_MLP_USE_DOUBLE "Use double precision Scalar for debug and numerical investigation builds" OFF)
-option(BRUTAL_MLP_ENABLE_ISPC "Build the optional ISPC SIMD inference backend when the ispc compiler is available" ON)
-option(BRUTAL_MLP_REQUIRE_ISPC "Fail CMake configuration if the ISPC SIMD inference backend cannot be enabled" OFF)
-set(BRUTAL_MLP_ISPC_TARGET "host" CACHE STRING "ISPC target string used for the optional SIMD inference backend")
+option(BRUTAL_MLP_ENABLE_ISPC "Build the optional ISPC SIMD backend (inference and training kernels) when the ispc compiler is available" ON)
+option(BRUTAL_MLP_REQUIRE_ISPC "Fail CMake configuration if the ISPC SIMD backend cannot be enabled" OFF)
+set(BRUTAL_MLP_ISPC_TARGET "sse4.2-i32x4,avx2-i32x8,avx512skx-x16" CACHE STRING
+    "ISPC targets of the optional SIMD backend; several comma-separated targets are dispatched at run time")
 
 if(BRUTAL_MLP_REQUIRE_ISPC AND NOT BRUTAL_MLP_ENABLE_ISPC)
     message(FATAL_ERROR "BRUTAL_MLP_REQUIRE_ISPC=ON requires BRUTAL_MLP_ENABLE_ISPC=ON")
@@ -93,45 +94,75 @@ if(BRUTAL_MLP_ENABLE_ISPC AND NOT BRUTAL_MLP_USE_DOUBLE)
     find_program(BRUTAL_MLP_ISPC_EXECUTABLE NAMES ispc)
     if(BRUTAL_MLP_ISPC_EXECUTABLE)
         set(BRUTAL_MLP_ISPC_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated/ispc")
-        set(BRUTAL_MLP_ISPC_HEADER "${BRUTAL_MLP_ISPC_GENERATED_DIR}/dense_layer_kernel_ispc.h")
-        set(BRUTAL_MLP_ISPC_OBJECT "${BRUTAL_MLP_ISPC_GENERATED_DIR}/dense_layer_kernel_ispc${CMAKE_CXX_OUTPUT_EXTENSION}")
-        set(BRUTAL_MLP_ISPC_FLAGS "")
+        set(BRUTAL_MLP_ISPC_COMMON_FLAGS -O2)
         if(NOT WIN32)
             # Required when the object ends up in a shared library or a PIE executable.
-            list(APPEND BRUTAL_MLP_ISPC_FLAGS --pic)
+            list(APPEND BRUTAL_MLP_ISPC_COMMON_FLAGS --pic)
         endif()
 
-        add_custom_command(
-            OUTPUT "${BRUTAL_MLP_ISPC_HEADER}" "${BRUTAL_MLP_ISPC_OBJECT}"
-            COMMAND "${CMAKE_COMMAND}" -E make_directory "${BRUTAL_MLP_ISPC_GENERATED_DIR}"
-            COMMAND "${BRUTAL_MLP_ISPC_EXECUTABLE}"
-                    "${CMAKE_CURRENT_SOURCE_DIR}/src/math/dense_layer_kernel.ispc"
-                    --target=${BRUTAL_MLP_ISPC_TARGET}
-                    ${BRUTAL_MLP_ISPC_FLAGS}
-                    -h "${BRUTAL_MLP_ISPC_HEADER}"
-                    -o "${BRUTAL_MLP_ISPC_OBJECT}"
-            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/math/dense_layer_kernel.ispc"
-            VERBATIM
-        )
+        # With several comma-separated targets ISPC writes one object per instruction set plus
+        # a dispatch object that selects the best one supported by the CPU at run time.
+        string(REPLACE "," ";" BRUTAL_MLP_ISPC_TARGET_LIST "${BRUTAL_MLP_ISPC_TARGET}")
+        list(LENGTH BRUTAL_MLP_ISPC_TARGET_LIST BRUTAL_MLP_ISPC_TARGET_COUNT)
+        set(BRUTAL_MLP_ISPC_TARGET_SUFFIXES "")
+        if(BRUTAL_MLP_ISPC_TARGET_COUNT GREATER 1)
+            foreach(ispc_target IN LISTS BRUTAL_MLP_ISPC_TARGET_LIST)
+                string(REGEX REPLACE "-.*$" "" ispc_isa "${ispc_target}")
+                string(REGEX REPLACE "\\.[0-9]+$" "" ispc_isa "${ispc_isa}")
+                list(APPEND BRUTAL_MLP_ISPC_TARGET_SUFFIXES "_${ispc_isa}")
+            endforeach()
+        endif()
 
-        add_custom_target(brutal_mlp_ispc_generated
-            DEPENDS "${BRUTAL_MLP_ISPC_HEADER}" "${BRUTAL_MLP_ISPC_OBJECT}"
-        )
-        add_dependencies(brutal_mlp brutal_mlp_ispc_generated)
-        set_source_files_properties("${BRUTAL_MLP_ISPC_OBJECT}"
-            PROPERTIES
-                EXTERNAL_OBJECT TRUE
-                GENERATED TRUE
-        )
-        target_sources(brutal_mlp PRIVATE "${BRUTAL_MLP_ISPC_OBJECT}")
+        # Compiles one .ispc file into <name>_ispc.h and its object file(s).
+        function(brutal_mlp_add_ispc_kernel name source)
+            set(header "${BRUTAL_MLP_ISPC_GENERATED_DIR}/${name}_ispc.h")
+            set(object "${BRUTAL_MLP_ISPC_GENERATED_DIR}/${name}_ispc${CMAKE_CXX_OUTPUT_EXTENSION}")
+            set(outputs "${header}" "${object}")
+            foreach(suffix IN LISTS BRUTAL_MLP_ISPC_TARGET_SUFFIXES)
+                list(APPEND outputs
+                    "${BRUTAL_MLP_ISPC_GENERATED_DIR}/${name}_ispc${suffix}.h"
+                    "${BRUTAL_MLP_ISPC_GENERATED_DIR}/${name}_ispc${suffix}${CMAKE_CXX_OUTPUT_EXTENSION}")
+            endforeach()
+            add_custom_command(
+                OUTPUT ${outputs}
+                COMMAND "${CMAKE_COMMAND}" -E make_directory "${BRUTAL_MLP_ISPC_GENERATED_DIR}"
+                COMMAND "${BRUTAL_MLP_ISPC_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+                        --target=${BRUTAL_MLP_ISPC_TARGET}
+                        ${BRUTAL_MLP_ISPC_COMMON_FLAGS}
+                        ${ARGN}
+                        -h "${header}"
+                        -o "${object}"
+                DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${source}"
+                VERBATIM
+            )
+            add_custom_target(brutal_mlp_${name}_ispc DEPENDS ${outputs})
+            add_dependencies(brutal_mlp brutal_mlp_${name}_ispc)
+            set(objects "")
+            foreach(output IN LISTS outputs)
+                if(output MATCHES "${CMAKE_CXX_OUTPUT_EXTENSION}$")
+                    list(APPEND objects "${output}")
+                endif()
+            endforeach()
+            set_source_files_properties(${objects} PROPERTIES EXTERNAL_OBJECT TRUE GENERATED TRUE)
+            target_sources(brutal_mlp PRIVATE ${objects})
+        endfunction()
+
+        # Inference kernel: fused multiply-add allowed (results differ from the scalar path only
+        # by rounding).
+        brutal_mlp_add_ispc_kernel(dense_layer_kernel src/math/dense_layer_kernel.ispc)
+        # Training kernels: no fused multiply-add, so every value is rounded exactly like the
+        # C++ kernels and training stays bit-identical with and without ISPC.
+        brutal_mlp_add_ispc_kernel(dense_batch_kernels src/math/dense_batch_kernels.ispc --opt=disable-fma)
+
         target_include_directories(brutal_mlp PRIVATE "${BRUTAL_MLP_ISPC_GENERATED_DIR}")
         target_compile_definitions(brutal_mlp PRIVATE BRUTAL_MLP_HAS_ISPC=1)
-        message(STATUS "brutal_mlp: ISPC SIMD inference backend enabled (${BRUTAL_MLP_ISPC_TARGET})")
+        message(STATUS "brutal_mlp: ISPC SIMD backend enabled (${BRUTAL_MLP_ISPC_TARGET})")
     else()
         if(BRUTAL_MLP_REQUIRE_ISPC)
             message(FATAL_ERROR "BRUTAL_MLP_REQUIRE_ISPC=ON but the ispc compiler was not found")
         else()
-            message(STATUS "brutal_mlp: ispc compiler not found; using scalar inference backend")
+            message(STATUS "brutal_mlp: ispc compiler not found; using the C++ kernels")
         endif()
     endif()
 elseif(BRUTAL_MLP_ENABLE_ISPC AND BRUTAL_MLP_USE_DOUBLE)

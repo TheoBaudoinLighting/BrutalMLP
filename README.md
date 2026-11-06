@@ -14,14 +14,17 @@ When using the CMake target `brutal_mlp::brutal_mlp`, the precision macro is pro
 
 ## SIMD backend
 
-`brutal_mlp` has an optional ISPC inference backend for the compiled float runtime. It uses the ISPC compiler as a build tool only; no extra runtime library is required by `brutal_mlp`.
+`brutal_mlp` has an optional ISPC SIMD backend for float builds: the dense-layer kernel of inference and the three mini-batch kernels of training. It uses the ISPC compiler as a build tool only; no extra runtime library is required by `brutal_mlp`.
 
 ```bash
 cmake --preset ispc          # same as release, but fails if ispc is missing
 cmake --build --preset ispc
+# ispc outside PATH: cmake --preset ispc -DBRUTAL_MLP_ISPC_EXECUTABLE=C:/path/to/ispc.exe
 ```
 
-If `ispc` is not available in `PATH`, CMake keeps the scalar backend and prints a status message. Use `-DBRUTAL_MLP_REQUIRE_ISPC=ON` when a build must fail instead of falling back. Double precision builds always use the scalar backend. At runtime, `brutal_mlp::inference_backend()` returns `brutal_mlp::InferenceBackend::ispc` or `brutal_mlp::InferenceBackend::scalar`.
+- `BRUTAL_MLP_ISPC_TARGET` defaults to `sse4.2-i32x4,avx2-i32x8,avx512skx-x16`: one object per instruction set plus a dispatcher that picks the best one supported by the CPU at run time, so the binary stays portable. A single target such as `host` builds only that instruction set.
+- Training results are bit-identical with and without ISPC: the training kernels perform the same multiplies and additions in the same order as the C++ kernels and are compiled without fused multiply-add. Inference with ISPC uses fused multiply-add and a different summation order, so its outputs may differ from the C++ path by rounding.
+- If `ispc` is not found, CMake keeps the C++ kernels and prints a status message. Use `-DBRUTAL_MLP_REQUIRE_ISPC=ON` when a build must fail instead of falling back. Double precision builds always use the C++ kernels. At runtime, `brutal_mlp::inference_backend()` returns `brutal_mlp::InferenceBackend::ispc` or `brutal_mlp::InferenceBackend::scalar`.
 
 ## API split
 
@@ -601,7 +604,7 @@ The public surface is the single header `include/brutal_mlp/brutal_mlp.hpp`. Imp
 | Directory | Responsibility |
 |---|---|
 | `src/core/` | Argument checks, scalar-type constants, time and seed helpers, worker threads, enum strings, version info, `DenseMatrix`. |
-| `src/math/` | Activations, scalar helpers, the one-sample inference kernel with its optional ISPC version (`dense_layer_kernel.ispc`), and the mini-batch training kernels (`dense_batch.*`). |
+| `src/math/` | Activations, scalar helpers, the one-sample inference kernel with its optional ISPC version (`dense_layer_kernel.ispc`), and the mini-batch training kernels (`dense_batch.*`) with their ISPC versions (`dense_batch_kernels.ispc`). |
 | `src/config/` | Configuration validation and the factory functions of the config structs. |
 | `src/data/` | Training data validation, datasets, mini-batches and streaming datasets. |
 | `src/normalization/` | Feature normalization validation, application and factories. |
