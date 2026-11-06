@@ -81,6 +81,7 @@ struct WorkerPool::State {
 
     std::mutex error_mutex;
     std::exception_ptr error;
+    std::size_t error_task{0};  // Task index of `error`: the lowest index that threw.
 };
 
 WorkerPool::WorkerPool(std::size_t worker_count)
@@ -180,9 +181,12 @@ void WorkerPool::execute_tasks(std::size_t worker_index) noexcept {
         try {
             state_->task(state_->context, task_index, worker_index);
         } catch (...) {
+            // Keep the failure of the lowest task index, so the reported error does not depend
+            // on which worker failed first.
             const std::lock_guard<std::mutex> lock(state_->error_mutex);
-            if (!state_->error) {
+            if (!state_->error || task_index < state_->error_task) {
                 state_->error = std::current_exception();
+                state_->error_task = task_index;
             }
         }
     }

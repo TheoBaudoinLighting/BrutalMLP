@@ -1072,16 +1072,28 @@ void TrainingModel::Impl::fill_dataset_batch(const Dataset& dataset,
     require(count <= indices.size() - begin, "batch count is out of range");
     raw_batch.resize(count, input_size, output_size());
     normalized_batch.resize(count, input_size, output_size());
+    fill_dataset_rows(dataset, indices, begin, count, 0, raw_batch, normalized_batch, debug, base_debug_context);
+}
 
-    for (std::size_t sample = 0; sample < count; ++sample) {
-        dataset.sample(indices[begin + sample],
+void TrainingModel::Impl::fill_dataset_rows(const Dataset& dataset,
+                                            const std::vector<std::size_t>& indices,
+                                            std::size_t begin,
+                                            std::size_t count,
+                                            std::size_t row,
+                                            MiniBatch& raw_batch,
+                                            MiniBatch& normalized_batch,
+                                            const TrainingDebugOptions* debug,
+                                            const TrainingDebugContext& base_debug_context) const {
+    for (std::size_t offset = 0; offset < count; ++offset) {
+        const std::size_t sample = row + offset;
+        dataset.sample(indices[begin + offset],
                        raw_batch.input_data(sample),
                        raw_batch.input_size,
                        raw_batch.target_data(sample),
                        raw_batch.output_size);
         if (debug != nullptr && debug->enabled) {
             TrainingDebugContext context = base_debug_context;
-            context.sample_index = indices[begin + sample];
+            context.sample_index = indices[begin + offset];
             context.has_sample_index = true;
             debug_check_sample_values(raw_batch.input_data(sample),
                                       raw_batch.input_size,
@@ -1096,6 +1108,34 @@ void TrainingModel::Impl::fill_dataset_batch(const Dataset& dataset,
                          normalized_batch.input_data(sample),
                          normalized_batch.target_data(sample));
     }
+}
+
+void TrainingModel::Impl::fill_dataset_batch_parallel(const Dataset& dataset,
+                                                      const std::vector<std::size_t>& indices,
+                                                      std::size_t begin,
+                                                      std::size_t count,
+                                                      MiniBatch& raw_batch,
+                                                      MiniBatch& normalized_batch,
+                                                      ParallelTraining& parallel,
+                                                      const TrainingDebugOptions* debug,
+                                                      const TrainingDebugContext& base_debug_context) const {
+    if (!dataset.supports_concurrent_sample()) {
+        fill_dataset_batch(dataset, indices, begin, count, raw_batch, normalized_batch, debug, base_debug_context);
+        return;
+    }
+    require(begin <= indices.size(), "batch begin index is out of range");
+    require(count <= indices.size() - begin, "batch count is out of range");
+    // Resized once on this thread; the workers then write disjoint row ranges.
+    raw_batch.resize(count, input_size, output_size());
+    normalized_batch.resize(count, input_size, output_size());
+    const std::size_t chunks = (count + kLossChunkSamples - 1) / kLossChunkSamples;
+    auto fill_task = [&](std::size_t chunk, std::size_t) {
+        const std::size_t first = chunk * kLossChunkSamples;
+        const std::size_t rows = std::min(kLossChunkSamples, count - first);
+        fill_dataset_rows(dataset, indices, begin + first, rows, first, raw_batch, normalized_batch, debug,
+                          base_debug_context);
+    };
+    parallel.pool->run(chunks, fill_task);
 }
 
 Scalar TrainingModel::Impl::loss_for_dataset_indices(const Dataset& dataset,
@@ -1151,20 +1191,38 @@ Scalar TrainingModel::Impl::loss_for_dataset_indices_parallel(const Dataset& dat
     Scalar total = Scalar{0};
     for (std::size_t block_begin = 0; block_begin < indices.size(); block_begin += block_samples) {
         const std::size_t block = std::min(block_samples, indices.size() - block_begin);
-        // Reading and validating samples stays on this thread: Dataset::sample() need not be thread-safe.
-        fill_dataset_batch(dataset,
-                           indices,
-                           block_begin,
-                           block,
-                           parallel.loss_raw_batch,
-                           parallel.loss_normalized_batch,
-                           debug,
-                           context);
+        // Samples are read on this thread unless the dataset supports concurrent sample() calls,
+        // in which case each task reads its own rows.
+        const bool concurrent_reads = dataset.supports_concurrent_sample();
+        parallel.loss_raw_batch.resize(block, input_size, outputs);
+        parallel.loss_normalized_batch.resize(block, input_size, outputs);
+        if (!concurrent_reads) {
+            fill_dataset_rows(dataset,
+                              indices,
+                              block_begin,
+                              block,
+                              0,
+                              parallel.loss_raw_batch,
+                              parallel.loss_normalized_batch,
+                              debug,
+                              context);
+        }
         const std::size_t chunks = (block + kLossChunkSamples - 1) / kLossChunkSamples;
         auto loss_task = [&](std::size_t chunk, std::size_t worker) {
             TrainingWorkspace& workspace = parallel.workspaces[worker];
             const std::size_t first = chunk * kLossChunkSamples;
             const std::size_t last = std::min(block, first + kLossChunkSamples);
+            if (concurrent_reads) {
+                fill_dataset_rows(dataset,
+                                  indices,
+                                  block_begin + first,
+                                  last - first,
+                                  first,
+                                  parallel.loss_raw_batch,
+                                  parallel.loss_normalized_batch,
+                                  debug,
+                                  context);
+            }
             Scalar sum = Scalar{0};
             for (std::size_t begin = first; begin < last; begin += workspace.capacity) {
                 const std::size_t count = std::min(workspace.capacity, last - begin);

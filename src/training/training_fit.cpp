@@ -145,14 +145,26 @@ TrainingHistory TrainingModel::fit(const Dataset& dataset, const TrainingOptions
             debug_context.epoch = epoch;
             debug_context.has_epoch = true;
             try {
-                impl_->fill_dataset_batch(dataset,
-                                          training_indices,
-                                          begin,
-                                          batch_count,
-                                          raw_batch,
-                                          normalized_batch,
-                                          &runtime_options.debug,
-                                          debug_context);
+                if (parallel) {
+                    impl_->fill_dataset_batch_parallel(dataset,
+                                                       training_indices,
+                                                       begin,
+                                                       batch_count,
+                                                       raw_batch,
+                                                       normalized_batch,
+                                                       *parallel,
+                                                       &runtime_options.debug,
+                                                       debug_context);
+                } else {
+                    impl_->fill_dataset_batch(dataset,
+                                              training_indices,
+                                              begin,
+                                              batch_count,
+                                              raw_batch,
+                                              normalized_batch,
+                                              &runtime_options.debug,
+                                              debug_context);
+                }
             } catch (const TrainingDebugFailure& failure) {
                 history.stop_reason = failure.reason;
                 history.stop_message = failure.what();

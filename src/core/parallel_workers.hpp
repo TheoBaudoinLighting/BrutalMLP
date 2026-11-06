@@ -36,8 +36,8 @@ public:
 
     [[nodiscard]] std::size_t worker_count() const noexcept;
 
-    // Blocks until every task finished. If tasks throw, rethrows the first captured exception
-    // after all workers stopped touching the task data.
+    // Blocks until every task finished. If tasks throw, rethrows the exception of the lowest
+    // task index after all workers stopped touching the task data.
     template <typename Task>
     void run(std::size_t task_count, Task& task) {
         run_erased(task_count,

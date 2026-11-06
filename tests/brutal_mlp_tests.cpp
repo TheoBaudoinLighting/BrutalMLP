@@ -2691,6 +2691,97 @@ TEST(ParallelTraining, MatchesSerialTrainingUpToRounding) {
     }
 }
 
+namespace {
+
+// Forwards to another dataset and controls whether sample() may run concurrently. With
+// `poison`, two samples contain a NaN input.
+class ForwardingDataset final : public bm::Dataset {
+public:
+    ForwardingDataset(const bm::Dataset& source, bool concurrent, bool poison = false)
+        : source_(source), concurrent_(concurrent), poison_(poison) {}
+
+    [[nodiscard]] std::size_t sample_count() const noexcept override { return source_.sample_count(); }
+    [[nodiscard]] std::size_t input_size() const noexcept override { return source_.input_size(); }
+    [[nodiscard]] std::size_t output_size() const noexcept override { return source_.output_size(); }
+    [[nodiscard]] bool supports_concurrent_sample() const noexcept override { return concurrent_; }
+    void sample(std::size_t index, bm::Scalar* input, std::size_t input_size, bm::Scalar* target,
+                std::size_t target_size) const override {
+        source_.sample(index, input, input_size, target, target_size);
+        if (poison_ && (index == 37 || index == 150)) {
+            input[0] = std::numeric_limits<bm::Scalar>::quiet_NaN();
+        }
+    }
+
+private:
+    const bm::Dataset& source_;
+    bool concurrent_;
+    bool poison_;
+};
+
+} // namespace
+
+TEST(ParallelTraining, ConcurrentSampleReadingGivesIdenticalResults) {
+    bm::Matrix inputs;
+    bm::Matrix targets;
+    make_parallel_test_data(inputs, targets);
+    const bm::MatrixDataset matrix_dataset(inputs, targets);
+    EXPECT_TRUE(matrix_dataset.supports_concurrent_sample());
+
+    const ForwardingDataset read_on_caller(matrix_dataset, false);
+    const ForwardingDataset read_on_workers(matrix_dataset, true);
+    auto reference = make_parallel_test_model();
+    const auto reference_history = reference.fit(read_on_caller, parallel_test_options(8));
+    auto model = make_parallel_test_model();
+    const auto history = model.fit(read_on_workers, parallel_test_options(8));
+
+    EXPECT_EQ(history.training_loss, reference_history.training_loss);
+    EXPECT_EQ(history.validation_loss, reference_history.validation_loss);
+    const auto parameters = model.parameters();
+    const auto reference_parameters = reference.parameters();
+    for (std::size_t layer = 0; layer < parameters.size(); ++layer) {
+        EXPECT_EQ(parameters[layer].weights, reference_parameters[layer].weights);
+        EXPECT_EQ(parameters[layer].biases, reference_parameters[layer].biases);
+    }
+}
+
+TEST(ParallelTraining, InvalidSampleReportIsIndependentOfThreads) {
+    bm::Matrix inputs;
+    bm::Matrix targets;
+    make_parallel_test_data(inputs, targets);
+    const bm::MatrixDataset matrix_dataset(inputs, targets);
+    const ForwardingDataset poisoned(matrix_dataset, true, true);
+
+    auto serial_options = parallel_test_options(1);
+    serial_options.parallelism.execution = bm::ParallelExecution::serial;
+    serial_options.debug.enabled = true;
+    auto serial = make_parallel_test_model();
+    const auto serial_history = serial.fit(poisoned, serial_options);
+    ASSERT_EQ(serial_history.stop_reason, bm::TrainingStopReason::invalid_training_data);
+
+    for (std::size_t thread_count : {1U, 2U, 8U}) {
+        SCOPED_TRACE(thread_count);
+        auto options = parallel_test_options(thread_count);
+        options.debug.enabled = true;
+        auto model = make_parallel_test_model();
+        const auto history = model.fit(poisoned, options);
+        EXPECT_EQ(history.stop_reason, bm::TrainingStopReason::invalid_training_data);
+        EXPECT_EQ(history.stop_message, serial_history.stop_message);
+    }
+}
+
+TEST(Datasets, ConcurrentSampleSupportIsDeclaredPerDataset) {
+    const bm::Matrix inputs{{1.0}, {2.0}};
+    const bm::Matrix targets{{1.0}, {2.0}};
+    const bm::MatrixDataset matrix_dataset(inputs, targets);
+    const bm::DatasetView view(matrix_dataset, {1, 0});
+    EXPECT_TRUE(view.supports_concurrent_sample());
+
+    const bm::GeneratedDataset generated(2, 1, 1, generated_linear_sample);
+    EXPECT_FALSE(generated.supports_concurrent_sample());
+    const bm::DatasetView generated_view(generated, {0});
+    EXPECT_FALSE(generated_view.supports_concurrent_sample());
+}
+
 TEST(ParallelTraining, WorkerExceptionsReachTheCaller) {
     bm::Matrix inputs;
     bm::Matrix targets;

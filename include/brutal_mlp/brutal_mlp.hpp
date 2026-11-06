@@ -533,6 +533,11 @@ public:
                         std::size_t input_size,
                         Scalar* target,
                         std::size_t target_size) const = 0;
+
+    // True when sample() may run concurrently on several threads for the same object. Parallel
+    // training (ParallelExecution::worker_threads) then reads samples on its worker threads
+    // instead of the calling thread. The default is false.
+    [[nodiscard]] virtual bool supports_concurrent_sample() const noexcept;
 };
 
 class MatrixDataset final : public Dataset {
@@ -547,6 +552,7 @@ public:
                 std::size_t input_size,
                 Scalar* target,
                 std::size_t target_size) const override;
+    [[nodiscard]] bool supports_concurrent_sample() const noexcept override;
 
 private:
     const Matrix* inputs_{nullptr};
@@ -567,6 +573,7 @@ public:
                 std::size_t input_size,
                 Scalar* target,
                 std::size_t target_size) const override;
+    [[nodiscard]] bool supports_concurrent_sample() const noexcept override;
 
 private:
     const DenseMatrix* inputs_{nullptr};
@@ -626,6 +633,7 @@ public:
                 std::size_t input_size,
                 Scalar* target,
                 std::size_t target_size) const override;
+    [[nodiscard]] bool supports_concurrent_sample() const noexcept override;
 
 private:
     const Dataset* source_{nullptr};

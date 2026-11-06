@@ -172,6 +172,18 @@ struct TrainingModel::Impl {
     // `sample_count` is the dataset size; it bounds the useful number of loss evaluation tasks.
     [[nodiscard]] ParallelTraining make_parallel_training(const TrainingOptions& options, std::size_t sample_count) const;
 
+    // Same contract as fill_dataset_batch(). When the dataset supports concurrent sample() calls,
+    // the samples are read by the worker pool; the batch content is identical either way.
+    void fill_dataset_batch_parallel(const Dataset& dataset,
+                                     const std::vector<std::size_t>& indices,
+                                     std::size_t begin,
+                                     std::size_t count,
+                                     MiniBatch& raw_batch,
+                                     MiniBatch& normalized_batch,
+                                     ParallelTraining& parallel,
+                                     const TrainingDebugOptions* debug,
+                                     const detail::TrainingDebugContext& base_debug_context) const;
+
     // Same contract as accumulate_batch_gradients(MiniBatch&, ...), computed by the worker pool.
     void accumulate_batch_gradients_parallel(const MiniBatch& batch,
                                              ParallelTraining& parallel,
@@ -238,6 +250,19 @@ struct TrainingModel::Impl {
                              const TrainingDebugOptions* debug = nullptr,
                              const detail::TrainingDebugContext& debug_context = {}) const;
 
+    // Reads samples indices[begin .. begin + count) into rows [row, row + count) of batches that
+    // are already large enough. Distinct row ranges may be filled concurrently when the dataset
+    // supports concurrent sample() calls.
+    void fill_dataset_rows(const Dataset& dataset,
+                           const std::vector<std::size_t>& indices,
+                           std::size_t begin,
+                           std::size_t count,
+                           std::size_t row,
+                           MiniBatch& raw_batch,
+                           MiniBatch& normalized_batch,
+                           const TrainingDebugOptions* debug,
+                           const detail::TrainingDebugContext& base_debug_context) const;
+
     void fill_dataset_batch(const Dataset& dataset,
                             const std::vector<std::size_t>& indices,
                             std::size_t begin,
@@ -256,7 +281,8 @@ struct TrainingModel::Impl {
                                                   bool has_epoch = false) const;
 
     // Same contract as loss_for_dataset_indices(), computed by the worker pool. Samples are read
-    // on the calling thread, so Dataset::sample() never runs concurrently.
+    // by the workers when the dataset supports concurrent sample() calls, on the calling thread
+    // otherwise.
     [[nodiscard]] Scalar loss_for_dataset_indices_parallel(const Dataset& dataset,
                                                            const std::vector<std::size_t>& indices,
                                                            ParallelTraining& parallel,

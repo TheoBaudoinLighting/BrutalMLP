@@ -19,6 +19,10 @@ using namespace detail;
 
 Dataset::~Dataset() = default;
 
+bool Dataset::supports_concurrent_sample() const noexcept {
+    return false;
+}
+
 MatrixDataset::MatrixDataset(const Matrix& inputs, const Matrix& targets)
     : inputs_(&inputs),
       targets_(&targets),
@@ -37,6 +41,11 @@ std::size_t MatrixDataset::sample_count() const noexcept {
 
 std::size_t MatrixDataset::input_size() const noexcept {
     return input_size_;
+}
+
+// sample() only reads the referenced matrices.
+bool MatrixDataset::supports_concurrent_sample() const noexcept {
+    return true;
 }
 
 std::size_t MatrixDataset::output_size() const noexcept {
@@ -77,6 +86,11 @@ std::size_t DenseMatrixDataset::sample_count() const noexcept {
 
 std::size_t DenseMatrixDataset::input_size() const noexcept {
     return inputs_ ? inputs_->columns() : 0;
+}
+
+// sample() only reads the referenced matrices.
+bool DenseMatrixDataset::supports_concurrent_sample() const noexcept {
+    return true;
 }
 
 std::size_t DenseMatrixDataset::output_size() const noexcept {
@@ -191,6 +205,10 @@ std::size_t DatasetView::output_size() const noexcept {
 
 const std::vector<std::size_t>& DatasetView::indices() const noexcept {
     return indices_;
+}
+
+bool DatasetView::supports_concurrent_sample() const noexcept {
+    return source_ != nullptr && source_->supports_concurrent_sample();
 }
 
 void DatasetView::sample(std::size_t index,

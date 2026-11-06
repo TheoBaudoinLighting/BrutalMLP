@@ -590,7 +590,8 @@ options.parallelism.thread_count = 0; // 0 = hardware_concurrency()
 
 - Results are deterministic and identical for every `thread_count`: a mini-batch is split into chunks whose boundaries depend only on the batch size and the model size, each chunk accumulates into its own gradient buffer, and the buffers are summed in chunk order.
 - Compared with `serial` execution, only the summation order of the gradients and losses changes, so results agree up to floating-point rounding. Dropout masks are drawn in the same order in both modes.
-- `Dataset::sample()` is still called from the calling thread only. A custom loss (`LossConfig::custom`) is called from worker threads and must be safe to call concurrently.
+- Samples are read on the worker threads when the dataset declares `supports_concurrent_sample()`; otherwise `Dataset::sample()` is only called from the calling thread. `MatrixDataset`, `DenseMatrixDataset` (and so the `Matrix`/`DenseMatrix` overloads) declare it; `DatasetView` forwards its source; `GeneratedDataset` and custom datasets do not unless they override it. Both ways read the same samples and give identical results.
+- A custom loss (`LossConfig::custom`) is called from worker threads and must be safe to call concurrently.
 - Parallelism pays off with mini-batches of a few hundred samples or more; batches smaller than `minimum_parallel_samples` run on the calling thread with the same results. `fit(StreamingDataset&)` always trains on the calling thread.
 
 ## Source layout
