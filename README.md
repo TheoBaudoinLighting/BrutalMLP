@@ -7,10 +7,21 @@ The runtime library only uses the C++ standard library. GoogleTest and Google Be
 `brutal_mlp::Scalar` is `float` by default. Use double precision only for debug or numerical investigation builds:
 
 ```bash
-cmake -S . -B build-double -DBRUTAL_MLP_USE_DOUBLE=ON
+cmake --preset double
 ```
 
 When using the CMake target `brutal_mlp::brutal_mlp`, the precision macro is propagated to consumers. Do not mix objects built with different `BRUTAL_MLP_USE_DOUBLE` settings.
+
+## SIMD backend
+
+`brutal_mlp` has an optional ISPC inference backend for the compiled float runtime. It uses the ISPC compiler as a build tool only; no extra runtime library is required by `brutal_mlp`.
+
+```bash
+cmake --preset ispc          # same as release, but fails if ispc is missing
+cmake --build --preset ispc
+```
+
+If `ispc` is not available in `PATH`, CMake keeps the scalar backend and prints a status message. Use `-DBRUTAL_MLP_REQUIRE_ISPC=ON` when a build must fail instead of falling back. Double precision builds always use the scalar backend. At runtime, `brutal_mlp::inference_backend()` returns `brutal_mlp::InferenceBackend::ispc` or `brutal_mlp::InferenceBackend::scalar`.
 
 ## API split
 
@@ -63,6 +74,7 @@ Built-in training losses:
 - `mean_absolute_error`
 - `huber`
 - `relative_mean_squared_error`
+- `relative_l2`
 - `log_cosh`
 - `weighted_mean_squared_error`
 - `binary_cross_entropy`
@@ -91,11 +103,12 @@ Useful factory examples:
 brutal_mlp::LossConfig::mean_absolute_error();
 brutal_mlp::LossConfig::huber(1.0f);
 brutal_mlp::LossConfig::relative_mean_squared_error(1e-4f);
+brutal_mlp::LossConfig::relative_l2(0.01f);
 brutal_mlp::LossConfig::log_cosh();
 brutal_mlp::LossConfig::weighted_mean_squared_error({1.0f, 2.0f});
 ```
 
-`relative_mean_squared_error` divides each squared error by `max(abs(target), epsilon)^2`. `weighted_mean_squared_error` requires one non-negative weight per output and divides the weighted squared error by the sum of weights.
+`relative_mean_squared_error` divides each squared error by `max(abs(target), epsilon)^2`. `relative_l2` divides it by `prediction^2 + epsilon` and treats that denominator as a constant when differentiating (the relative L2 loss of Noise2Noise, neural radiance caches and neural render proxies): errors count relative to the predicted brightness, so dark and bright HDR values weigh alike. `weighted_mean_squared_error` requires one non-negative weight per output and divides the weighted squared error by the sum of weights.
 
 Custom losses are supported on the training side with raw function pointers and an optional context pointer:
 
@@ -268,6 +281,8 @@ options.restore_best_weights = true;
 options.best_checkpoint_path = "best.bmlp";
 ```
 
+`restore_best_weights` restores the best epoch's parameters together with the matching optimizer state (momentum/Adam moments and optimizer step), so a later `fit`, `save_binary`, or checkpoint continues from a consistent state.
+
 Learning rate schedules are configured through `TrainingOptions` and are reported in each epoch diagnostic:
 
 ```cpp
@@ -277,6 +292,8 @@ options.learning_rate_schedule =
 options.learning_rate_schedule.warmup_epochs = 10;
 options.learning_rate_schedule.warmup_start_learning_rate = 1e-6f;
 ```
+
+The schedule drives the per-epoch learning rate but never overwrites the model's configured `optimizer().learning_rate`: every `fit` call resolves `base_learning_rate` (or, when it is zero, the configured optimizer learning rate) from scratch, so repeated `fit` calls do not compound decay.
 
 Available schedules are constant, step decay, exponential decay, cosine annealing, and reduce-on-plateau. Warmup can prefix any schedule:
 
@@ -562,59 +579,83 @@ auto parallel_status = compiled.predict_batch_to(inputs.data(),
 
 `predict_batch(DenseMatrix)` is the convenient contiguous batch API. It allocates one output block plus one scratch buffer, so it is much cheaper than the legacy `Matrix` convenience API, but the pointer-based `predict_batch_to(...)` remains the no-allocation renderer path.
 
-`TrainingOptions::parallelism` stores the same policy and is written into binary models and checkpoints. The current optimizer update path remains serial and deterministic; the policy is part of the training config so CPU-parallel batch loading, normalization, or gradient accumulation can be enabled without changing the public configuration surface.
+`TrainingOptions::parallelism` uses the same policy for `fit(Dataset)` and the `Matrix`/`DenseMatrix` overloads, and is written into binary models and checkpoints. With `ParallelExecution::worker_threads`, each mini-batch's gradients and every loss evaluation are computed by a worker pool created once per `fit` call:
+
+```cpp
+brutal_mlp::TrainingOptions options;
+options.batch_size = 1024;
+options.parallelism.execution = brutal_mlp::ParallelExecution::worker_threads;
+options.parallelism.thread_count = 0; // 0 = hardware_concurrency()
+```
+
+- Results are deterministic and identical for every `thread_count`: a mini-batch is split into chunks whose boundaries depend only on the batch size and the model size, each chunk accumulates into its own gradient buffer, and the buffers are summed in chunk order.
+- Compared with `serial` execution, only the summation order of the gradients and losses changes, so results agree up to floating-point rounding. Dropout masks are drawn in the same order in both modes.
+- `Dataset::sample()` is still called from the calling thread only. A custom loss (`LossConfig::custom`) is called from worker threads and must be safe to call concurrently.
+- Parallelism pays off with mini-batches of a few hundred samples or more; batches smaller than `minimum_parallel_samples` run on the calling thread with the same results. `fit(StreamingDataset&)` always trains on the calling thread.
+
+## Source layout
+
+The public surface is the single header `include/brutal_mlp/brutal_mlp.hpp`. Implementation files under `src/` are grouped by responsibility; their headers are internal (namespace `brutal_mlp::detail`) and are never installed.
+
+| Directory | Responsibility |
+|---|---|
+| `src/core/` | Argument checks, scalar-type constants, time and seed helpers, worker threads, enum strings, version info, `DenseMatrix`. |
+| `src/math/` | Activations, scalar helpers, the one-sample inference kernel with its optional ISPC version (`dense_layer_kernel.ispc`), and the mini-batch training kernels (`dense_batch.*`). |
+| `src/config/` | Configuration validation and the factory functions of the config structs. |
+| `src/data/` | Training data validation, datasets, mini-batches and streaming datasets. |
+| `src/normalization/` | Feature normalization validation, application and factories. |
+| `src/evaluation/` | Regression and classification metrics. |
+| `src/training/` | `TrainingModel` (builder, `Impl`, both `fit` loops, persistence), learning-rate schedules, initialization, diagnostics and run config export. |
+| `src/inference/` | `InferenceModel`/`CompiledModel` runtime, workspace, layer validation and persistence. |
+| `src/serialization/` | Text format, binary I/O primitives, binary model format, enum codes and size limits. |
 
 ## Build
 
 Prerequisites:
 
-- CMake 3.20+
+- CMake 3.20+ (3.21+ to use `CMakePresets.json`)
 - A C++17 compiler
 - Git, because tests and benchmarks use CMake `FetchContent`
 
-Portable multi-config build, recommended for Visual Studio and Xcode:
+All build trees live in `builds/<preset>/`. The `builds/` directory is disposable and ignored by git: delete it at any time to start from scratch. `CMakePresets.json` provides:
+
+| Preset | Content |
+|---|---|
+| `release` | float, Release, tests, benchmarks and examples |
+| `debug` | float, Debug, tests and examples |
+| `double` | double precision, Release, tests and examples |
+| `ispc` | like `release`, but configuration fails when the `ispc` compiler is missing |
 
 ```bash
-cmake -S . -B build -DBRUTAL_MLP_BUILD_TESTS=ON -DBRUTAL_MLP_BUILD_BENCHMARKS=ON
-cmake --build build --config Release
-ctest --test-dir build --output-on-failure -C Release
+cmake --preset release
+cmake --build --preset release --parallel
+ctest --preset release
 ```
 
-Single-config build, recommended for Ninja and Makefiles:
-
-```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DBRUTAL_MLP_BUILD_TESTS=ON -DBRUTAL_MLP_BUILD_BENCHMARKS=ON
-cmake --build build --parallel
-ctest --test-dir build --output-on-failure
-```
+The same three commands work with `debug`, `double` and `ispc`, with single-config generators (Ninja, Makefiles) and multi-config generators (Visual Studio, Xcode). In MSVC Debug builds the test executable reports CRT assertions on stderr instead of opening a dialog.
 
 Benchmarks are exposed by the `brutal_mlp_benchmarks` executable when `BRUTAL_MLP_BUILD_BENCHMARKS=ON`. They cover small, medium, and large models across single prediction, flat batch prediction, dense and matrix convenience prediction, worker-thread batch prediction, one training epoch, and text/binary save/load. Useful filters:
 
 ```bash
 # List every benchmark case.
-build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_list_tests
+builds/release/benchmarks/Release/brutal_mlp_benchmarks --benchmark_list_tests
 
 # Compare no-allocation and allocating inference paths.
-build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredict.*(Unchecked|AllocatingDense|AllocatingMatrix)"
+builds/release/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredict.*(Unchecked|AllocatingDense|AllocatingMatrix)"
 
 # Measure training epoch and serialization costs.
-build/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="TrainingEpoch|Save|Load"
+builds/release/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="TrainingEpoch|Save|Load"
 ```
 
-Each benchmark reports `scalar_bits`, model dimensions, weight counts, and, for inference paths, `allocations_per_call` plus `allocating_path`. To compare float and double, build two benchmark trees and run the same filter:
+Each benchmark reports `scalar_bits`, model dimensions and weight counts. Inference paths add `allocations_per_call` plus `allocating_path`; training epochs add `allocations_per_sample`. The `render_proxy` model (22 inputs, 4 x 64 ReLU, 3 linear outputs, batches of 1024) mirrors a neural render proxy workload.
+
+The executable path above is for multi-config generators (Visual Studio, Xcode); single-config generators put it in `builds/release/benchmarks/`. To compare float and double precision, run the same filter from the `release` tree and from a `double` tree configured with `-DBRUTAL_MLP_BUILD_BENCHMARKS=ON`:
 
 ```bash
-cmake -S . -B build-bench-float -DCMAKE_BUILD_TYPE=Release -DBRUTAL_MLP_BUILD_TESTS=OFF -DBRUTAL_MLP_BUILD_BENCHMARKS=ON
-cmake --build build-bench-float --parallel
-
-cmake -S . -B build-bench-double -DCMAKE_BUILD_TYPE=Release -DBRUTAL_MLP_USE_DOUBLE=ON -DBRUTAL_MLP_BUILD_TESTS=OFF -DBRUTAL_MLP_BUILD_BENCHMARKS=ON
-cmake --build build-bench-double --parallel
-
-build-bench-float/benchmarks/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredictUnchecked|TrainingEpoch"
-build-bench-double/benchmarks/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredictUnchecked|TrainingEpoch"
+cmake --preset double -DBRUTAL_MLP_BUILD_BENCHMARKS=ON
+cmake --build --preset double --parallel
+builds/double/benchmarks/Release/brutal_mlp_benchmarks --benchmark_filter="SinglePredict|BatchPredictUnchecked|TrainingEpoch"
 ```
-
-With multi-config generators such as Visual Studio or Xcode, use the same commands with `cmake --build ... --config Release`; the executable is under `benchmarks/Release/`.
 
 When consumed from another CMake project through `FetchContent`, tests and examples default to `OFF`.
 

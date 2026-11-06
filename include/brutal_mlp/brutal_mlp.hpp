@@ -70,7 +70,11 @@ enum class Loss {
     weighted_mean_squared_error,
     binary_cross_entropy,
     categorical_cross_entropy,
-    custom
+    custom,
+    // Relative L2 (Lehtinen et al. 2018, used by neural radiance caches and render proxies):
+    // mean over outputs of (prediction - target)^2 / (prediction^2 + relative_epsilon), with the
+    // denominator treated as a constant when differentiating. Suited to HDR targets.
+    relative_l2
 };
 
 enum class Metric {
@@ -162,7 +166,13 @@ enum class ParallelExecution {
     worker_threads
 };
 
+enum class InferenceBackend {
+    scalar,
+    ispc
+};
+
 [[nodiscard]] std::string_view version_string() noexcept;
+[[nodiscard]] InferenceBackend inference_backend() noexcept;
 [[nodiscard]] std::string to_string(Activation activation);
 [[nodiscard]] std::string to_string(Loss loss);
 [[nodiscard]] std::string to_string(Metric metric);
@@ -176,6 +186,7 @@ enum class ParallelExecution {
 [[nodiscard]] std::string to_string(LearningRateSchedule schedule);
 [[nodiscard]] std::string to_string(WeightInitialization initialization);
 [[nodiscard]] std::string to_string(ParallelExecution execution);
+[[nodiscard]] std::string to_string(InferenceBackend backend);
 
 [[nodiscard]] Activation activation_from_string(std::string_view value);
 [[nodiscard]] Loss loss_from_string(std::string_view value);
@@ -184,6 +195,7 @@ enum class ParallelExecution {
 [[nodiscard]] OptimizerType optimizer_type_from_string(std::string_view value);
 [[nodiscard]] NormalizationMode normalization_mode_from_string(std::string_view value);
 [[nodiscard]] ParallelExecution parallel_execution_from_string(std::string_view value);
+[[nodiscard]] InferenceBackend inference_backend_from_string(std::string_view value);
 
 using CustomLossValueFunction = Scalar (*)(const Scalar* prediction,
                                            const Scalar* target,
@@ -213,6 +225,7 @@ struct LossConfig {
     [[nodiscard]] static LossConfig mean_absolute_error();
     [[nodiscard]] static LossConfig huber(Scalar delta = static_cast<Scalar>(1));
     [[nodiscard]] static LossConfig relative_mean_squared_error(Scalar epsilon = static_cast<Scalar>(1e-6));
+    [[nodiscard]] static LossConfig relative_l2(Scalar epsilon = static_cast<Scalar>(0.01));
     [[nodiscard]] static LossConfig log_cosh();
     [[nodiscard]] static LossConfig weighted_mean_squared_error(const Vector& weights);
     [[nodiscard]] static LossConfig binary_cross_entropy();

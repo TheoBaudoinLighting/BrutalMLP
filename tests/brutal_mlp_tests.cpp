@@ -19,9 +19,26 @@
 #include <type_traits>
 #include <utility>
 
+#if defined(_MSC_VER) && defined(_DEBUG)
+#include <crtdbg.h>
+#endif
+
 namespace bm = brutal_mlp;
 
 namespace {
+
+#if defined(_MSC_VER) && defined(_DEBUG)
+// Debug CRT assertions are reported on stderr instead of a modal dialog, so a Debug
+// test run fails visibly instead of blocking on a window.
+const bool g_crt_reports_to_stderr = [] {
+    _CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+    _CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDERR);
+    _CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE | _CRTDBG_MODE_DEBUG);
+    _CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+    return true;
+}();
+#endif
 
 constexpr double kTightTolerance = sizeof(bm::Scalar) == sizeof(float) ? 1e-5 : 1e-12;
 constexpr bm::Scalar kGradientStep = sizeof(bm::Scalar) == sizeof(float) ? bm::Scalar{1e-2f} : bm::Scalar{1e-5};
@@ -642,6 +659,8 @@ TEST(StringConversions, RoundTripSupportedEnums) {
     EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::huber)), bm::Loss::huber);
     EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::relative_mean_squared_error)),
               bm::Loss::relative_mean_squared_error);
+    EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::relative_l2)), bm::Loss::relative_l2);
+    EXPECT_EQ(bm::to_string(bm::Loss::relative_l2), "relative_l2");
     EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::log_cosh)), bm::Loss::log_cosh);
     EXPECT_EQ(bm::loss_from_string(bm::to_string(bm::Loss::weighted_mean_squared_error)),
               bm::Loss::weighted_mean_squared_error);
@@ -702,6 +721,19 @@ TEST(StringConversions, RoundTripSupportedEnums) {
               bm::ParallelExecution::serial);
     EXPECT_EQ(bm::parallel_execution_from_string(bm::to_string(bm::ParallelExecution::worker_threads)),
               bm::ParallelExecution::worker_threads);
+    EXPECT_EQ(bm::to_string(bm::InferenceBackend::scalar), "scalar");
+    EXPECT_EQ(bm::to_string(bm::InferenceBackend::ispc), "ispc");
+    EXPECT_EQ(bm::inference_backend_from_string(bm::to_string(bm::InferenceBackend::scalar)),
+              bm::InferenceBackend::scalar);
+    EXPECT_EQ(bm::inference_backend_from_string(bm::to_string(bm::InferenceBackend::ispc)),
+              bm::InferenceBackend::ispc);
+
+    const bm::InferenceBackend backend = bm::inference_backend();
+    EXPECT_TRUE(backend == bm::InferenceBackend::scalar || backend == bm::InferenceBackend::ispc);
+    EXPECT_FALSE(bm::to_string(backend).empty());
+#if defined(BRUTAL_MLP_USE_DOUBLE) && BRUTAL_MLP_USE_DOUBLE
+    EXPECT_EQ(backend, bm::InferenceBackend::scalar);
+#endif
 }
 
 TEST(StringConversions, RejectUnknownValues) {
@@ -711,6 +743,7 @@ TEST(StringConversions, RejectUnknownValues) {
     EXPECT_THROW((void)bm::averaging_from_string("weighted"), std::invalid_argument);
     EXPECT_THROW((void)bm::optimizer_type_from_string("rmsprop"), std::invalid_argument);
     EXPECT_THROW((void)bm::parallel_execution_from_string("task_graph"), std::invalid_argument);
+    EXPECT_THROW((void)bm::inference_backend_from_string("gpu"), std::invalid_argument);
 }
 
 TEST(OptimizerConfig, FactoriesExposeExpectedDefaults) {
@@ -1115,6 +1148,70 @@ TEST(Losses, RelativeMeanSquaredErrorMatchesKnownValue) {
                 kTightTolerance);
 }
 
+namespace {
+
+bm::TrainingModel make_relative_l2_model(bm::OptimizerConfig optimizer = bm::OptimizerConfig::adam()) {
+    auto model = bm::TrainingModel::builder()
+                     .input_size(2)
+                     .add_layer(1, bm::Activation::linear)
+                     .loss(bm::LossConfig::relative_l2(bm::Scalar{0.01}))
+                     .optimizer(optimizer)
+                     .seed(7)
+                     .build();
+    model.set_parameters({
+        bm::LayerParameters{2, 1, bm::Activation::linear, {bm::Scalar{2}, bm::Scalar{-1}}, {bm::Scalar{0.5}}},
+    });
+    return model;
+}
+
+} // namespace
+
+TEST(Losses, RelativeL2MatchesKnownValue) {
+    auto model = make_relative_l2_model();
+    // prediction = 2 * 3 - 1 * 1 + 0.5 = 5.5, error = 1, denominator = 5.5^2 + 0.01 = 30.26.
+    EXPECT_NEAR(model.evaluate_loss({{bm::Scalar{3}, bm::Scalar{1}}}, {{bm::Scalar{4.5}}}),
+                1.0 / 30.26,
+                kTightTolerance);
+    EXPECT_EQ(model.loss(), bm::Loss::relative_l2);
+    EXPECT_NEAR(model.loss_config().relative_epsilon, 0.01, kTightTolerance);
+}
+
+TEST(Losses, RelativeL2GradientTreatsDenominatorAsConstant) {
+    auto model = make_relative_l2_model(bm::OptimizerConfig::sgd(bm::Scalar{0.1}));
+    bm::TrainingOptions options;
+    options.epochs = 1;
+    options.batch_size = 1;
+    options.shuffle = false;
+    options.restore_best_weights = false;
+    (void)model.fit({{bm::Scalar{3}, bm::Scalar{1}}}, {{bm::Scalar{4.5}}}, options);
+
+    // dLoss/dprediction = 2 * error / (prediction^2 + epsilon), without the derivative of the
+    // denominator (the full derivative would subtract 2 * prediction * error^2 / denominator^2).
+    const double gradient = 2.0 * 1.0 / 30.26;
+    const auto parameters = model.parameters();
+    ASSERT_EQ(parameters.size(), 1U);
+    EXPECT_NEAR(parameters[0].weights[0], 2.0 - 0.1 * 3.0 * gradient, kTightTolerance);
+    EXPECT_NEAR(parameters[0].weights[1], -1.0 - 0.1 * 1.0 * gradient, kTightTolerance);
+    EXPECT_NEAR(parameters[0].biases[0], 0.5 - 0.1 * gradient, kTightTolerance);
+}
+
+TEST(Losses, RelativeL2SurvivesTextAndBinarySerialization) {
+    const auto model = make_relative_l2_model();
+    for (const bool binary : {false, true}) {
+        SCOPED_TRACE(binary);
+        const auto path = temp_test_path(binary ? "brutal_mlp_relative_l2.bmlp" : "brutal_mlp_relative_l2.model");
+        if (binary) {
+            model.save_binary(path);
+        } else {
+            model.save(path);
+        }
+        const auto loaded = binary ? bm::TrainingModel::load_binary(path) : bm::TrainingModel::load(path);
+        std::filesystem::remove(path);
+        EXPECT_EQ(loaded.loss(), bm::Loss::relative_l2);
+        EXPECT_NEAR(loaded.loss_config().relative_epsilon, 0.01, kTightTolerance);
+    }
+}
+
 TEST(Losses, LogCoshMatchesKnownValue) {
     auto model = bm::TrainingModel::builder()
                      .input_size(2)
@@ -1203,6 +1300,8 @@ TEST(Losses, RejectsInvalidTargetsForLossContracts) {
 TEST(Losses, RejectsInvalidLossConfigurations) {
     EXPECT_THROW((void)bm::LossConfig::huber(bm::Scalar{0}), std::invalid_argument);
     EXPECT_THROW((void)bm::LossConfig::relative_mean_squared_error(bm::Scalar{0}), std::invalid_argument);
+    EXPECT_THROW((void)bm::LossConfig::relative_l2(bm::Scalar{0}), std::invalid_argument);
+    EXPECT_THROW((void)bm::LossConfig::relative_l2(bm::Scalar{-1}), std::invalid_argument);
     EXPECT_THROW((void)bm::LossConfig::weighted_mean_squared_error({}), std::invalid_argument);
     EXPECT_THROW((void)bm::LossConfig::weighted_mean_squared_error({bm::Scalar{0}, bm::Scalar{0}}),
                  std::invalid_argument);
@@ -2466,6 +2565,167 @@ TEST(Training, LearningRateExponentialDecayReportsExpectedCurve) {
     EXPECT_NEAR(history.epochs[1].learning_rate, 0.05, kTightTolerance);
     EXPECT_NEAR(history.epochs[2].learning_rate, 0.025, kTightTolerance);
     EXPECT_NEAR(history.epochs[3].learning_rate, 0.0125, kTightTolerance);
+}
+
+TEST(Training, LearningRateScheduleDoesNotLeakIntoOptimizerConfig) {
+    auto model = make_learning_rate_test_model();
+    const bm::Scalar configured_learning_rate = model.optimizer().learning_rate;
+    auto options = quick_options(4, 2);
+    options.shuffle = false;
+    options.restore_best_weights = false;
+    options.learning_rate_schedule = bm::LearningRateScheduleConfig::exponential_decay(bm::Scalar{0.5});
+    const bm::Matrix inputs{{-2.0}, {-1.0}, {0.0}, {1.0}};
+    const bm::Matrix targets{{-5.0}, {-3.0}, {-1.0}, {1.0}};
+
+    const auto first = model.fit(inputs, targets, options);
+    ASSERT_EQ(first.epochs.size(), 4U);
+    EXPECT_NEAR(model.optimizer().learning_rate, configured_learning_rate, kTightTolerance);
+
+    const auto second = model.fit(inputs, targets, options);
+    ASSERT_EQ(second.epochs.size(), 4U);
+    EXPECT_NEAR(second.epochs[0].learning_rate, configured_learning_rate, kTightTolerance);
+    EXPECT_NEAR(second.run_config.optimizer.learning_rate, configured_learning_rate, kTightTolerance);
+    EXPECT_NEAR(model.optimizer().learning_rate, configured_learning_rate, kTightTolerance);
+}
+
+TEST(Training, RestoreBestWeightsAlsoRestoresMatchingOptimizerState) {
+    const auto path = temp_test_path("brutal_mlp_restore_best_optimizer_state.bmlp");
+    auto model = make_learning_rate_test_model();
+    auto options = quick_options(8, 2);
+    options.shuffle = false;
+    options.restore_best_weights = true;
+    const bm::Matrix inputs{{-2.0}, {-1.0}, {0.0}, {1.0}};
+    const bm::Matrix targets{{-5.0}, {-3.0}, {-1.0}, {1.0}};
+
+    const auto history = model.fit(inputs, targets, options);
+    ASSERT_TRUE(history.has_best_checkpoint);
+
+    model.save_binary(path);
+    const auto info = bm::inspect_binary_model(path);
+    std::filesystem::remove(path);
+
+    const std::uint64_t batches_per_epoch = 2;
+    EXPECT_EQ(info.optimizer_step, (static_cast<std::uint64_t>(history.best_epoch) + 1) * batches_per_epoch);
+}
+
+namespace {
+
+bm::TrainingModel make_parallel_test_model() {
+    return bm::TrainingModel::builder()
+        .input_size(3)
+        .add_layer(24, bm::Activation::relu, bm::Scalar{0.25})
+        .add_layer(12, bm::Activation::tanh)
+        .add_layer(2, bm::Activation::linear)
+        .optimizer(bm::OptimizerConfig::adam(bm::Scalar{0.01}))
+        .seed(321)
+        .build();
+}
+
+void make_parallel_test_data(bm::Matrix& inputs, bm::Matrix& targets) {
+    for (std::size_t i = 0; i < 237; ++i) {
+        const bm::Scalar a = static_cast<bm::Scalar>(i % 13) / bm::Scalar{12};
+        const bm::Scalar b = static_cast<bm::Scalar>((i * 5) % 17) / bm::Scalar{16};
+        inputs.push_back({a, b, a * b});
+        targets.push_back({a + b, a - b});
+    }
+}
+
+bm::TrainingOptions parallel_test_options(std::size_t thread_count) {
+    bm::TrainingOptions options;
+    options.epochs = 4;
+    options.batch_size = 100; // Several gradient chunks of uneven size, plus a smaller last batch.
+    options.validation_split = bm::Scalar{0.2};
+    options.seed = 5;
+    options.restore_best_weights = false;
+    options.parallelism.execution = bm::ParallelExecution::worker_threads;
+    options.parallelism.thread_count = thread_count;
+    return options;
+}
+
+} // namespace
+
+TEST(ParallelTraining, ResultsAreIdenticalForEveryThreadCount) {
+    bm::Matrix inputs;
+    bm::Matrix targets;
+    make_parallel_test_data(inputs, targets);
+
+    auto reference = make_parallel_test_model();
+    const auto reference_history = reference.fit(inputs, targets, parallel_test_options(1));
+    const auto reference_parameters = reference.parameters();
+
+    for (std::size_t thread_count : {2U, 3U, 8U}) {
+        SCOPED_TRACE(thread_count);
+        auto model = make_parallel_test_model();
+        const auto history = model.fit(inputs, targets, parallel_test_options(thread_count));
+        EXPECT_EQ(history.training_loss, reference_history.training_loss);
+        EXPECT_EQ(history.validation_loss, reference_history.validation_loss);
+        const auto parameters = model.parameters();
+        ASSERT_EQ(parameters.size(), reference_parameters.size());
+        for (std::size_t layer = 0; layer < parameters.size(); ++layer) {
+            EXPECT_EQ(parameters[layer].weights, reference_parameters[layer].weights);
+            EXPECT_EQ(parameters[layer].biases, reference_parameters[layer].biases);
+        }
+    }
+}
+
+TEST(ParallelTraining, MatchesSerialTrainingUpToRounding) {
+    bm::Matrix inputs;
+    bm::Matrix targets;
+    make_parallel_test_data(inputs, targets);
+
+    auto serial = make_parallel_test_model();
+    auto serial_options = parallel_test_options(1);
+    serial_options.parallelism.execution = bm::ParallelExecution::serial;
+    const auto serial_history = serial.fit(inputs, targets, serial_options);
+
+    auto parallel = make_parallel_test_model();
+    const auto parallel_history = parallel.fit(inputs, targets, parallel_test_options(4));
+
+    // Same samples, same dropout masks: only the summation order of the gradients differs.
+    ASSERT_EQ(parallel_history.training_loss.size(), serial_history.training_loss.size());
+    for (std::size_t epoch = 0; epoch < serial_history.training_loss.size(); ++epoch) {
+        EXPECT_NEAR(parallel_history.training_loss[epoch], serial_history.training_loss[epoch], 1e-3);
+    }
+    for (const bm::Vector& input : {bm::Vector{0.1f, 0.4f, 0.04f}, bm::Vector{0.9f, 0.2f, 0.18f}}) {
+        expect_vector_near(parallel.predict(input), serial.predict(input), 1e-3);
+    }
+}
+
+TEST(ParallelTraining, WorkerExceptionsReachTheCaller) {
+    bm::Matrix inputs;
+    bm::Matrix targets;
+    make_parallel_test_data(inputs, targets);
+    const auto non_finite_gradient = +[](const bm::Scalar*, const bm::Scalar*, std::size_t size, bm::Scalar* gradient, void*) {
+        for (std::size_t i = 0; i < size; ++i) {
+            gradient[i] = std::numeric_limits<bm::Scalar>::quiet_NaN();
+        }
+    };
+    auto model = bm::TrainingModel::builder()
+                     .input_size(3)
+                     .add_layer(8, bm::Activation::relu)
+                     .add_layer(2, bm::Activation::linear)
+                     .loss(bm::LossConfig::custom(custom_mse_value, non_finite_gradient))
+                     .seed(4)
+                     .build();
+    EXPECT_THROW((void)model.fit(inputs, targets, parallel_test_options(4)), std::invalid_argument);
+}
+
+TEST(Training, ZeroGradientNoiseIsAcceptedByEveryOptimizer) {
+    for (const auto& optimizer : {bm::OptimizerConfig::sgd(bm::Scalar{0.05}, bm::Scalar{0.9}),
+                                  bm::OptimizerConfig::adam(bm::Scalar{0.01}),
+                                  bm::OptimizerConfig::adamw(bm::Scalar{0.01})}) {
+        auto model = bm::TrainingModel::builder()
+                         .input_size(1)
+                         .add_layer(2, bm::Activation::tanh)
+                         .add_layer(1, bm::Activation::linear)
+                         .optimizer(optimizer)
+                         .seed(17)
+                         .build();
+        auto options = quick_options(2, 2);
+        options.gradient_noise_stddev = bm::Scalar{0};
+        const auto history = model.fit({{-1.0}, {0.0}, {1.0}, {2.0}}, {{-1.0}, {0.0}, {1.0}, {2.0}}, options);
+        EXPECT_EQ(history.stop_reason, bm::TrainingStopReason::completed_epochs);
+    }
 }
 
 TEST(Training, LearningRateCosineAnnealingReachesConfiguredFloor) {

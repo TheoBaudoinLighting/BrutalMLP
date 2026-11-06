@@ -75,6 +75,8 @@ struct ModelSpec {
 constexpr ModelSpec kSmallModel{"small", 8, 16, 1, 4, 128, 16};
 constexpr ModelSpec kMediumModel{"medium", 32, 64, 2, 8, 256, 32};
 constexpr ModelSpec kLargeModel{"large", 128, 256, 3, 16, 128, 32};
+// Same shape as a neural render proxy: 22 encoded pixel/light features, 4 x 64 ReLU, linear RGB head.
+constexpr ModelSpec kRenderProxyModel{"render_proxy", 22, 64, 4, 3, 4096, 1024};
 
 template <typename Function>
 std::size_t count_allocations(Function&& function) {
@@ -183,6 +185,8 @@ void set_model_counters(benchmark::State& state, const ModelSpec& spec, const bm
     state.counters["weight_scalars"] = static_cast<double>(model.weight_count());
     state.counters["bias_scalars"] = static_cast<double>(model.bias_count());
     state.counters["scratch_scalars"] = static_cast<double>(model.scratch_size());
+    state.counters["ispc_backend"] =
+        bm::inference_backend() == bm::InferenceBackend::ispc ? 1.0 : 0.0;
 }
 
 void set_training_counters(benchmark::State& state, const ModelSpec& spec) {
@@ -422,6 +426,47 @@ static void BM_TrainingEpoch(benchmark::State& state, const ModelSpec* spec) {
 
     state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(spec->training_samples));
     set_training_counters(state, *spec);
+
+    // Heap allocations of one extra epoch, outside the timed region.
+    auto counted_model = make_training_model(*spec);
+    bm::TrainingOptions counted_options;
+    counted_options.epochs = 1;
+    counted_options.batch_size = spec->training_batch;
+    counted_options.shuffle = false;
+    counted_options.restore_best_weights = false;
+    const std::size_t allocations = count_allocations([&] {
+        auto history = counted_model.fit(inputs, targets, counted_options);
+        benchmark::DoNotOptimize(history.training_loss.data());
+    });
+    state.counters["allocations_per_sample"] =
+        static_cast<double>(allocations) / static_cast<double>(spec->training_samples);
+}
+
+// One training epoch with ParallelExecution::worker_threads; the benchmark argument is the
+// thread count. Results are identical for every thread count, only the time changes.
+static void BM_TrainingEpochParallel(benchmark::State& state, const ModelSpec* spec) {
+    const auto inputs = make_inputs(spec->training_samples, spec->inputs);
+    const auto targets = make_regression_targets(inputs, spec->outputs);
+
+    for (auto _ : state) {
+        state.PauseTiming();
+        auto model = make_training_model(*spec);
+        bm::TrainingOptions options;
+        options.epochs = 1;
+        options.batch_size = spec->training_batch;
+        options.shuffle = false;
+        options.restore_best_weights = false;
+        options.parallelism.execution = bm::ParallelExecution::worker_threads;
+        options.parallelism.thread_count = static_cast<std::size_t>(state.range(0));
+        state.ResumeTiming();
+
+        auto history = model.fit(inputs, targets, options);
+        benchmark::DoNotOptimize(history.training_loss.data());
+    }
+
+    state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(spec->training_samples));
+    set_training_counters(state, *spec);
+    state.counters["threads"] = static_cast<double>(state.range(0));
 }
 
 static void BM_SaveInferenceText(benchmark::State& state, const ModelSpec* spec) {
@@ -564,6 +609,12 @@ static void BM_LoadTrainingBinary(benchmark::State& state, const ModelSpec* spec
 REGISTER_MODEL_BENCHMARKS(small, &kSmallModel);
 REGISTER_MODEL_BENCHMARKS(medium, &kMediumModel);
 REGISTER_MODEL_BENCHMARKS(large, &kLargeModel);
+REGISTER_MODEL_BENCHMARKS(render_proxy, &kRenderProxyModel);
+
+BENCHMARK_CAPTURE(BM_TrainingEpochParallel, render_proxy, &kRenderProxyModel)
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->UseRealTime();
+BENCHMARK_CAPTURE(BM_TrainingEpochParallel, large, &kLargeModel)
+    ->Arg(1)->Arg(2)->Arg(4)->Arg(8)->Arg(16)->UseRealTime();
 
 } // namespace
 
